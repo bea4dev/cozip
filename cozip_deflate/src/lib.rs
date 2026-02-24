@@ -40,11 +40,13 @@ const MAX_HASH_CANDIDATES: usize = 32;
 const MAX_RUN_HINTS: usize = 8;
 const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
+const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUNT * 2);
 const GPU_BATCH_CHUNKS: usize = 16;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
+const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 20;
 const GPU_RESERVATION_TIMEOUT_MS: u64 = 3;
 const SCHEDULER_WAIT_MS: u64 = 1;
 
@@ -250,6 +252,10 @@ struct GpuAssist {
     token_finalize_pipeline: wgpu::ComputePipeline,
     freq_bind_group_layout: wgpu::BindGroupLayout,
     freq_pipeline: wgpu::ComputePipeline,
+    dyn_map_bind_group_layout: wgpu::BindGroupLayout,
+    dyn_map_pipeline: wgpu::ComputePipeline,
+    dyn_finalize_bind_group_layout: wgpu::BindGroupLayout,
+    dyn_finalize_pipeline: wgpu::ComputePipeline,
     litlen_bind_group_layout: wgpu::BindGroupLayout,
     litlen_pipeline: wgpu::ComputePipeline,
     bitpack_bind_group_layout: wgpu::BindGroupLayout,
@@ -283,6 +289,9 @@ struct DeflateSlot {
     token_lit_buffer: wgpu::Buffer,
     litlen_freq_buffer: wgpu::Buffer,
     dist_freq_buffer: wgpu::Buffer,
+    dyn_table_buffer: wgpu::Buffer,
+    dyn_meta_buffer: wgpu::Buffer,
+    dyn_overflow_buffer: wgpu::Buffer,
     token_prefix_buffer: wgpu::Buffer,
     token_total_buffer: wgpu::Buffer,
     bitlens_buffer: wgpu::Buffer,
@@ -294,6 +303,8 @@ struct DeflateSlot {
     litlen_bg: wgpu::BindGroup,
     tokenize_bg: wgpu::BindGroup,
     freq_bg: wgpu::BindGroup,
+    dyn_map_bg: wgpu::BindGroup,
+    dyn_finalize_bg: wgpu::BindGroup,
     bitpack_bg: wgpu::BindGroup,
 }
 
@@ -907,6 +918,398 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             entry_point: "main",
         });
 
+        let dyn_map_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cozip-dyn-map-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let dyn_map_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cozip-dyn-map-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                r#"
+struct Params {
+    len: u32,
+    block_size: u32,
+    mode: u32,
+    header_bits: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> token_flags: array<u32>;
+
+@group(0) @binding(1)
+var<storage, read> token_match_len: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> token_match_dist: array<u32>;
+
+@group(0) @binding(3)
+var<storage, read> token_lit: array<u32>;
+
+@group(0) @binding(4)
+var<storage, read> dyn_table: array<u32>;
+
+@group(0) @binding(5)
+var<storage, read_write> out_codes: array<u32>;
+
+@group(0) @binding(6)
+var<storage, read_write> out_overflow: array<u32>;
+
+@group(0) @binding(7)
+var<storage, read_write> out_bitlens: array<u32>;
+
+@group(0) @binding(8)
+var<uniform> params: Params;
+
+fn litlen_code(sym: u32) -> u32 {
+    return dyn_table[sym];
+}
+
+fn litlen_bits(sym: u32) -> u32 {
+    return dyn_table[286u + sym];
+}
+
+fn dist_code(sym: u32) -> u32 {
+    return dyn_table[572u + sym];
+}
+
+fn dist_bits(sym: u32) -> u32 {
+    return dyn_table[602u + sym];
+}
+
+fn litlen_symbol_for_len(mlen_in: u32) -> vec3<u32> {
+    let mlen = min(max(mlen_in, 3u), 258u);
+    if (mlen <= 10u) {
+        return vec3<u32>(254u + mlen, 0u, 0u);
+    }
+    if (mlen == 258u) {
+        return vec3<u32>(285u, 0u, 0u);
+    }
+
+    var symbol: u32 = 265u;
+    var base: u32 = 11u;
+    var extra: u32 = 1u;
+    loop {
+        if (extra > 5u) {
+            break;
+        }
+        var j: u32 = 0u;
+        loop {
+            if (j >= 4u) {
+                break;
+            }
+            let maxv = base + ((1u << extra) - 1u);
+            if (mlen >= base && mlen <= maxv) {
+                return vec3<u32>(symbol, mlen - base, extra);
+            }
+            base = maxv + 1u;
+            symbol = symbol + 1u;
+            j = j + 1u;
+        }
+        extra = extra + 1u;
+    }
+    return vec3<u32>(285u, 0u, 0u);
+}
+
+fn dist_symbol_for_dist(mdist_in: u32) -> vec3<u32> {
+    let mdist = max(mdist_in, 1u);
+    if (mdist <= 1u) {
+        return vec3<u32>(0u, 0u, 0u);
+    }
+    if (mdist <= 4u) {
+        return vec3<u32>(mdist - 1u, 0u, 0u);
+    }
+
+    var symbol: u32 = 4u;
+    var base: u32 = 5u;
+    var extra: u32 = 1u;
+    loop {
+        if (extra > 13u) {
+            break;
+        }
+        var j: u32 = 0u;
+        loop {
+            if (j >= 2u) {
+                break;
+            }
+            let maxv = base + ((1u << extra) - 1u);
+            if (mdist >= base && mdist <= maxv) {
+                return vec3<u32>(symbol, mdist - base, extra);
+            }
+            base = maxv + 1u;
+            symbol = symbol + 1u;
+            j = j + 1u;
+        }
+        extra = extra + 1u;
+    }
+    return vec3<u32>(29u, 0u, 0u);
+}
+
+fn append_bits(
+    value: u32,
+    bits: u32,
+    code_lo: ptr<function, u32>,
+    code_hi: ptr<function, u32>,
+    bitlen: ptr<function, u32>,
+) {
+    if (bits == 0u) {
+        return;
+    }
+    let cur = *bitlen;
+    if (cur < 32u) {
+        if (cur + bits <= 32u) {
+            *code_lo = *code_lo | (value << cur);
+        } else {
+            let low_bits = 32u - cur;
+            *code_lo = *code_lo | (value << cur);
+            *code_hi = *code_hi | (value >> low_bits);
+        }
+    } else {
+        let hi_shift = cur - 32u;
+        *code_hi = *code_hi | (value << hi_shift);
+    }
+    *bitlen = cur + bits;
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= params.len || token_flags[idx] == 0u) {
+        return;
+    }
+
+    var code_lo: u32 = 0u;
+    var code_hi: u32 = 0u;
+    var bits: u32 = 0u;
+
+    if (token_match_len[idx] < 3u || token_match_dist[idx] == 0u) {
+        let sym = min(token_lit[idx], 255u);
+        append_bits(litlen_code(sym), litlen_bits(sym), &code_lo, &code_hi, &bits);
+    } else {
+        let len_info = litlen_symbol_for_len(token_match_len[idx]);
+        let len_sym = len_info.x;
+        let len_extra_val = len_info.y;
+        let len_extra_bits = len_info.z;
+        append_bits(
+            litlen_code(len_sym),
+            litlen_bits(len_sym),
+            &code_lo,
+            &code_hi,
+            &bits,
+        );
+        append_bits(len_extra_val, len_extra_bits, &code_lo, &code_hi, &bits);
+
+        let dist_info = dist_symbol_for_dist(token_match_dist[idx]);
+        let dist_sym = dist_info.x;
+        let dist_extra_val = dist_info.y;
+        let dist_extra_bits = dist_info.z;
+        append_bits(dist_code(dist_sym), dist_bits(dist_sym), &code_lo, &code_hi, &bits);
+        append_bits(dist_extra_val, dist_extra_bits, &code_lo, &code_hi, &bits);
+    }
+
+    out_codes[idx] = code_lo;
+    out_overflow[idx] = code_hi;
+    out_bitlens[idx] = bits;
+}
+"#,
+            )),
+        });
+
+        let dyn_map_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-dyn-map-layout"),
+            bind_group_layouts: &[&dyn_map_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let dyn_map_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-dyn-map-pipeline"),
+            layout: Some(&dyn_map_layout),
+            module: &dyn_map_shader,
+            entry_point: "main",
+        });
+
+        let dyn_finalize_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cozip-dyn-finalize-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let dyn_finalize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cozip-dyn-finalize-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                r#"
+@group(0) @binding(0)
+var<storage, read_write> out_words: array<atomic<u32>>;
+
+@group(0) @binding(1)
+var<storage, read_write> total_bits: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> dyn_meta: array<u32>;
+
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x != 0u) {
+        return;
+    }
+
+    let header_bits = dyn_meta[0];
+    let eob_code = dyn_meta[1];
+    let eob_bits = dyn_meta[2];
+
+    let token_bits = total_bits[0];
+    let bit_offset = header_bits + token_bits;
+    let word_index = bit_offset >> 5u;
+    let shift = bit_offset & 31u;
+
+    atomicOr(&out_words[word_index], eob_code << shift);
+    if (shift + eob_bits > 32u) {
+        atomicOr(&out_words[word_index + 1u], eob_code >> (32u - shift));
+    }
+
+    total_bits[0] = bit_offset + eob_bits;
+}
+"#,
+            )),
+        });
+
+        let dyn_finalize_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-dyn-finalize-layout"),
+            bind_group_layouts: &[&dyn_finalize_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let dyn_finalize_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cozip-dyn-finalize-pipeline"),
+                layout: Some(&dyn_finalize_layout),
+                module: &dyn_finalize_shader,
+                entry_point: "main",
+            });
+
         let litlen_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("cozip-litlen-bgl"),
@@ -1257,7 +1660,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                         binding: 3,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size: None,
                         },
@@ -1265,6 +1668,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -1291,15 +1704,18 @@ struct Params {
 var<storage, read> codes: array<u32>;
 
 @group(0) @binding(1)
-var<storage, read> bitlens: array<u32>;
+var<storage, read> codes_hi: array<u32>;
 
 @group(0) @binding(2)
-var<storage, read> bit_offsets: array<u32>;
+var<storage, read> bitlens: array<u32>;
 
 @group(0) @binding(3)
-var<storage, read_write> out_words: array<atomic<u32>>;
+var<storage, read> bit_offsets: array<u32>;
 
 @group(0) @binding(4)
+var<storage, read_write> out_words: array<atomic<u32>>;
+
+@group(0) @binding(5)
 var<uniform> params: Params;
 
 @compute @workgroup_size(128)
@@ -1315,13 +1731,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let code = codes[idx];
-    let bit_offset = bit_offsets[idx] + 3u; // BFINAL/BTYPE header
+    let code_hi = codes_hi[idx];
+    let bit_offset = bit_offsets[idx] + params._pad1;
     let word_index = bit_offset >> 5u;
     let shift = bit_offset & 31u;
 
     atomicOr(&out_words[word_index], code << shift);
     if (shift + bits > 32u) {
         atomicOr(&out_words[word_index + 1u], code >> (32u - shift));
+    }
+
+    if (bits > 32u) {
+        let hi_bits = bits - 32u;
+        let hi_offset = bit_offset + 32u;
+        let hi_word_index = hi_offset >> 5u;
+        let hi_shift = hi_offset & 31u;
+
+        atomicOr(&out_words[hi_word_index], code_hi << hi_shift);
+        if (hi_shift + hi_bits > 32u) {
+            atomicOr(&out_words[hi_word_index + 1u], code_hi >> (32u - hi_shift));
+        }
     }
 }
 "#,
@@ -1948,6 +2377,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             token_finalize_pipeline,
             freq_bind_group_layout,
             freq_pipeline,
+            dyn_map_bind_group_layout,
+            dyn_map_pipeline,
+            dyn_finalize_bind_group_layout,
+            dyn_finalize_pipeline,
             litlen_bind_group_layout,
             litlen_pipeline,
             bitpack_bind_group_layout,
@@ -2116,8 +2549,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let input_storage_size = bytes_len::<u32>(input_words)?;
         let lane_storage_size = bytes_len::<u32>(len_capacity)?;
         let max_total_bits = len_capacity
-            .checked_mul(9)
-            .and_then(|value| value.checked_add(10))
+            .checked_mul(GPU_DEFLATE_MAX_BITS_PER_BYTE)
+            .and_then(|value| value.checked_add(2048))
             .ok_or(CozipDeflateError::DataTooLarge)?;
         let output_words = max_total_bits.div_ceil(32);
         let output_storage_size = bytes_len::<u32>(output_words)?;
@@ -2178,6 +2611,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let dyn_table_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dyn-table"),
+            size: bytes_len::<u32>(DYN_TABLE_U32_COUNT)?,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dyn_meta_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dyn-meta"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dyn_overflow_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dyn-overflow"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let token_prefix_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2364,19 +2815,85 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: bitlens_buffer.as_entire_binding(),
+                    resource: dyn_overflow_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: bit_offsets_buffer.as_entire_binding(),
+                    resource: bitlens_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: output_words_buffer.as_entire_binding(),
+                    resource: bit_offsets_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: output_words_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let dyn_map_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-dyn-map-bg"),
+            layout: &self.dyn_map_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: token_flags_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: token_len_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: token_dist_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: token_lit_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: dyn_table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: codes_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: dyn_overflow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: bitlens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let dyn_finalize_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-dyn-finalize-bg"),
+            layout: &self.dyn_finalize_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: output_words_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: total_bits_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: dyn_meta_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -2387,7 +2904,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
                 .map_err(|_| CozipDeflateError::DataTooLarge)?,
             0,
-            0,
+            3,
         ];
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
@@ -2404,6 +2921,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             token_lit_buffer,
             litlen_freq_buffer,
             dist_freq_buffer,
+            dyn_table_buffer,
+            dyn_meta_buffer,
+            dyn_overflow_buffer,
             token_prefix_buffer,
             token_total_buffer,
             bitlens_buffer,
@@ -2415,6 +2935,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             litlen_bg,
             tokenize_bg,
             freq_bg,
+            dyn_map_bg,
+            dyn_finalize_bg,
             bitpack_bg,
         })
     }
@@ -2865,7 +3387,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
                     .map_err(|_| CozipDeflateError::DataTooLarge)?,
                 compression_mode_id(mode),
-                0,
+                3,
             ];
             let output_storage_size = slots[slot_index].output_storage_size;
             {
@@ -2883,6 +3405,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 encoder.clear_buffer(&slot.token_total_buffer, 0, None);
                 encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
                 encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
+                encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
                 encoder.clear_buffer(&slot.output_words_buffer, 0, None);
                 encoder.copy_buffer_to_buffer(
                     &self.deflate_header_buffer,
@@ -3089,7 +3612,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             let slot = &slots[chunk_index];
-            let lane_copy_size = bytes_len::<u32>(len)?;
             let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
             let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
 
@@ -3112,36 +3634,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             self.queue
                 .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
-            let flags_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-flags-rb"),
-                size: lane_copy_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let kind_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-kind-rb"),
-                size: lane_copy_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let len_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-len-rb"),
-                size: lane_copy_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let dist_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-dist-rb"),
-                size: lane_copy_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let lit_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-lit-rb"),
-                size: lane_copy_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
             let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-litlen-freq-rb"),
                 size: litlen_freq_size,
@@ -3194,11 +3686,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
             }
 
-            encoder.copy_buffer_to_buffer(&slot.token_flags_buffer, 0, &flags_readback, 0, lane_copy_size);
-            encoder.copy_buffer_to_buffer(&slot.token_kind_buffer, 0, &kind_readback, 0, lane_copy_size);
-            encoder.copy_buffer_to_buffer(&slot.token_len_buffer, 0, &len_readback, 0, lane_copy_size);
-            encoder.copy_buffer_to_buffer(&slot.token_dist_buffer, 0, &dist_readback, 0, lane_copy_size);
-            encoder.copy_buffer_to_buffer(&slot.token_lit_buffer, 0, &lit_readback, 0, lane_copy_size);
             encoder.copy_buffer_to_buffer(
                 &slot.litlen_freq_buffer,
                 0,
@@ -3224,25 +3711,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 rx
             };
 
-            let flags_rx = map_buffer(&flags_readback);
-            let kind_rx = map_buffer(&kind_readback);
-            let len_rx = map_buffer(&len_readback);
-            let dist_rx = map_buffer(&dist_readback);
-            let lit_rx = map_buffer(&lit_readback);
             let litlen_freq_rx = map_buffer(&litlen_freq_readback);
             let dist_freq_rx = map_buffer(&dist_freq_readback);
 
             self.device.poll(wgpu::Maintain::Wait);
 
-            for rx in [
-                flags_rx,
-                kind_rx,
-                len_rx,
-                dist_rx,
-                lit_rx,
-                litlen_freq_rx,
-                dist_freq_rx,
-            ] {
+            for rx in [litlen_freq_rx, dist_freq_rx] {
                 match rx.recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
@@ -3250,45 +3724,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
 
-            let flags_map = flags_readback.slice(..).get_mapped_range();
-            let kind_map = kind_readback.slice(..).get_mapped_range();
-            let len_map = len_readback.slice(..).get_mapped_range();
-            let dist_map = dist_readback.slice(..).get_mapped_range();
-            let lit_map = lit_readback.slice(..).get_mapped_range();
             let litlen_freq_map = litlen_freq_readback.slice(..).get_mapped_range();
             let dist_freq_map = dist_freq_readback.slice(..).get_mapped_range();
-
-            let flags_words: &[u32] = bytemuck::cast_slice(&flags_map);
-            let kind_words: &[u32] = bytemuck::cast_slice(&kind_map);
-            let len_words: &[u32] = bytemuck::cast_slice(&len_map);
-            let dist_words: &[u32] = bytemuck::cast_slice(&dist_map);
-            let lit_words: &[u32] = bytemuck::cast_slice(&lit_map);
-
-            let mut tokens = Vec::new();
-            for i in 0..len {
-                if flags_words.get(i).copied().unwrap_or(0) == 0 {
-                    continue;
-                }
-                if kind_words.get(i).copied().unwrap_or(0) == 1 {
-                    let mlen = len_words.get(i).copied().unwrap_or(0) as usize;
-                    let mdist = dist_words.get(i).copied().unwrap_or(0) as usize;
-                    if (MIN_MATCH..=MAX_MATCH).contains(&mlen) && (1..=MAX_DISTANCE).contains(&mdist)
-                    {
-                        tokens.push(DeflateToken::Match {
-                            len: mlen,
-                            dist: mdist,
-                        });
-                        continue;
-                    }
-                }
-                tokens.push(DeflateToken::Literal(
-                    (lit_words.get(i).copied().unwrap_or(0) & 0xFF) as u8,
-                ));
-            }
-
-            if tokens.is_empty() {
-                tokens.extend(data.iter().copied().map(DeflateToken::Literal));
-            }
 
             let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
             let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
@@ -3296,29 +3733,142 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
             litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
             dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
-            litlen_freq[256] = litlen_freq[256].saturating_add(1);
-            if dist_freq.iter().all(|value| *value == 0) {
-                dist_freq[0] = 1;
-            }
-
-            drop(flags_map);
-            drop(kind_map);
-            drop(len_map);
-            drop(dist_map);
-            drop(lit_map);
             drop(litlen_freq_map);
             drop(dist_freq_map);
-            flags_readback.unmap();
-            kind_readback.unmap();
-            len_readback.unmap();
-            dist_readback.unmap();
-            lit_readback.unmap();
             litlen_freq_readback.unmap();
             dist_freq_readback.unmap();
 
-            let compressed = encode_deflate_dynamic_from_tokens(&tokens, &litlen_freq, &dist_freq)
-                .or_else(|_| encode_deflate_fixed_from_tokens(&tokens))?;
-            results[chunk_index] = compressed;
+            let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
+            let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
+            dyn_table.extend_from_slice(&plan.litlen_codes);
+            dyn_table.extend_from_slice(&plan.litlen_bits);
+            dyn_table.extend_from_slice(&plan.dist_codes);
+            dyn_table.extend_from_slice(&plan.dist_bits);
+            self.queue
+                .write_buffer(&slot.dyn_table_buffer, 0, bytemuck::cast_slice(&dyn_table));
+            let meta = [plan.header_bits, u32::from(plan.eob_code), u32::from(plan.eob_bits), 0];
+            self.queue
+                .write_buffer(&slot.dyn_meta_buffer, 0, bytemuck::cast_slice(&meta));
+            let params = [
+                len_u32,
+                u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                compression_mode_id(mode),
+                plan.header_bits,
+            ];
+            self.queue
+                .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
+
+            let header_words = plan.header_bytes.len().div_ceil(std::mem::size_of::<u32>());
+            let header_copy_size = bytes_len::<u32>(header_words)?;
+            let header_copy_size_usize =
+                usize::try_from(header_copy_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            if header_copy_size > slot.output_storage_size {
+                return Err(CozipDeflateError::DataTooLarge);
+            }
+            let mut header_padded = vec![0_u8; header_copy_size_usize];
+            header_padded[..plan.header_bytes.len()].copy_from_slice(&plan.header_bytes);
+            let header_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-dyn-header"),
+                size: header_copy_size,
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&header_staging, 0, &header_padded);
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-deflate-dynamic-pack-encoder"),
+                });
+
+            encoder.clear_buffer(&slot.token_total_buffer, 0, None);
+            encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
+            encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
+            encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
+            encoder.clear_buffer(&slot.output_words_buffer, 0, None);
+            encoder.copy_buffer_to_buffer(
+                &header_staging,
+                0,
+                &slot.output_words_buffer,
+                0,
+                header_copy_size,
+            );
+
+            self.dispatch_parallel_prefix_scan(
+                &mut encoder,
+                &slot.token_flags_buffer,
+                &slot.token_prefix_buffer,
+                &slot.token_total_buffer,
+                len,
+                "token-prefix-dynamic",
+            )?;
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-dyn-map-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.dyn_map_pipeline);
+                pass.set_bind_group(0, &slot.dyn_map_bg, &[]);
+                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+            }
+
+            self.dispatch_parallel_prefix_scan(
+                &mut encoder,
+                &slot.bitlens_buffer,
+                &slot.bit_offsets_buffer,
+                &slot.total_bits_buffer,
+                len,
+                "bitlen-prefix-dynamic",
+            )?;
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-bitpack-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.bitpack_pipeline);
+                pass.set_bind_group(0, &slot.bitpack_bg, &[]);
+                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-dyn-finalize-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.dyn_finalize_pipeline);
+                pass.set_bind_group(0, &slot.dyn_finalize_bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+
+            encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
+            encoder.copy_buffer_to_buffer(
+                &slot.output_words_buffer,
+                0,
+                &slot.readback,
+                4,
+                slot.output_storage_size,
+            );
+
+            self.queue.submit(Some(encoder.finish()));
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            slot.readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            self.device.poll(wgpu::Maintain::Wait);
+            match rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            }
+
+            results[chunk_index] =
+                collect_deflate_readback_dynamic(&slots[chunk_index], slots[chunk_index].output_storage_size)?;
         }
 
         Ok(results)
@@ -3356,6 +3906,43 @@ fn collect_deflate_readback(
     let total_bits = literal_bits
         .checked_add(10)
         .ok_or(CozipDeflateError::DataTooLarge)?;
+    let total_bytes = total_bits.div_ceil(8);
+
+    let output_storage_size =
+        usize::try_from(output_storage_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    if total_bytes > output_storage_size {
+        return Err(CozipDeflateError::Internal(
+            "gpu compressed output exceeded allocated readback",
+        ));
+    }
+
+    let payload_start = 4usize;
+    let payload_end = payload_start
+        .checked_add(output_storage_size)
+        .ok_or(CozipDeflateError::DataTooLarge)?;
+    if payload_end > mapped.len() {
+        return Err(CozipDeflateError::Internal("gpu readback payload out of range"));
+    }
+
+    let payload = &mapped[payload_start..payload_end];
+    let mut compressed = Vec::with_capacity(total_bytes);
+    compressed.extend_from_slice(&payload[..total_bytes]);
+    drop(mapped);
+    slot.readback.unmap();
+    Ok(compressed)
+}
+
+fn collect_deflate_readback_dynamic(
+    slot: &DeflateSlot,
+    output_storage_size: u64,
+) -> Result<Vec<u8>, CozipDeflateError> {
+    let mapped = slot.readback.slice(..).get_mapped_range();
+    if mapped.len() < 4 {
+        return Err(CozipDeflateError::Internal("gpu readback too small"));
+    }
+
+    let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
+    let total_bits = total_words.first().copied().unwrap_or(0) as usize;
     let total_bytes = total_bits.div_ceil(8);
 
     let output_storage_size =
@@ -4641,6 +5228,7 @@ struct BitWriter {
     out: Vec<u8>,
     bitbuf: u64,
     bitcount: u8,
+    total_bits: usize,
 }
 
 impl BitWriter {
@@ -4649,18 +5237,24 @@ impl BitWriter {
             out: Vec::new(),
             bitbuf: 0,
             bitcount: 0,
+            total_bits: 0,
         }
     }
 
     fn write_bits(&mut self, value: u32, bits: u8) {
         self.bitbuf |= (value as u64) << self.bitcount;
         self.bitcount += bits;
+        self.total_bits += bits as usize;
 
         while self.bitcount >= 8 {
             self.out.push((self.bitbuf & 0xFF) as u8);
             self.bitbuf >>= 8;
             self.bitcount -= 8;
         }
+    }
+
+    fn bit_len(&self) -> usize {
+        self.total_bits
     }
 
     fn finish(mut self) -> Vec<u8> {
@@ -5071,6 +5665,141 @@ fn encode_code_lengths_rle(lengths: &[u8]) -> Vec<(u8, u8)> {
         i += run;
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct DynamicHuffmanPlan {
+    litlen_codes: Vec<u32>,
+    litlen_bits: Vec<u32>,
+    dist_codes: Vec<u32>,
+    dist_bits: Vec<u32>,
+    header_bytes: Vec<u8>,
+    header_bits: u32,
+    eob_code: u16,
+    eob_bits: u8,
+}
+
+fn build_dynamic_huffman_plan(
+    litlen_freq_in: &[u32],
+    dist_freq_in: &[u32],
+) -> Result<DynamicHuffmanPlan, CozipDeflateError> {
+    const MAX_BITS: u8 = 15;
+    const CODELEN_MAX_BITS: u8 = 7;
+    const CODELEN_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    if litlen_freq_in.len() != LITLEN_SYMBOL_COUNT || dist_freq_in.len() != DIST_SYMBOL_COUNT {
+        return Err(CozipDeflateError::Internal("invalid frequency table size"));
+    }
+
+    let mut litlen_freq = litlen_freq_in.to_vec();
+    let mut dist_freq = dist_freq_in.to_vec();
+    litlen_freq[256] = litlen_freq[256].saturating_add(1);
+    if dist_freq.iter().all(|value| *value == 0) {
+        dist_freq[0] = 1;
+    }
+
+    let litlen_lengths = build_huffman_code_lengths(&litlen_freq, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build litlen huffman lengths"))?;
+    let dist_lengths = build_huffman_code_lengths(&dist_freq, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build dist huffman lengths"))?;
+
+    let hlit_count = litlen_lengths
+        .iter()
+        .rposition(|len| *len != 0)
+        .map(|index| (index + 1).max(257))
+        .unwrap_or(257);
+    let hdist_count = dist_lengths
+        .iter()
+        .rposition(|len| *len != 0)
+        .map(|index| (index + 1).max(1))
+        .unwrap_or(1);
+
+    let mut header_lengths = Vec::with_capacity(hlit_count + hdist_count);
+    header_lengths.extend_from_slice(&litlen_lengths[..hlit_count]);
+    header_lengths.extend_from_slice(&dist_lengths[..hdist_count]);
+    let cl_rle = encode_code_lengths_rle(&header_lengths);
+
+    let mut cl_freq = vec![0_u32; 19];
+    for (symbol, _) in &cl_rle {
+        cl_freq[*symbol as usize] = cl_freq[*symbol as usize].saturating_add(1);
+    }
+    if cl_freq.iter().all(|value| *value == 0) {
+        cl_freq[0] = 1;
+    }
+
+    let cl_lengths = build_huffman_code_lengths(&cl_freq, CODELEN_MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build codelen huffman lengths"))?;
+    let hclen_count = CODELEN_ORDER
+        .iter()
+        .rposition(|&sym| cl_lengths[sym] != 0)
+        .map(|index| (index + 1).max(4))
+        .unwrap_or(4);
+
+    let litlen_codes_raw = build_canonical_codes(&litlen_lengths, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build litlen codes"))?;
+    let dist_codes_raw = build_canonical_codes(&dist_lengths, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build dist codes"))?;
+    let cl_codes = build_canonical_codes(&cl_lengths, CODELEN_MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build codelen codes"))?;
+
+    let mut writer = BitWriter::new();
+    writer.write_bits(1, 1);
+    writer.write_bits(0b10, 2);
+    writer.write_bits((hlit_count - 257) as u32, 5);
+    writer.write_bits((hdist_count - 1) as u32, 5);
+    writer.write_bits((hclen_count - 4) as u32, 4);
+    for &sym in CODELEN_ORDER.iter().take(hclen_count) {
+        writer.write_bits(cl_lengths[sym] as u32, 3);
+    }
+    for (symbol, extra) in cl_rle {
+        let (code, bits) = cl_codes[symbol as usize];
+        if bits == 0 {
+            return Err(CozipDeflateError::Internal("missing code-length code"));
+        }
+        writer.write_bits(code as u32, bits);
+        match symbol {
+            16 => writer.write_bits(extra as u32, 2),
+            17 => writer.write_bits(extra as u32, 3),
+            18 => writer.write_bits(extra as u32, 7),
+            _ => {}
+        }
+    }
+
+    let header_bits = u32::try_from(writer.bit_len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let header_bytes = writer.finish();
+
+    let mut litlen_codes = vec![0_u32; LITLEN_SYMBOL_COUNT];
+    let mut litlen_bits = vec![0_u32; LITLEN_SYMBOL_COUNT];
+    for (idx, (code, bits)) in litlen_codes_raw.into_iter().enumerate() {
+        litlen_codes[idx] = code as u32;
+        litlen_bits[idx] = bits as u32;
+    }
+
+    let mut dist_codes = vec![0_u32; DIST_SYMBOL_COUNT];
+    let mut dist_bits = vec![0_u32; DIST_SYMBOL_COUNT];
+    for (idx, (code, bits)) in dist_codes_raw.into_iter().enumerate() {
+        dist_codes[idx] = code as u32;
+        dist_bits[idx] = bits as u32;
+    }
+
+    let eob_code = litlen_codes[256] as u16;
+    let eob_bits = litlen_bits[256] as u8;
+    if eob_bits == 0 {
+        return Err(CozipDeflateError::Internal("missing end-of-block code"));
+    }
+
+    Ok(DynamicHuffmanPlan {
+        litlen_codes,
+        litlen_bits,
+        dist_codes,
+        dist_bits,
+        header_bytes,
+        header_bits,
+        eob_code,
+        eob_bits,
+    })
 }
 
 fn encode_deflate_dynamic_from_tokens(

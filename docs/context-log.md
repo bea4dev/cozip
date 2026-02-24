@@ -866,3 +866,49 @@ mode別GPU品質パラメータ:
 検証:
 - `cargo test -p cozip_deflate --lib` 通過
 - `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+
+## 2026-02-24 - Ratio 1+2 実装 (freq+final readback / GPU bitpack)
+
+目的:
+- ratio で readback を最小化
+  - 旧: token配列 + freq + 最終出力
+  - 新: freq + 最終出力のみ
+- CPUは dynamic Huffman 木生成のみ
+- GPUで token bitpack + EOB finalize を実行
+
+主な変更:
+- `deflate_dynamic_hybrid_batch()` を2段化
+  1. GPU tokenize/finalize/freq → `litlen/dist` 頻度のみreadback
+  2. CPUで dynamic Huffman plan 作成
+  3. planをGPUへupload
+  4. GPUで token map → prefix scan → bitpack → dynamic finalize(EOB)
+  5. 最終圧縮バイト列のみreadback
+- dynamic Huffman plan構築ヘルパーを追加
+  - `build_dynamic_huffman_plan()`
+- GPU dynamic map/finalize パイプラインを追加
+  - `dyn_map_pipeline`
+  - `dyn_finalize_pipeline`
+- bitpack shader を拡張
+  - base bit offset を `params._pad1` で可変化
+  - 33bit以上コード用の high-lane (`dyn_overflow_buffer`) を追加
+
+制約対応:
+- `wgpu` の `max_storage_buffers_per_shader_stage=8` 制限へ対応
+  - `dyn_map` のstorage bindingを8本以内に再設計
+  - token compact index(`token_prefix`)依存を除去（lane indexで直接bitpack）
+  - dynamic tableを単一storage buffer (`dyn_table_buffer`) に統合
+
+バッファ/slot側:
+- 追加: `dyn_table_buffer`, `dyn_meta_buffer`, `dyn_overflow_buffer`, `dyn_map_bg`, `dyn_finalize_bg`
+- 出力上限を dynamic も見込んで拡張
+  - `GPU_DEFLATE_MAX_BITS_PER_BYTE = 20`
+
+検証:
+- `cargo test -p cozip_deflate --lib --no-run` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+- `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 512 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256 --mode ratio` 通過
+  - CPU_ONLY ratio=0.3364, CPU+GPU ratio=0.3373 (512MiB, 1iter)
+
+備考:
+- 未使用関数/定数に関する warning は残る（既存設計由来）。
+- 今回は panic/validation error を出さずに ratio 経路をGPU bitpack 化できた状態。
