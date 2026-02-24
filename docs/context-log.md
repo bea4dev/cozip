@@ -527,3 +527,73 @@
   - CPU+GPU : comp_mib_s=132.78 ratio=0.4978
 
 補足: 圧縮スループットは大きく改善。圧縮率は依然CPU_ONLYより悪化しやすい。
+
+## 2026-02-24 - Atomic状態ベースの適応スケジューラ
+
+### 目的
+
+- 固定比率(`gpu_fraction`)配分だけだとGPU遅い環境で全体が引きずられる問題を緩和
+- GPU優先予約を維持しつつ、未着手予約をCPUへ再配分する
+
+### 実装
+
+1. 圧縮タスク状態をAtomic化
+- `ScheduledCompressTask` を追加
+- 状態: `Pending / ReservedGpu / RunningGpu / RunningCpu / Done`
+- `reserved_at_ms` を保持し、GPU予約の鮮度を判定
+
+2. GPU有効時の圧縮経路を新スケジューラへ切替
+- `compress_hybrid()` でGPU有効時は `compress_hybrid_adaptive_scheduler()` を使用
+- CPU-only時は既存キュー経路を維持
+
+3. 監視スレッド(Watchdog)を追加
+- `ReservedGpu` のまま一定時間(`GPU_RESERVATION_TIMEOUT_MS`)更新されないタスクを検出
+- CPU空き数(`active_cpu`)ぶんだけ `Pending` へ降格し、CPUに実行機会を渡す
+
+4. CPU/GPUワーカーはCASでタスク獲得
+- CPUは `Pending -> RunningCpu`
+- GPUは `ReservedGpu -> RunningGpu` を優先、その後 `Pending -> RunningGpu`
+- 実行後は `Done` に遷移し `remaining` を減算
+
+5. 待機は `Condvar + timeout` で実装
+- 両者が取り合えない時は短時間sleepし、busy-spinを回避
+
+### 検証
+
+1. `cargo test -p cozip_deflate --lib` 通過
+2. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+3. `cargo run --release -p cozip_deflate --example bench_hybrid` 実行
+
+### 直近ベンチ (bench_hybrid)
+
+- 4MiB
+  - CPU_ONLY: comp_mib_s=40.85 ratio=0.3361
+  - CPU+GPU : comp_mib_s=190.71 ratio=0.6593
+
+- 16MiB
+  - CPU_ONLY: comp_mib_s=138.54 ratio=0.3364
+  - CPU+GPU : comp_mib_s=149.78 ratio=0.4978
+
+メモ: 圧縮率はまだGPU側が不利だが、スループット面は固定配分より改善。
+
+### 追加ベンチ (2026-02-24 / 4GiB)
+
+command:
+`cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 4096 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256`
+
+- CPU_ONLY:
+  - comp_mib_s=514.72
+  - decomp_mib_s=4656.01
+  - ratio=0.3364
+  - cpu_chunks=1024 gpu_chunks=0
+
+- CPU+GPU:
+  - comp_mib_s=587.09
+  - decomp_mib_s=4282.01
+  - ratio=0.4020
+  - cpu_chunks=816 gpu_chunks=208
+
+メモ:
+- 圧縮はCPU+GPUが優位(+14%程度)
+- 解凍はCPU_ONLYが優位
+- speedup表記の注記(`>1.0 means CPU_ONLY faster`)は逆で、実際はCPU_ONLY/hybrid比なので>1はhybridが速い

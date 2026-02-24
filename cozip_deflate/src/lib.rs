@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use thiserror::Error;
@@ -38,6 +40,8 @@ const MAX_RUN_HINTS: usize = 8;
 const GPU_BATCH_CHUNKS: usize = 16;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
+const GPU_RESERVATION_TIMEOUT_MS: u64 = 3;
+const SCHEDULER_WAIT_MS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct HybridOptions {
@@ -153,6 +157,25 @@ struct ChunkTask {
     index: usize,
     preferred_gpu: bool,
     raw: Vec<u8>,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressTaskState {
+    Pending = 0,
+    ReservedGpu = 1,
+    RunningGpu = 2,
+    RunningCpu = 3,
+    Done = 4,
+}
+
+#[derive(Debug)]
+struct ScheduledCompressTask {
+    index: usize,
+    preferred_gpu: bool,
+    raw: Vec<u8>,
+    state: AtomicU8,
+    reserved_at_ms: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -2572,8 +2595,11 @@ pub fn compress_hybrid(
     };
 
     let tasks = build_chunk_tasks(input, options, gpu_context.is_some())?;
-    let chunk_count = tasks.len();
+    if let Some(gpu) = gpu_context.clone() {
+        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options, gpu);
+    }
 
+    let chunk_count = tasks.len();
     let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let results = Arc::new(Mutex::new(vec![None; chunk_count]));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
@@ -2797,6 +2823,414 @@ fn build_chunk_tasks(
     }
 
     Ok(tasks)
+}
+
+fn compress_hybrid_adaptive_scheduler(
+    original_len: usize,
+    tasks: Vec<ChunkTask>,
+    options: &HybridOptions,
+    gpu: Arc<GpuAssist>,
+) -> Result<CompressedFrame, CozipDeflateError> {
+    let chunk_count = tasks.len();
+    let start = Arc::new(Instant::now());
+    let now_ms = monotonic_ms(&start);
+    let scheduled_tasks = Arc::new(
+        tasks
+            .into_iter()
+            .map(|task| {
+                let state = if task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size {
+                    CompressTaskState::ReservedGpu
+                } else {
+                    CompressTaskState::Pending
+                };
+                ScheduledCompressTask {
+                    index: task.index,
+                    preferred_gpu: task.preferred_gpu,
+                    raw: task.raw,
+                    state: AtomicU8::new(state as u8),
+                    reserved_at_ms: AtomicU64::new(now_ms),
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
+    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
+    let remaining = Arc::new(AtomicUsize::new(chunk_count));
+    let active_cpu = Arc::new(AtomicUsize::new(0));
+    let wake = Arc::new((Mutex::new(()), Condvar::new()));
+    let cpu_workers = cpu_worker_count(true);
+
+    let mut handles = Vec::new();
+    for _ in 0..cpu_workers {
+        let tasks_ref = Arc::clone(&scheduled_tasks);
+        let results_ref = Arc::clone(&results);
+        let err_ref = Arc::clone(&error);
+        let rem_ref = Arc::clone(&remaining);
+        let active_ref = Arc::clone(&active_cpu);
+        let wake_ref = Arc::clone(&wake);
+        let opts = options.clone();
+
+        handles.push(std::thread::spawn(move || {
+            compress_cpu_worker_adaptive(
+                tasks_ref,
+                results_ref,
+                err_ref,
+                rem_ref,
+                active_ref,
+                wake_ref,
+                &opts,
+            )
+        }));
+    }
+
+    {
+        let tasks_ref = Arc::clone(&scheduled_tasks);
+        let results_ref = Arc::clone(&results);
+        let err_ref = Arc::clone(&error);
+        let rem_ref = Arc::clone(&remaining);
+        let wake_ref = Arc::clone(&wake);
+        let opts = options.clone();
+        let gpu_ref = Arc::clone(&gpu);
+
+        handles.push(std::thread::spawn(move || {
+            compress_gpu_worker_adaptive(tasks_ref, results_ref, err_ref, rem_ref, wake_ref, &opts, gpu_ref)
+        }));
+    }
+
+    {
+        let tasks_ref = Arc::clone(&scheduled_tasks);
+        let err_ref = Arc::clone(&error);
+        let rem_ref = Arc::clone(&remaining);
+        let active_ref = Arc::clone(&active_cpu);
+        let wake_ref = Arc::clone(&wake);
+        let start_ref = Arc::clone(&start);
+
+        handles.push(std::thread::spawn(move || {
+            compress_scheduler_watchdog(
+                tasks_ref, err_ref, rem_ref, active_ref, wake_ref, cpu_workers, start_ref,
+            )
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(err) = lock(&error)?.take() {
+        return Err(err);
+    }
+
+    let mut chunks = Vec::new();
+    for item in lock(&results)?.drain(..) {
+        let member = item.ok_or(CozipDeflateError::Internal("missing compressed chunk"))?;
+        chunks.push(member);
+    }
+    chunks.sort_by_key(|chunk| chunk.index);
+
+    let stats = summarize_encoded_chunks(&chunks, true);
+    let frame = encode_frame(original_len, &chunks)?;
+
+    Ok(CompressedFrame { bytes: frame, stats })
+}
+
+fn compress_cpu_worker_adaptive(
+    tasks: Arc<Vec<ScheduledCompressTask>>,
+    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    remaining: Arc<AtomicUsize>,
+    active_cpu: Arc<AtomicUsize>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    options: &HybridOptions,
+) {
+    loop {
+        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
+            break;
+        }
+
+        let Some(task_index) = claim_cpu_task(&tasks, options.gpu_min_chunk_size) else {
+            wait_for_scheduler(&wake);
+            continue;
+        };
+
+        active_cpu.fetch_add(1, Ordering::AcqRel);
+        let task = &tasks[task_index];
+        let raw_len = match u32::try_from(task.raw.len()) {
+            Ok(value) => value,
+            Err(_) => {
+                set_error(&error, CozipDeflateError::DataTooLarge);
+                return;
+            }
+        };
+        let compressed = deflate_compress_cpu(&task.raw, options.compression_level).map(|compressed| {
+            ChunkMember {
+                index: task.index,
+                backend: ChunkBackend::Cpu,
+                transform: ChunkTransform::None,
+                raw_len,
+                compressed,
+            }
+        });
+        active_cpu.fetch_sub(1, Ordering::AcqRel);
+
+        match compressed {
+            Ok(encoded) => {
+                if let Err(err) = store_encoded_result(&results, encoded) {
+                    set_error(&error, err);
+                    break;
+                }
+                finish_scheduled_task(task, &remaining, &wake);
+            }
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        }
+    }
+}
+
+fn compress_gpu_worker_adaptive(
+    tasks: Arc<Vec<ScheduledCompressTask>>,
+    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    remaining: Arc<AtomicUsize>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    options: &HybridOptions,
+    gpu: Arc<GpuAssist>,
+) {
+    loop {
+        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
+            break;
+        }
+
+        let batch = claim_gpu_batch_tasks(&tasks, options.gpu_min_chunk_size, GPU_BATCH_CHUNKS);
+        if batch.is_empty() {
+            wait_for_scheduler(&wake);
+            continue;
+        }
+
+        let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
+        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data);
+
+        match compressed_batch {
+            Ok(compressed_items) if compressed_items.len() == batch.len() => {
+                for (task_index, compressed) in batch.iter().copied().zip(compressed_items.into_iter()) {
+                    let task = &tasks[task_index];
+                    let raw_len = match u32::try_from(task.raw.len()) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            set_error(&error, CozipDeflateError::DataTooLarge);
+                            return;
+                        }
+                    };
+                    let encoded = ChunkMember {
+                        index: task.index,
+                        backend: ChunkBackend::GpuAssisted,
+                        transform: ChunkTransform::None,
+                        raw_len,
+                        compressed,
+                    };
+                    if let Err(err) = store_encoded_result(&results, encoded) {
+                        set_error(&error, err);
+                        return;
+                    }
+                    finish_scheduled_task(task, &remaining, &wake);
+                }
+            }
+            _ => {
+                for task_index in batch {
+                    let task = &tasks[task_index];
+                    let raw_len = match u32::try_from(task.raw.len()) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            set_error(&error, CozipDeflateError::DataTooLarge);
+                            return;
+                        }
+                    };
+                    match deflate_compress_cpu(&task.raw, options.compression_level) {
+                        Ok(compressed) => {
+                            let encoded = ChunkMember {
+                                index: task.index,
+                                backend: ChunkBackend::Cpu,
+                                transform: ChunkTransform::None,
+                                raw_len,
+                                compressed,
+                            };
+                            if let Err(err) = store_encoded_result(&results, encoded) {
+                                set_error(&error, err);
+                                return;
+                            }
+                            finish_scheduled_task(task, &remaining, &wake);
+                        }
+                        Err(err) => {
+                            set_error(&error, err);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn compress_scheduler_watchdog(
+    tasks: Arc<Vec<ScheduledCompressTask>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    remaining: Arc<AtomicUsize>,
+    active_cpu: Arc<AtomicUsize>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    cpu_workers: usize,
+    start: Arc<Instant>,
+) {
+    loop {
+        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
+            break;
+        }
+
+        let idle_cpu = cpu_workers.saturating_sub(active_cpu.load(Ordering::Acquire));
+        if idle_cpu > 0 {
+            let now_ms = monotonic_ms(&start);
+            let mut demoted = 0usize;
+            for task in tasks.iter() {
+                if demoted >= idle_cpu {
+                    break;
+                }
+                if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8 {
+                    let reserved_at = task.reserved_at_ms.load(Ordering::Acquire);
+                    if now_ms.saturating_sub(reserved_at) >= GPU_RESERVATION_TIMEOUT_MS
+                        && task
+                            .state
+                            .compare_exchange(
+                                CompressTaskState::ReservedGpu as u8,
+                                CompressTaskState::Pending as u8,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        demoted += 1;
+                    }
+                }
+            }
+            if demoted > 0 {
+                wake.1.notify_all();
+            }
+        }
+
+        wait_for_scheduler(&wake);
+    }
+}
+
+fn monotonic_ms(start: &Instant) -> u64 {
+    let elapsed = start.elapsed().as_millis();
+    elapsed.min(u128::from(u64::MAX)) as u64
+}
+
+fn claim_cpu_task(tasks: &[ScheduledCompressTask], gpu_min_chunk_size: usize) -> Option<usize> {
+    for (index, task) in tasks.iter().enumerate() {
+        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
+            && (!task.preferred_gpu || task.raw.len() < gpu_min_chunk_size)
+            && task
+                .state
+                .compare_exchange(
+                    CompressTaskState::Pending as u8,
+                    CompressTaskState::RunningCpu as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return Some(index);
+        }
+    }
+
+    for (index, task) in tasks.iter().enumerate() {
+        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
+            && task
+                .state
+                .compare_exchange(
+                    CompressTaskState::Pending as u8,
+                    CompressTaskState::RunningCpu as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn claim_gpu_batch_tasks(
+    tasks: &[ScheduledCompressTask],
+    gpu_min_chunk_size: usize,
+    max_batch_chunks: usize,
+) -> Vec<usize> {
+    let mut batch = Vec::with_capacity(max_batch_chunks.max(1));
+    let batch_limit = max_batch_chunks.max(1);
+
+    for (index, task) in tasks.iter().enumerate() {
+        if batch.len() >= batch_limit {
+            break;
+        }
+        if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8
+            && task
+                .state
+                .compare_exchange(
+                    CompressTaskState::ReservedGpu as u8,
+                    CompressTaskState::RunningGpu as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            batch.push(index);
+        }
+    }
+
+    for (index, task) in tasks.iter().enumerate() {
+        if batch.len() >= batch_limit {
+            break;
+        }
+        if task.raw.len() < gpu_min_chunk_size {
+            continue;
+        }
+        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
+            && task
+                .state
+                .compare_exchange(
+                    CompressTaskState::Pending as u8,
+                    CompressTaskState::RunningGpu as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            batch.push(index);
+        }
+    }
+
+    batch
+}
+
+fn finish_scheduled_task(
+    task: &ScheduledCompressTask,
+    remaining: &AtomicUsize,
+    wake: &(Mutex<()>, Condvar),
+) {
+    task.state.store(CompressTaskState::Done as u8, Ordering::Release);
+    remaining.fetch_sub(1, Ordering::AcqRel);
+    wake.1.notify_all();
+}
+
+fn wait_for_scheduler(wake: &(Mutex<()>, Condvar)) {
+    if let Ok(guard) = wake.0.lock() {
+        let _ = wake
+            .1
+            .wait_timeout(guard, Duration::from_millis(SCHEDULER_WAIT_MS));
+    }
 }
 
 fn summarize_encoded_chunks(chunks: &[ChunkMember], gpu_available: bool) -> HybridStats {
