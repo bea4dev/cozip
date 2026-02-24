@@ -225,6 +225,32 @@ struct GpuAssist {
     scan_add_pipeline: wgpu::ComputePipeline,
     emit_bind_group_layout: wgpu::BindGroupLayout,
     emit_pipeline: wgpu::ComputePipeline,
+    deflate_slots: Mutex<Vec<DeflateSlot>>,
+    deflate_header_buffer: wgpu::Buffer,
+}
+
+#[derive(Debug)]
+struct DeflateSlot {
+    len_capacity: usize,
+    output_storage_size: u64,
+    input_buffer: wgpu::Buffer,
+    codes_buffer: wgpu::Buffer,
+    token_flags_buffer: wgpu::Buffer,
+    token_kind_buffer: wgpu::Buffer,
+    token_len_buffer: wgpu::Buffer,
+    token_dist_buffer: wgpu::Buffer,
+    token_lit_buffer: wgpu::Buffer,
+    token_prefix_buffer: wgpu::Buffer,
+    token_total_buffer: wgpu::Buffer,
+    bitlens_buffer: wgpu::Buffer,
+    bit_offsets_buffer: wgpu::Buffer,
+    total_bits_buffer: wgpu::Buffer,
+    output_words_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    litlen_bg: wgpu::BindGroup,
+    tokenize_bg: wgpu::BindGroup,
+    bitpack_bg: wgpu::BindGroup,
 }
 
 impl GpuAssist {
@@ -1577,6 +1603,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             entry_point: "main",
         });
 
+        let deflate_header_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-header"),
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&deflate_header_buffer, 0, bytemuck::bytes_of(&0b011_u32));
+
         Ok(Self {
             device,
             queue,
@@ -1599,6 +1633,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             scan_add_pipeline,
             emit_bind_group_layout,
             emit_pipeline,
+            deflate_slots: Mutex::new(Vec::new()),
+            deflate_header_buffer,
         })
     }
 
@@ -1741,6 +1777,257 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         encoder.copy_buffer_to_buffer(&block_total_buffer, 0, total_buffer, 0, 4);
         let _ = label;
         Ok(())
+    }
+
+    fn create_deflate_slot(&self, len_capacity: usize) -> Result<DeflateSlot, CozipDeflateError> {
+        let len_u32 = u32::try_from(len_capacity).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let input_words = len_capacity.div_ceil(std::mem::size_of::<u32>());
+        let input_storage_size = bytes_len::<u32>(input_words)?;
+        let lane_storage_size = bytes_len::<u32>(len_capacity)?;
+        let max_total_bits = len_capacity
+            .checked_mul(9)
+            .and_then(|value| value.checked_add(10))
+            .ok_or(CozipDeflateError::DataTooLarge)?;
+        let output_words = max_total_bits.div_ceil(32);
+        let output_storage_size = bytes_len::<u32>(output_words)?;
+
+        let input_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-input"),
+            size: input_storage_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let codes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-codes"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_flags_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-flags"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_kind_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-kind"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_len_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-len"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_dist_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-dist"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_lit_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-lit"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_prefix_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-prefix"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let token_total_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-token-total"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bitlens_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-bitlens"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bit_offsets_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-bit-offsets"),
+            size: lane_storage_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let total_bits_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-total-bits"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let output_words_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-out-words"),
+            size: output_storage_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let readback_size = output_storage_size
+            .checked_add(4)
+            .ok_or(CozipDeflateError::DataTooLarge)?;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-readback"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let litlen_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-litlen-bg"),
+            layout: &self.litlen_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: token_flags_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: token_kind_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: token_len_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: token_dist_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: token_lit_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: token_prefix_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: codes_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: bitlens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let tokenize_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-tokenize-bg"),
+            layout: &self.tokenize_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: token_flags_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: token_kind_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: token_len_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: token_dist_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: token_lit_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let bitpack_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-bitpack-bg"),
+            layout: &self.bitpack_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: codes_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bitlens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bit_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_words_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Set static params for maximum-capacity slot; actual len is set per dispatch call.
+        let params = [
+            len_u32,
+            u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
+                .map_err(|_| CozipDeflateError::DataTooLarge)?,
+            0,
+            0,
+        ];
+        self.queue
+            .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
+
+        Ok(DeflateSlot {
+            len_capacity,
+            output_storage_size,
+            input_buffer,
+            codes_buffer,
+            token_flags_buffer,
+            token_kind_buffer,
+            token_len_buffer,
+            token_dist_buffer,
+            token_lit_buffer,
+            token_prefix_buffer,
+            token_total_buffer,
+            bitlens_buffer,
+            bit_offsets_buffer,
+            total_bits_buffer,
+            output_words_buffer,
+            params_buffer,
+            readback,
+            litlen_bg,
+            tokenize_bg,
+            bitpack_bg,
+        })
     }
 
     fn run_start_positions(
@@ -2088,7 +2375,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         struct PendingDeflateReadback {
             chunk_index: usize,
-            readback: wgpu::Buffer,
+            slot_index: usize,
             output_storage_size: u64,
         }
 
@@ -2100,6 +2387,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 label: Some("cozip-deflate-batch-encoder"),
             });
         let mut dispatched = false;
+        let mut slots = lock(&self.deflate_slots)?;
 
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
@@ -2109,120 +2397,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let len = data.len();
             let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            if slots.len() <= chunk_index {
+                slots.push(self.create_deflate_slot(len)?);
+            } else if slots[chunk_index].len_capacity < len {
+                slots[chunk_index] = self.create_deflate_slot(len)?;
+            }
+            let slot = &mut slots[chunk_index];
+
             let input_words = len.div_ceil(std::mem::size_of::<u32>());
-            let input_storage_size = bytes_len::<u32>(input_words)?;
-            let lane_storage_size = bytes_len::<u32>(len)?;
-
-            let max_total_bits = len
-                .checked_mul(9)
-                .and_then(|value| value.checked_add(10))
-                .ok_or(CozipDeflateError::DataTooLarge)?;
-            let output_words = max_total_bits.div_ceil(32);
-            let output_storage_size = bytes_len::<u32>(output_words)?;
-
-            let input_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-input"),
-                size: input_storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
             if data.len() % std::mem::size_of::<u32>() == 0 {
-                self.queue.write_buffer(&input_buffer, 0, data);
+                self.queue.write_buffer(&slot.input_buffer, 0, data);
             } else {
                 let mut padded = vec![0_u8; input_words * std::mem::size_of::<u32>()];
                 padded[..data.len()].copy_from_slice(data);
-                self.queue.write_buffer(&input_buffer, 0, &padded);
+                self.queue.write_buffer(&slot.input_buffer, 0, &padded);
             }
-
-            let codes_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-codes"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_flags_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-flags"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_kind_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-kind"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_len_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-len"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_dist_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-dist"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_lit_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-lit"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_prefix_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-prefix"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let token_total_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-token-total"),
-                size: 4,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let bitlens_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-bitlens"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let bit_offsets_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-bit-offsets"),
-                size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let total_bits_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-total-bits"),
-                size: 4,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let output_words_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-out-words"),
-                size: output_storage_size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            self.queue
-                .write_buffer(&output_words_buffer, 0, bytemuck::bytes_of(&0b011_u32));
 
             let params = [
                 len_u32,
@@ -2231,129 +2420,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 0,
                 0,
             ];
-            let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-params"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
             self.queue
-                .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
+                .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
-            let readback_size = output_storage_size
-                .checked_add(4)
-                .ok_or(CozipDeflateError::DataTooLarge)?;
-            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-readback"),
-                size: u64::try_from(readback_size).map_err(|_| CozipDeflateError::DataTooLarge)?,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let litlen_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-deflate-litlen-bg"),
-                layout: &self.litlen_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: token_flags_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: token_kind_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: token_len_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: token_dist_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: token_lit_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: token_prefix_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: codes_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: bitlens_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let tokenize_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-deflate-tokenize-bg"),
-                layout: &self.tokenize_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: input_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: token_flags_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: token_kind_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: token_len_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: token_dist_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: token_lit_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let bitpack_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-deflate-bitpack-bg"),
-                layout: &self.bitpack_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: codes_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: bitlens_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: bit_offsets_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: output_words_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            encoder.clear_buffer(&slot.token_total_buffer, 0, None);
+            encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
+            encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
+            encoder.clear_buffer(&slot.output_words_buffer, 0, None);
+            encoder.copy_buffer_to_buffer(
+                &self.deflate_header_buffer,
+                0,
+                &slot.output_words_buffer,
+                0,
+                4,
+            );
 
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2361,7 +2441,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.tokenize_pipeline);
-                pass.set_bind_group(0, &tokenize_bg, &[]);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
                 pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
             }
 
@@ -2371,15 +2451,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.token_finalize_pipeline);
-                pass.set_bind_group(0, &tokenize_bg, &[]);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
                 pass.dispatch_workgroups(workgroup_count(len, TOKEN_FINALIZE_SEGMENT_SIZE)?, 1, 1);
             }
 
             self.dispatch_parallel_prefix_scan(
                 &mut encoder,
-                &token_flags_buffer,
-                &token_prefix_buffer,
-                &token_total_buffer,
+                &slot.token_flags_buffer,
+                &slot.token_prefix_buffer,
+                &slot.token_total_buffer,
                 len,
                 "token-prefix",
             )?;
@@ -2390,15 +2470,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.litlen_pipeline);
-                pass.set_bind_group(0, &litlen_bg, &[]);
+                pass.set_bind_group(0, &slot.litlen_bg, &[]);
                 pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
             }
 
             self.dispatch_parallel_prefix_scan(
                 &mut encoder,
-                &bitlens_buffer,
-                &bit_offsets_buffer,
-                &total_bits_buffer,
+                &slot.bitlens_buffer,
+                &slot.bit_offsets_buffer,
+                &slot.total_bits_buffer,
                 len,
                 "bitlen-prefix",
             )?;
@@ -2409,23 +2489,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bitpack_pipeline);
-                pass.set_bind_group(0, &bitpack_bg, &[]);
+                pass.set_bind_group(0, &slot.bitpack_bg, &[]);
                 pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
             }
 
-            encoder.copy_buffer_to_buffer(&total_bits_buffer, 0, &readback, 0, 4);
+            encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
             encoder.copy_buffer_to_buffer(
-                &output_words_buffer,
+                &slot.output_words_buffer,
                 0,
-                &readback,
+                &slot.readback,
                 4,
-                output_storage_size,
+                slot.output_storage_size,
             );
 
             pending.push(PendingDeflateReadback {
                 chunk_index,
-                readback,
-                output_storage_size,
+                slot_index: chunk_index,
+                output_storage_size: slot.output_storage_size,
             });
             dispatched = true;
         }
@@ -2439,7 +2519,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let mut receivers = Vec::with_capacity(pending.len());
         for item in &pending {
             let (tx, rx) = std::sync::mpsc::channel();
-            item.readback
+            slots[item.slot_index]
+                .readback
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, move |result| {
                     let _ = tx.send(result);
@@ -2456,7 +2537,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
 
-            let mapped = item.readback.slice(..).get_mapped_range();
+            let mapped = slots[item.slot_index].readback.slice(..).get_mapped_range();
             if mapped.len() < 4 {
                 return Err(CozipDeflateError::Internal("gpu readback too small"));
             }
@@ -2486,7 +2567,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let mut compressed = Vec::with_capacity(total_bytes);
             compressed.extend_from_slice(&payload[..total_bytes]);
             drop(mapped);
-            item.readback.unmap();
+            slots[item.slot_index].readback.unmap();
 
             results[item.chunk_index] = compressed;
         }

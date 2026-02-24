@@ -642,3 +642,51 @@ command:
 
 - 圧縮スループットは改善傾向
 - 圧縮率は依然としてCPU_ONLYより悪化しやすく、GPU match品質の改善が次段課題
+
+## 2026-02-24 - 速度最適化(1+2継続): Deflateスロット再利用
+
+### 実装
+
+1. GPU Deflateバッファの永続化/再利用
+- `GpuAssist` に `deflate_slots: Mutex<Vec<DeflateSlot>>` を追加
+- チャンクごとの大量 `create_buffer/create_bind_group` を削減
+- 必要容量を超えた場合のみスロットを再確保
+
+2. per-slot bind group 再利用
+- `litlen_bg` / `tokenize_bg` / `bitpack_bg` をスロット内に保持
+- 毎チャンク再生成を廃止
+
+3. 初期化のGPU側クリア
+- 再利用バッファの初期化は `encoder.clear_buffer` を利用
+- `output_words` ヘッダは専用 `deflate_header_buffer` から `copy_buffer_to_buffer` で設定
+
+4. readbackは単一バッファ維持
+- `total_bits + payload` を1本で回収
+
+### 検証
+
+1. `cargo test -p cozip_deflate --lib` 通過
+2. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+3. `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 1024 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256`
+4. `cargo run --release -p cozip_deflate --example bench_hybrid`
+
+### 直近ベンチ
+
+- 1GiB (`bench_1gb`)
+  - CPU_ONLY: comp_mib_s=502.32 decomp_mib_s=4364.46 ratio=0.3364
+  - CPU+GPU : comp_mib_s=625.10 decomp_mib_s=5463.49 ratio=0.4373
+  - speedup(cpu/hybrid): compress=1.244x decompress=1.252x
+  - 配分: cpu_chunks=176 gpu_chunks=80
+
+- `bench_hybrid`
+  - 4MiB:
+    - CPU_ONLY comp_mib_s=33.06 ratio=0.3361
+    - CPU+GPU  comp_mib_s=305.02 ratio=0.6593
+  - 16MiB:
+    - CPU_ONLY comp_mib_s=112.70 ratio=0.3364
+    - CPU+GPU  comp_mib_s=133.84 ratio=0.4978
+
+### メモ
+
+- `1` は反映済み
+- `2` の完全版(二重バッファ submit/collect 分離による upload/compute/readback 重畳)は次段実装候補
