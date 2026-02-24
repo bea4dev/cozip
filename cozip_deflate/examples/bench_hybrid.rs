@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
+use cozip_deflate::{CompressionMode, HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
 
 #[derive(Debug, Clone)]
 struct BenchAgg {
@@ -131,6 +131,7 @@ fn main() {
             chunk_size: 4 * 1024 * 1024,
             gpu_subchunk_size: 256 * 1024,
             compression_level: 6,
+            compression_mode: CompressionMode::Speed,
             prefer_gpu: false,
             gpu_fraction: 0.0,
             gpu_min_chunk_size: 64 * 1024,
@@ -140,6 +141,7 @@ fn main() {
             chunk_size: 4 * 1024 * 1024,
             gpu_subchunk_size: 256 * 1024,
             compression_level: 6,
+            compression_mode: CompressionMode::Speed,
             prefer_gpu: true,
             gpu_fraction: 0.5,
             gpu_min_chunk_size: 64 * 1024,

@@ -726,3 +726,143 @@ command:
 
 - 前回実装の「部分的重畳」から、実際に submit/collect を分離したパイプラインへ移行
 - 圧縮率は CPU_ONLY より悪いままだが、スループットは引き続き CPU+GPU が優位
+
+## 2026-02-24 - モード共存実装 (Speed/Balanced/Ratio + codec_id)
+
+### 実装
+
+1. 圧縮モードを追加
+- `HybridOptions` に `compression_mode: CompressionMode` を追加
+- `CompressionMode`:
+  - `Speed` (既存優先)
+  - `Balanced` (GPU探索品質を中間設定)
+  - `Ratio` (GPU探索品質を高設定)
+- `Default` は `CompressionMode::Speed`
+
+2. フレームメタへ `codec_id` を追加
+- `FRAME_VERSION` を `3` へ更新
+- chunk metadata に `codec_id` を追加 (`backend + transform + codec + raw_len + compressed_len`)
+- 新形式書き出し時は v3
+- 読み取りは v1/v2/v3 互換維持
+  - v2は `backend` から codec を推定
+
+3. チャンクcodec分岐を追加
+- `ChunkCodec::{DeflateCpu, DeflateGpuFast}` を導入
+- 圧縮時にチャンクごとに codec を格納
+- 復号時は `codec` で分岐してinflate（現状どちらも deflate inflate だが将来拡張点を確保）
+
+4. `Balanced` / `Ratio` の挙動
+- speed と同様に GPU へタスクを割り当てる
+- CPU再圧縮フォールバックではなく、GPU tokenize/finalize の探索品質をモード別に切り替える
+
+### 検証
+
+1. `cargo test -p cozip_deflate --lib` 通過
+2. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+3. `cargo test -p cozip_deflate` 通過
+4. 追加テスト:
+- `ratio_mode_roundtrip`
+- `decode_v2_frame_compatibility`
+
+### 運用メモ
+
+- `bench_1gb` に `--mode speed|balanced|ratio` を追加済み
+
+### 4GiB モード比較 (2026-02-24 / ローカル実測・更新版)
+
+command (各モード):
+`target/release/examples/bench_1gb --size-mib 4096 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256 --mode <speed|balanced|ratio>`
+
+結果:
+
+- `speed`
+  - CPU_ONLY: comp_mib_s=514.68 decomp_mib_s=4328.25 ratio=0.3364
+  - CPU+GPU : comp_mib_s=753.17 decomp_mib_s=4888.60 ratio=0.4625
+  - speedup(cpu/hybrid): compress=1.463x decompress=1.129x
+  - chunk配分: cpu_chunks=624 gpu_chunks=400
+  - GPU使用率観測: ほぼ100%張り付き
+
+- `balanced`
+  - CPU_ONLY: comp_mib_s=518.28 decomp_mib_s=4339.05 ratio=0.3364
+  - CPU+GPU : comp_mib_s=435.05 decomp_mib_s=5488.71 ratio=0.3364
+  - speedup(cpu/hybrid): compress=0.839x decompress=1.265x
+  - chunk配分: cpu_chunks=1024 gpu_chunks=0
+  - GPU使用率観測: 16%前後
+
+- `ratio`
+  - CPU_ONLY: comp_mib_s=514.65 decomp_mib_s=4328.79 ratio=0.3364
+  - CPU+GPU : comp_mib_s=527.86 decomp_mib_s=3767.50 ratio=0.3364
+  - speedup(cpu/hybrid): compress=1.026x decompress=0.870x
+  - chunk配分: cpu_chunks=1024 gpu_chunks=0
+  - GPU使用率観測: 30%前後
+
+所見:
+- 圧縮速度最優先なら `speed` が最良。CPU+GPUで圧縮/解凍ともCPU_ONLYを上回る。
+- 圧縮率最優先なら `balanced` が有効（CPU_ONLY同等の ratio を維持）。ただし圧縮スループットは低下。
+- `ratio` は現状ほぼCPU実行だが、圧縮速度はCPU_ONLYと同等以上、解凍速度は低下傾向が見られる。
+
+## 2026-02-24 - モード仕様修正 (GPU再計算フォールバック廃止)
+
+方針:
+- `balanced` / `ratio` でも `speed` と同様に GPU へ圧縮タスクを割当
+- 圧縮率改善は CPU再圧縮でなく GPU側ロジック改善で行う
+
+実装:
+- `compress_hybrid()` の `Ratio` による GPU無効化を廃止
+- GPU圧縮の CPU再圧縮比較ロジックを撤去
+- tokenize shader:
+  - mode別に `max_match_scan` / `max_match_len` / `distance candidate count` を切替
+  - distance candidate を 32段階 (最大 32768) まで拡張
+- token_finalize shader:
+  - mode別 lazy matching (`speed=0`, `balanced=1`, `ratio=2`) を追加
+
+mode別GPU品質パラメータ:
+- `Speed`: scan=64, max_len=64, dist_slots=20
+- `Balanced`: scan=128, max_len=128, dist_slots=28
+- `Ratio`: scan=192, max_len=258, dist_slots=32
+
+検証:
+- `cargo test -p cozip_deflate --lib` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+
+## 2026-02-24 - Ratioモード: GPU頻度集計 + CPU木生成(dynamic Huffman)
+
+実装:
+- `ratio` モードでも GPU タスク割当は維持（GPU無効化しない）
+- `deflate_fixed_literals_batch()` に `ratio` 分岐を追加し、`deflate_dynamic_hybrid_batch()` を使用
+- `deflate_dynamic_hybrid_batch()`:
+  1. GPUで tokenize + finalize
+  2. GPU frequency pass で `litlen(286)` / `dist(30)` 頻度を atomic 集計
+  3. 頻度テーブルを readback
+  4. CPUで Huffman木(符号長)生成 + canonical code生成
+  5. CPUで dynamic header + token列を bitpack
+- GPU側は mode に応じて探索品質を切替:
+  - `Speed`: scan=64 / len=64 / dist_slots=20
+  - `Balanced`: scan=128 / len=128 / dist_slots=28
+  - `Ratio`: scan=192 / len=258 / dist_slots=32
+
+補足:
+- `balanced/ratio` のCPU再圧縮フォールバックは廃止
+- 圧縮率改善はスケジューリングではなく GPU tokenization 品質 + dynamic Huffman で行う
+
+検証:
+- `cargo test -p cozip_deflate --lib` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+- `cargo check -p cozip_deflate --examples` 通過
+
+## 2026-02-24 - Balanced/Ratio 実行時エラー修正
+
+報告エラー:
+1. `mode=balanced` で `InvalidFrame("raw chunk length mismatch in cpu path")`
+2. `mode=ratio` で `Source buffer is missing the COPY_SRC usage flag`
+
+修正:
+- ratio用 dynamic path で readback コピーしているバッファに `COPY_SRC` を追加
+  - `token_flags/token_kind/token_len/token_dist/token_lit`
+- balanced/ratio の GPU 圧縮結果に対して整合性ガードを追加
+  - GPU圧縮結果を inflate して元チャンク一致を検証
+  - 不一致時のみ CPU圧縮へフォールバック（クラッシュ防止の保険）
+
+検証:
+- `cargo test -p cozip_deflate --lib` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過

@@ -1,7 +1,7 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
+use cozip_deflate::{CompressionMode, HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -10,6 +10,7 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     gpu_subchunk_kib: usize,
+    mode: CompressionMode,
 }
 
 impl Default for BenchConfig {
@@ -20,6 +21,7 @@ impl Default for BenchConfig {
             warmups: 0,
             chunk_mib: 4,
             gpu_subchunk_kib: 256,
+            mode: CompressionMode::Speed,
         }
     }
 }
@@ -64,6 +66,18 @@ impl BenchConfig {
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-subchunk-kib".to_string())?;
                 }
+                "--mode" => {
+                    cfg.mode = match value.as_str() {
+                        "speed" => CompressionMode::Speed,
+                        "balanced" => CompressionMode::Balanced,
+                        "ratio" => CompressionMode::Ratio,
+                        _ => {
+                            return Err(
+                                "invalid --mode (expected: speed|balanced|ratio)".to_string()
+                            );
+                        }
+                    };
+                }
                 _ => {
                     return Err(format!("unknown argument: {}\n{}", arg, help_text()));
                 }
@@ -84,7 +98,8 @@ fn help_text() -> String {
   --iters <N>              measured iterations (default: 1)
   --warmups <N>            warmup iterations (default: 0)
   --chunk-mib <N>          host chunk size in MiB (default: 4)
-  --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)"#;
+  --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)
+  --mode <M>               speed|balanced|ratio (default: speed)"#;
     text.to_string()
 }
 
@@ -211,6 +226,7 @@ fn main() {
         chunk_size,
         gpu_subchunk_size,
         compression_level: 6,
+        compression_mode: cfg.mode,
         prefer_gpu: false,
         gpu_fraction: 0.0,
         gpu_min_chunk_size: 64 * 1024,
@@ -220,6 +236,7 @@ fn main() {
         chunk_size,
         gpu_subchunk_size,
         compression_level: 6,
+        compression_mode: cfg.mode,
         prefer_gpu: true,
         gpu_fraction: 0.5,
         gpu_min_chunk_size: 64 * 1024,
@@ -227,8 +244,8 @@ fn main() {
 
     println!("cozip_deflate 1GB-class benchmark");
     println!(
-        "size_mib={} iters={} warmups={} chunk_mib={} gpu_subchunk_kib={}",
-        cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib
+        "size_mib={} iters={} warmups={} chunk_mib={} gpu_subchunk_kib={} mode={:?}",
+        cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib, cfg.mode
     );
 
     if cfg.warmups > 0 {

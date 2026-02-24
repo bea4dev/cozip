@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{HybridOptions, compress_hybrid, decompress_hybrid};
+use cozip_deflate::{CompressionMode, HybridOptions, compress_hybrid, decompress_hybrid};
 
 fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes);
@@ -57,6 +57,7 @@ fn compare_cpu_only_vs_cpu_gpu_with_nocapture() {
         chunk_size: 256 * 1024,
         gpu_subchunk_size: 128 * 1024,
         compression_level: 6,
+        compression_mode: CompressionMode::Speed,
         prefer_gpu: false,
         gpu_fraction: 0.0,
         gpu_min_chunk_size: 64 * 1024,
@@ -66,6 +67,7 @@ fn compare_cpu_only_vs_cpu_gpu_with_nocapture() {
         chunk_size: 256 * 1024,
         gpu_subchunk_size: 128 * 1024,
         compression_level: 6,
+        compression_mode: CompressionMode::Speed,
         prefer_gpu: true,
         gpu_fraction: 0.5,
         gpu_min_chunk_size: 64 * 1024,
@@ -121,6 +123,7 @@ fn hybrid_uses_both_cpu_and_gpu_when_gpu_is_available() {
         chunk_size: 256 * 1024,
         gpu_subchunk_size: 128 * 1024,
         compression_level: 6,
+        compression_mode: CompressionMode::Speed,
         prefer_gpu: true,
         gpu_fraction: 0.5,
         gpu_min_chunk_size: 64 * 1024,

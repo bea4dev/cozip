@@ -9,8 +9,9 @@ use flate2::Compression;
 use thiserror::Error;
 
 const FRAME_MAGIC: [u8; 4] = *b"CZDF";
-const FRAME_VERSION: u8 = 2;
+const FRAME_VERSION: u8 = 3;
 const HEADER_LEN: usize = 22;
+const CHUNK_META_LEN_V3: usize = 11;
 const CHUNK_META_LEN_V2: usize = 10;
 const CHUNK_META_LEN_V1: usize = 9;
 const TRANSFORM_LANES: usize = 2;
@@ -37,6 +38,8 @@ const HASH_SIZE: usize = 1 << 15;
 const HASH_MASK: usize = HASH_SIZE - 1;
 const MAX_HASH_CANDIDATES: usize = 32;
 const MAX_RUN_HINTS: usize = 8;
+const LITLEN_SYMBOL_COUNT: usize = 286;
+const DIST_SYMBOL_COUNT: usize = 30;
 const GPU_BATCH_CHUNKS: usize = 16;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
@@ -50,9 +53,17 @@ pub struct HybridOptions {
     pub chunk_size: usize,
     pub gpu_subchunk_size: usize,
     pub compression_level: u32,
+    pub compression_mode: CompressionMode,
     pub prefer_gpu: bool,
     pub gpu_fraction: f32,
     pub gpu_min_chunk_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionMode {
+    Speed,
+    Balanced,
+    Ratio,
 }
 
 impl Default for HybridOptions {
@@ -61,6 +72,7 @@ impl Default for HybridOptions {
             chunk_size: 4 * 1024 * 1024,
             gpu_subchunk_size: 256 * 1024,
             compression_level: 6,
+            compression_mode: CompressionMode::Speed,
             prefer_gpu: true,
             gpu_fraction: 0.5,
             gpu_min_chunk_size: 64 * 1024,
@@ -136,6 +148,29 @@ impl ChunkTransform {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkCodec {
+    DeflateCpu,
+    DeflateGpuFast,
+}
+
+impl ChunkCodec {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::DeflateCpu => 0,
+            Self::DeflateGpuFast => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, CozipDeflateError> {
+        match value {
+            0 => Ok(Self::DeflateCpu),
+            1 => Ok(Self::DeflateGpuFast),
+            _ => Err(CozipDeflateError::InvalidFrame("unknown codec id")),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CozipDeflateError {
     #[error("invalid options: {0}")]
@@ -185,6 +220,7 @@ struct ChunkMember {
     index: usize,
     backend: ChunkBackend,
     transform: ChunkTransform,
+    codec: ChunkCodec,
     raw_len: u32,
     compressed: Vec<u8>,
 }
@@ -200,6 +236,7 @@ struct ChunkDescriptor {
     index: usize,
     backend: ChunkBackend,
     transform: ChunkTransform,
+    codec: ChunkCodec,
     raw_len: u32,
     compressed: Vec<u8>,
 }
@@ -211,6 +248,8 @@ struct GpuAssist {
     tokenize_bind_group_layout: wgpu::BindGroupLayout,
     tokenize_pipeline: wgpu::ComputePipeline,
     token_finalize_pipeline: wgpu::ComputePipeline,
+    freq_bind_group_layout: wgpu::BindGroupLayout,
+    freq_pipeline: wgpu::ComputePipeline,
     litlen_bind_group_layout: wgpu::BindGroupLayout,
     litlen_pipeline: wgpu::ComputePipeline,
     bitpack_bind_group_layout: wgpu::BindGroupLayout,
@@ -242,6 +281,8 @@ struct DeflateSlot {
     token_len_buffer: wgpu::Buffer,
     token_dist_buffer: wgpu::Buffer,
     token_lit_buffer: wgpu::Buffer,
+    litlen_freq_buffer: wgpu::Buffer,
+    dist_freq_buffer: wgpu::Buffer,
     token_prefix_buffer: wgpu::Buffer,
     token_total_buffer: wgpu::Buffer,
     bitlens_buffer: wgpu::Buffer,
@@ -252,6 +293,7 @@ struct DeflateSlot {
     readback: wgpu::Buffer,
     litlen_bg: wgpu::BindGroup,
     tokenize_bg: wgpu::BindGroup,
+    freq_bg: wgpu::BindGroup,
     bitpack_bg: wgpu::BindGroup,
 }
 
@@ -367,7 +409,7 @@ impl GpuAssist {
 struct Params {
     len: u32,
     block_size: u32,
-    _pad0: u32,
+    mode: u32,
     _pad1: u32,
 }
 
@@ -392,9 +434,29 @@ var<storage, read_write> token_lit: array<u32>;
 @group(0) @binding(6)
 var<uniform> params: Params;
 
-const MAX_MATCH_SCAN: u32 = 64u;
-const MAX_MATCH_LEN: u32 = 64u;
-const DIST_CANDIDATE_COUNT: u32 = 20u;
+fn mode_max_match_scan(mode: u32) -> u32 {
+    switch (mode) {
+        case 1u: { return 128u; } // Balanced
+        case 2u: { return 192u; } // Ratio
+        default: { return 64u; }  // Speed
+    }
+}
+
+fn mode_max_match_len(mode: u32) -> u32 {
+    switch (mode) {
+        case 1u: { return 128u; } // Balanced
+        case 2u: { return 258u; } // Ratio
+        default: { return 64u; }  // Speed
+    }
+}
+
+fn mode_dist_candidate_count(mode: u32) -> u32 {
+    switch (mode) {
+        case 1u: { return 28u; } // up to 8192
+        case 2u: { return 32u; } // up to 32768
+        default: { return 20u; } // up to 512
+    }
+}
 
 fn byte_at(index: u32) -> u32 {
     let word = input_words[index >> 2u];
@@ -408,22 +470,34 @@ fn dist_candidate(slot: u32) -> u32 {
         case 1u: { return 2u; }
         case 2u: { return 3u; }
         case 3u: { return 4u; }
-        case 4u: { return 6u; }
-        case 5u: { return 8u; }
-        case 6u: { return 12u; }
-        case 7u: { return 16u; }
-        case 8u: { return 24u; }
-        case 9u: { return 32u; }
-        case 10u: { return 48u; }
-        case 11u: { return 64u; }
-        case 12u: { return 96u; }
-        case 13u: { return 128u; }
-        case 14u: { return 192u; }
-        case 15u: { return 256u; }
-        case 16u: { return 384u; }
-        case 17u: { return 512u; }
-        case 18u: { return 768u; }
-        default: { return 1024u; }
+        case 4u: { return 5u; }
+        case 5u: { return 6u; }
+        case 6u: { return 8u; }
+        case 7u: { return 10u; }
+        case 8u: { return 12u; }
+        case 9u: { return 16u; }
+        case 10u: { return 24u; }
+        case 11u: { return 32u; }
+        case 12u: { return 48u; }
+        case 13u: { return 64u; }
+        case 14u: { return 96u; }
+        case 15u: { return 128u; }
+        case 16u: { return 192u; }
+        case 17u: { return 256u; }
+        case 18u: { return 384u; }
+        case 19u: { return 512u; }
+        case 20u: { return 768u; }
+        case 21u: { return 1024u; }
+        case 22u: { return 1536u; }
+        case 23u: { return 2048u; }
+        case 24u: { return 3072u; }
+        case 25u: { return 4096u; }
+        case 26u: { return 6144u; }
+        case 27u: { return 8192u; }
+        case 28u: { return 12288u; }
+        case 29u: { return 16384u; }
+        case 30u: { return 24576u; }
+        default: { return 32768u; }
     }
 }
 
@@ -441,9 +515,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var best_dist: u32 = 0u;
     var best_len: u32 = 0u;
+    let match_scan_limit = mode_max_match_scan(params.mode);
+    let match_len_limit = mode_max_match_len(params.mode);
+    let dist_limit = mode_dist_candidate_count(params.mode);
     var c: u32 = 0u;
     loop {
-        if (c >= DIST_CANDIDATE_COUNT) {
+        if (c >= dist_limit) {
             break;
         }
         let dist = dist_candidate(c);
@@ -456,7 +533,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 var p = i + 3u;
                 var scanned: u32 = 0u;
                 loop {
-                    if (p >= params.len || mlen >= MAX_MATCH_LEN || scanned >= MAX_MATCH_SCAN) {
+                    if (p >= params.len || mlen >= match_len_limit || scanned >= match_scan_limit) {
                         break;
                     }
                     if (byte_at(p) != byte_at(p - dist)) {
@@ -507,7 +584,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 struct Params {
     len: u32,
     block_size: u32,
-    _pad0: u32,
+    mode: u32,
     _pad1: u32,
 }
 
@@ -526,6 +603,14 @@ var<storage, read_write> token_dist: array<u32>;
 @group(0) @binding(6)
 var<uniform> params: Params;
 
+fn mode_lazy_delta(mode: u32) -> u32 {
+    switch (mode) {
+        case 1u: { return 1u; } // Balanced
+        case 2u: { return 2u; } // Ratio
+        default: { return 0u; } // Speed
+    }
+}
+
 @compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let segment_size = max(params.block_size, 1u);
@@ -536,6 +621,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let seg_end = min(seg_start + segment_size, params.len);
 
     var i: u32 = seg_start;
+    let lazy_delta = mode_lazy_delta(params.mode);
     loop {
         if (i >= seg_end) {
             break;
@@ -543,22 +629,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         if (token_len[i] >= 3u && token_dist[i] > 0u) {
             let mlen = min(token_len[i], seg_end - i);
-            token_flags[i] = 1u;
-            token_kind[i] = 1u;
-            token_len[i] = mlen;
-
-            var j: u32 = 1u;
-            loop {
-                if (j >= mlen || (i + j) >= seg_end) {
-                    break;
+            var take_match = true;
+            if (lazy_delta > 0u && (i + 1u) < seg_end && token_len[i + 1u] >= 3u && token_dist[i + 1u] > 0u) {
+                let next_len = min(token_len[i + 1u], seg_end - (i + 1u));
+                if (next_len >= mlen + lazy_delta) {
+                    take_match = false;
                 }
-                token_flags[i + j] = 0u;
-                token_kind[i + j] = 0u;
-                token_len[i + j] = 0u;
-                token_dist[i + j] = 0u;
-                j = j + 1u;
             }
-            i = i + mlen;
+
+            if (take_match) {
+                token_flags[i] = 1u;
+                token_kind[i] = 1u;
+                token_len[i] = mlen;
+
+                var j: u32 = 1u;
+                loop {
+                    if (j >= mlen || (i + j) >= seg_end) {
+                        break;
+                    }
+                    token_flags[i + j] = 0u;
+                    token_kind[i + j] = 0u;
+                    token_len[i + j] = 0u;
+                    token_dist[i + j] = 0u;
+                    j = j + 1u;
+                }
+                i = i + mlen;
+            } else {
+                token_flags[i] = 1u;
+                token_kind[i] = 0u;
+                token_len[i] = 0u;
+                token_dist[i] = 0u;
+                i = i + 1u;
+            }
         } else {
             token_flags[i] = 1u;
             token_kind[i] = 0u;
@@ -579,6 +681,231 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 module: &token_finalize_shader,
                 entry_point: "main",
             });
+
+        let freq_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cozip-freq-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let freq_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cozip-freq-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                r#"
+struct Params {
+    len: u32,
+    block_size: u32,
+    mode: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> token_flags: array<u32>;
+
+@group(0) @binding(1)
+var<storage, read> token_kind: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read> token_match_len: array<u32>;
+
+@group(0) @binding(3)
+var<storage, read> token_match_dist: array<u32>;
+
+@group(0) @binding(4)
+var<storage, read> token_lit: array<u32>;
+
+@group(0) @binding(5)
+var<storage, read_write> litlen_freq: array<atomic<u32>>;
+
+@group(0) @binding(6)
+var<storage, read_write> dist_freq: array<atomic<u32>>;
+
+@group(0) @binding(7)
+var<uniform> params: Params;
+
+fn litlen_symbol_for_len(mlen_in: u32) -> u32 {
+    let mlen = min(max(mlen_in, 3u), 258u);
+    if (mlen <= 10u) {
+        return 254u + mlen;
+    }
+    if (mlen == 258u) {
+        return 285u;
+    }
+
+    var symbol: u32 = 265u;
+    var base: u32 = 11u;
+    var extra: u32 = 1u;
+    loop {
+        if (extra > 5u) {
+            break;
+        }
+        var j: u32 = 0u;
+        loop {
+            if (j >= 4u) {
+                break;
+            }
+            let maxv = base + ((1u << extra) - 1u);
+            if (mlen >= base && mlen <= maxv) {
+                return symbol;
+            }
+            base = maxv + 1u;
+            symbol = symbol + 1u;
+            j = j + 1u;
+        }
+        extra = extra + 1u;
+    }
+    return 285u;
+}
+
+fn dist_symbol_for_dist(mdist_in: u32) -> u32 {
+    let mdist = max(mdist_in, 1u);
+    if (mdist <= 1u) {
+        return 0u;
+    }
+    if (mdist <= 4u) {
+        return mdist - 1u;
+    }
+
+    var symbol: u32 = 4u;
+    var base: u32 = 5u;
+    var extra: u32 = 1u;
+    loop {
+        if (extra > 13u) {
+            break;
+        }
+        var j: u32 = 0u;
+        loop {
+            if (j >= 2u) {
+                break;
+            }
+            let maxv = base + ((1u << extra) - 1u);
+            if (mdist >= base && mdist <= maxv) {
+                return symbol;
+            }
+            base = maxv + 1u;
+            symbol = symbol + 1u;
+            j = j + 1u;
+        }
+        extra = extra + 1u;
+    }
+    return 29u;
+}
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= params.len || token_flags[idx] == 0u) {
+        return;
+    }
+
+    if (token_kind[idx] == 0u) {
+        let lit = min(token_lit[idx], 255u);
+        atomicAdd(&litlen_freq[lit], 1u);
+        return;
+    }
+
+    let len_symbol = litlen_symbol_for_len(token_match_len[idx]);
+    let dist_symbol = dist_symbol_for_dist(token_match_dist[idx]);
+    atomicAdd(&litlen_freq[len_symbol], 1u);
+    atomicAdd(&dist_freq[dist_symbol], 1u);
+}
+"#,
+            )),
+        });
+
+        let freq_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-freq-layout"),
+            bind_group_layouts: &[&freq_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let freq_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-freq-pipeline"),
+            layout: Some(&freq_layout),
+            module: &freq_shader,
+            entry_point: "main",
+        });
 
         let litlen_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1619,6 +1946,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             tokenize_bind_group_layout,
             tokenize_pipeline,
             token_finalize_pipeline,
+            freq_bind_group_layout,
+            freq_pipeline,
             litlen_bind_group_layout,
             litlen_pipeline,
             bitpack_bind_group_layout,
@@ -1808,31 +2137,47 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let token_flags_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-token-flags"),
             size: lane_storage_size,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let token_kind_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-token-kind"),
             size: lane_storage_size,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let token_len_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-token-len"),
             size: lane_storage_size,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let token_dist_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-token-dist"),
             size: lane_storage_size,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let token_lit_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-token-lit"),
             size: lane_storage_size,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let litlen_freq_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-litlen-freq"),
+            size: bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let dist_freq_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dist-freq"),
+            size: bytes_len::<u32>(DIST_SYMBOL_COUNT)?,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let token_prefix_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1970,6 +2315,45 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             ],
         });
 
+        let freq_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-deflate-freq-bg"),
+            layout: &self.freq_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: token_flags_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: token_kind_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: token_len_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: token_dist_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: token_lit_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: litlen_freq_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: dist_freq_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         let bitpack_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cozip-deflate-bitpack-bg"),
             layout: &self.bitpack_bind_group_layout,
@@ -2018,6 +2402,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             token_len_buffer,
             token_dist_buffer,
             token_lit_buffer,
+            litlen_freq_buffer,
+            dist_freq_buffer,
             token_prefix_buffer,
             token_total_buffer,
             bitlens_buffer,
@@ -2028,6 +2414,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             readback,
             litlen_bg,
             tokenize_bg,
+            freq_bg,
             bitpack_bg,
         })
     }
@@ -2370,7 +2757,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     fn deflate_fixed_literals_batch(
         &self,
         chunks: &[&[u8]],
+        mode: CompressionMode,
     ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+        if mode == CompressionMode::Ratio {
+            return self.deflate_dynamic_hybrid_batch(chunks, mode);
+        }
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -2473,7 +2864,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 len_u32,
                 u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
                     .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                0,
+                compression_mode_id(mode),
                 0,
             ];
             let output_storage_size = slots[slot_index].output_storage_size;
@@ -2666,6 +3057,268 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             results[item.chunk_index] =
                 collect_deflate_readback(&slots[item.slot_index], item.output_storage_size)?;
+        }
+
+        Ok(results)
+    }
+
+    fn deflate_dynamic_hybrid_batch(
+        &self,
+        chunks: &[&[u8]],
+        mode: CompressionMode,
+    ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = vec![Vec::new(); chunks.len()];
+        let mut slots = lock(&self.deflate_slots)?;
+
+        for (chunk_index, data) in chunks.iter().enumerate() {
+            if data.is_empty() {
+                results[chunk_index] = vec![0x03, 0x00];
+                continue;
+            }
+
+            let len = data.len();
+            let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            if slots.len() <= chunk_index {
+                slots.push(self.create_deflate_slot(len)?);
+            } else if slots[chunk_index].len_capacity < len {
+                slots[chunk_index] = self.create_deflate_slot(len)?;
+            }
+
+            let slot = &slots[chunk_index];
+            let lane_copy_size = bytes_len::<u32>(len)?;
+            let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
+            let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
+
+            let input_words = len.div_ceil(std::mem::size_of::<u32>());
+            if data.len() % std::mem::size_of::<u32>() == 0 {
+                self.queue.write_buffer(&slot.input_buffer, 0, data);
+            } else {
+                let mut padded = vec![0_u8; input_words * std::mem::size_of::<u32>()];
+                padded[..data.len()].copy_from_slice(data);
+                self.queue.write_buffer(&slot.input_buffer, 0, &padded);
+            }
+
+            let params = [
+                len_u32,
+                u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                compression_mode_id(mode),
+                0,
+            ];
+            self.queue
+                .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
+
+            let flags_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-flags-rb"),
+                size: lane_copy_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let kind_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-kind-rb"),
+                size: lane_copy_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let len_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-len-rb"),
+                size: lane_copy_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let dist_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-dist-rb"),
+                size: lane_copy_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let lit_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-lit-rb"),
+                size: lane_copy_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-litlen-freq-rb"),
+                size: litlen_freq_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let dist_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-dist-freq-rb"),
+                size: dist_freq_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-deflate-dynamic-batch-encoder"),
+                });
+
+            encoder.clear_buffer(&slot.litlen_freq_buffer, 0, None);
+            encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-tokenize-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tokenize_pipeline);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-token-finalize-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.token_finalize_pipeline);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+                pass.dispatch_workgroups(workgroup_count(len, TOKEN_FINALIZE_SEGMENT_SIZE)?, 1, 1);
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-freq-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.freq_pipeline);
+                pass.set_bind_group(0, &slot.freq_bg, &[]);
+                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+            }
+
+            encoder.copy_buffer_to_buffer(&slot.token_flags_buffer, 0, &flags_readback, 0, lane_copy_size);
+            encoder.copy_buffer_to_buffer(&slot.token_kind_buffer, 0, &kind_readback, 0, lane_copy_size);
+            encoder.copy_buffer_to_buffer(&slot.token_len_buffer, 0, &len_readback, 0, lane_copy_size);
+            encoder.copy_buffer_to_buffer(&slot.token_dist_buffer, 0, &dist_readback, 0, lane_copy_size);
+            encoder.copy_buffer_to_buffer(&slot.token_lit_buffer, 0, &lit_readback, 0, lane_copy_size);
+            encoder.copy_buffer_to_buffer(
+                &slot.litlen_freq_buffer,
+                0,
+                &litlen_freq_readback,
+                0,
+                litlen_freq_size,
+            );
+            encoder.copy_buffer_to_buffer(
+                &slot.dist_freq_buffer,
+                0,
+                &dist_freq_readback,
+                0,
+                dist_freq_size,
+            );
+
+            self.queue.submit(Some(encoder.finish()));
+
+            let map_buffer = |buffer: &wgpu::Buffer| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+                rx
+            };
+
+            let flags_rx = map_buffer(&flags_readback);
+            let kind_rx = map_buffer(&kind_readback);
+            let len_rx = map_buffer(&len_readback);
+            let dist_rx = map_buffer(&dist_readback);
+            let lit_rx = map_buffer(&lit_readback);
+            let litlen_freq_rx = map_buffer(&litlen_freq_readback);
+            let dist_freq_rx = map_buffer(&dist_freq_readback);
+
+            self.device.poll(wgpu::Maintain::Wait);
+
+            for rx in [
+                flags_rx,
+                kind_rx,
+                len_rx,
+                dist_rx,
+                lit_rx,
+                litlen_freq_rx,
+                dist_freq_rx,
+            ] {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                }
+            }
+
+            let flags_map = flags_readback.slice(..).get_mapped_range();
+            let kind_map = kind_readback.slice(..).get_mapped_range();
+            let len_map = len_readback.slice(..).get_mapped_range();
+            let dist_map = dist_readback.slice(..).get_mapped_range();
+            let lit_map = lit_readback.slice(..).get_mapped_range();
+            let litlen_freq_map = litlen_freq_readback.slice(..).get_mapped_range();
+            let dist_freq_map = dist_freq_readback.slice(..).get_mapped_range();
+
+            let flags_words: &[u32] = bytemuck::cast_slice(&flags_map);
+            let kind_words: &[u32] = bytemuck::cast_slice(&kind_map);
+            let len_words: &[u32] = bytemuck::cast_slice(&len_map);
+            let dist_words: &[u32] = bytemuck::cast_slice(&dist_map);
+            let lit_words: &[u32] = bytemuck::cast_slice(&lit_map);
+
+            let mut tokens = Vec::new();
+            for i in 0..len {
+                if flags_words.get(i).copied().unwrap_or(0) == 0 {
+                    continue;
+                }
+                if kind_words.get(i).copied().unwrap_or(0) == 1 {
+                    let mlen = len_words.get(i).copied().unwrap_or(0) as usize;
+                    let mdist = dist_words.get(i).copied().unwrap_or(0) as usize;
+                    if (MIN_MATCH..=MAX_MATCH).contains(&mlen) && (1..=MAX_DISTANCE).contains(&mdist)
+                    {
+                        tokens.push(DeflateToken::Match {
+                            len: mlen,
+                            dist: mdist,
+                        });
+                        continue;
+                    }
+                }
+                tokens.push(DeflateToken::Literal(
+                    (lit_words.get(i).copied().unwrap_or(0) & 0xFF) as u8,
+                ));
+            }
+
+            if tokens.is_empty() {
+                tokens.extend(data.iter().copied().map(DeflateToken::Literal));
+            }
+
+            let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
+            let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
+            let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
+            let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
+            litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
+            dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
+            litlen_freq[256] = litlen_freq[256].saturating_add(1);
+            if dist_freq.iter().all(|value| *value == 0) {
+                dist_freq[0] = 1;
+            }
+
+            drop(flags_map);
+            drop(kind_map);
+            drop(len_map);
+            drop(dist_map);
+            drop(lit_map);
+            drop(litlen_freq_map);
+            drop(dist_freq_map);
+            flags_readback.unmap();
+            kind_readback.unmap();
+            len_readback.unmap();
+            dist_readback.unmap();
+            lit_readback.unmap();
+            litlen_freq_readback.unmap();
+            dist_freq_readback.unmap();
+
+            let compressed = encode_deflate_dynamic_from_tokens(&tokens, &litlen_freq, &dist_freq)
+                .or_else(|_| encode_deflate_fixed_from_tokens(&tokens))?;
+            results[chunk_index] = compressed;
         }
 
         Ok(results)
@@ -2972,6 +3625,25 @@ fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {
     Ok(())
 }
 
+fn compression_mode_id(mode: CompressionMode) -> u32 {
+    match mode {
+        CompressionMode::Speed => 0,
+        CompressionMode::Balanced => 1,
+        CompressionMode::Ratio => 2,
+    }
+}
+
+fn should_validate_gpu_chunk(mode: CompressionMode) -> bool {
+    mode != CompressionMode::Speed
+}
+
+fn gpu_chunk_roundtrip_matches(raw: &[u8], compressed: &[u8]) -> bool {
+    match deflate_decompress_cpu(compressed) {
+        Ok(decoded) => decoded == raw,
+        Err(_) => false,
+    }
+}
+
 fn build_chunk_tasks(
     input: &[u8],
     options: &HybridOptions,
@@ -3166,6 +3838,7 @@ fn compress_cpu_worker_adaptive(
                 index: task.index,
                 backend: ChunkBackend::Cpu,
                 transform: ChunkTransform::None,
+                codec: ChunkCodec::DeflateCpu,
                 raw_len,
                 compressed,
             }
@@ -3209,7 +3882,7 @@ fn compress_gpu_worker_adaptive(
         }
 
         let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
-        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data);
+        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options.compression_mode);
 
         match compressed_batch {
             Ok(compressed_items) if compressed_items.len() == batch.len() => {
@@ -3222,12 +3895,32 @@ fn compress_gpu_worker_adaptive(
                             return;
                         }
                     };
-                    let encoded = ChunkMember {
-                        index: task.index,
-                        backend: ChunkBackend::GpuAssisted,
-                        transform: ChunkTransform::None,
-                        raw_len,
-                        compressed,
+                    let encoded = if should_validate_gpu_chunk(options.compression_mode)
+                        && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
+                    {
+                        match deflate_compress_cpu(&task.raw, options.compression_level) {
+                            Ok(cpu_compressed) => ChunkMember {
+                                index: task.index,
+                                backend: ChunkBackend::Cpu,
+                                transform: ChunkTransform::None,
+                                codec: ChunkCodec::DeflateCpu,
+                                raw_len,
+                                compressed: cpu_compressed,
+                            },
+                            Err(err) => {
+                                set_error(&error, err);
+                                return;
+                            }
+                        }
+                    } else {
+                        ChunkMember {
+                            index: task.index,
+                            backend: ChunkBackend::GpuAssisted,
+                            transform: ChunkTransform::None,
+                            codec: ChunkCodec::DeflateGpuFast,
+                            raw_len,
+                            compressed,
+                        }
                     };
                     if let Err(err) = store_encoded_result(&results, encoded) {
                         set_error(&error, err);
@@ -3252,6 +3945,7 @@ fn compress_gpu_worker_adaptive(
                                 index: task.index,
                                 backend: ChunkBackend::Cpu,
                                 transform: ChunkTransform::None,
+                                codec: ChunkCodec::DeflateCpu,
                                 raw_len,
                                 compressed,
                             };
@@ -3632,7 +4326,7 @@ fn pop_gpu_batch_tasks(
 
 fn compress_chunk_gpu_batch(
     tasks: &[ChunkTask],
-    _options: &HybridOptions,
+    options: &HybridOptions,
     gpu: &GpuAssist,
 ) -> Result<Vec<ChunkMember>, CozipDeflateError> {
     if tasks.is_empty() {
@@ -3640,7 +4334,7 @@ fn compress_chunk_gpu_batch(
     }
 
     let task_data: Vec<&[u8]> = tasks.iter().map(|task| task.raw.as_slice()).collect();
-    let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data)?;
+    let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options.compression_mode)?;
 
     if compressed_batch.len() != tasks.len() {
         return Err(CozipDeflateError::Internal(
@@ -3650,13 +4344,30 @@ fn compress_chunk_gpu_batch(
 
     let mut out = Vec::with_capacity(tasks.len());
     for (task, compressed) in tasks.iter().zip(compressed_batch.into_iter()) {
-        out.push(ChunkMember {
-            index: task.index,
-            backend: ChunkBackend::GpuAssisted,
-            transform: ChunkTransform::None,
-            raw_len: u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?,
-            compressed,
-        });
+        let raw_len = u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let member = if should_validate_gpu_chunk(options.compression_mode)
+            && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
+        {
+            let cpu_compressed = deflate_compress_cpu(&task.raw, options.compression_level)?;
+            ChunkMember {
+                index: task.index,
+                backend: ChunkBackend::Cpu,
+                transform: ChunkTransform::None,
+                codec: ChunkCodec::DeflateCpu,
+                raw_len,
+                compressed: cpu_compressed,
+            }
+        } else {
+            ChunkMember {
+                index: task.index,
+                backend: ChunkBackend::GpuAssisted,
+                transform: ChunkTransform::None,
+                codec: ChunkCodec::DeflateGpuFast,
+                raw_len,
+                compressed,
+            }
+        };
+        out.push(member);
     }
 
     Ok(out)
@@ -3822,16 +4533,23 @@ fn compress_chunk_cpu(
         index: task.index,
         backend: ChunkBackend::Cpu,
         transform: ChunkTransform::None,
+        codec: ChunkCodec::DeflateCpu,
         raw_len: u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?,
         compressed,
     })
+}
+
+fn decode_deflate_by_codec(codec: ChunkCodec, compressed: &[u8]) -> Result<Vec<u8>, CozipDeflateError> {
+    match codec {
+        ChunkCodec::DeflateCpu | ChunkCodec::DeflateGpuFast => deflate_decompress_cpu(compressed),
+    }
 }
 
 fn decode_descriptor_cpu(
     descriptor: ChunkDescriptor,
     options: &HybridOptions,
 ) -> Result<DecodedChunk, CozipDeflateError> {
-    let inflated = deflate_decompress_cpu(&descriptor.compressed)?;
+    let inflated = decode_deflate_by_codec(descriptor.codec, &descriptor.compressed)?;
 
     let raw = match descriptor.transform {
         ChunkTransform::None => inflated,
@@ -3857,7 +4575,7 @@ fn decode_descriptor_gpu(
     options: &HybridOptions,
     _gpu: &GpuAssist,
 ) -> Result<DecodedChunk, CozipDeflateError> {
-    let inflated = deflate_decompress_cpu(&descriptor.compressed)?;
+    let inflated = decode_deflate_by_codec(descriptor.codec, &descriptor.compressed)?;
 
     let raw = match descriptor.transform {
         ChunkTransform::None => inflated,
@@ -4110,19 +4828,11 @@ fn write_fixed_litlen_symbol(writer: &mut BitWriter, symbol: u16) -> Result<(), 
     Ok(())
 }
 
-fn write_length_distance(
-    writer: &mut BitWriter,
-    len: usize,
-    dist: usize,
-) -> Result<(), CozipDeflateError> {
+fn length_symbol_extra(len: usize) -> Result<(u16, u32, u8), CozipDeflateError> {
     if !(MIN_MATCH..=MAX_MATCH).contains(&len) {
         return Err(CozipDeflateError::Internal("length out of deflate range"));
     }
-    if !(1..=MAX_DISTANCE).contains(&dist) {
-        return Err(CozipDeflateError::Internal("distance out of deflate range"));
-    }
 
-    let mut length_symbol = None;
     for index in 0..LEN_BASE.len() {
         let base = LEN_BASE[index] as usize;
         let extra = LEN_EXTRA[index];
@@ -4135,20 +4845,18 @@ fn write_length_distance(
         if (base..=max).contains(&len) {
             let symbol = 257 + index as u16;
             let extra_value = len - base;
-            length_symbol = Some((symbol, extra_value as u32, extra));
-            break;
+            return Ok((symbol, extra_value as u32, extra));
         }
     }
 
-    let (len_symbol, len_extra_value, len_extra_bits) =
-        length_symbol.ok_or(CozipDeflateError::Internal("length symbol not found"))?;
+    Err(CozipDeflateError::Internal("length symbol not found"))
+}
 
-    write_fixed_litlen_symbol(writer, len_symbol)?;
-    if len_extra_bits > 0 {
-        writer.write_bits(len_extra_value, len_extra_bits);
+fn distance_symbol_extra(dist: usize) -> Result<(u16, u32, u8), CozipDeflateError> {
+    if !(1..=MAX_DISTANCE).contains(&dist) {
+        return Err(CozipDeflateError::Internal("distance out of deflate range"));
     }
 
-    let mut dist_symbol = None;
     for index in 0..DIST_BASE.len() {
         let base = DIST_BASE[index] as usize;
         let extra = DIST_EXTRA[index];
@@ -4160,13 +4868,26 @@ fn write_length_distance(
 
         if (base..=max).contains(&dist) {
             let extra_value = dist - base;
-            dist_symbol = Some((index as u16, extra_value as u32, extra));
-            break;
+            return Ok((index as u16, extra_value as u32, extra));
         }
     }
 
-    let (dist_symbol, dist_extra_value, dist_extra_bits) =
-        dist_symbol.ok_or(CozipDeflateError::Internal("distance symbol not found"))?;
+    Err(CozipDeflateError::Internal("distance symbol not found"))
+}
+
+fn write_length_distance(
+    writer: &mut BitWriter,
+    len: usize,
+    dist: usize,
+) -> Result<(), CozipDeflateError> {
+    let (len_symbol, len_extra_value, len_extra_bits) = length_symbol_extra(len)?;
+
+    write_fixed_litlen_symbol(writer, len_symbol)?;
+    if len_extra_bits > 0 {
+        writer.write_bits(len_extra_value, len_extra_bits);
+    }
+
+    let (dist_symbol, dist_extra_value, dist_extra_bits) = distance_symbol_extra(dist)?;
 
     let dist_code = reverse_bits(dist_symbol, 5);
     writer.write_bits(dist_code as u32, 5);
@@ -4175,6 +4896,312 @@ fn write_length_distance(
     }
 
     Ok(())
+}
+
+fn encode_deflate_fixed_from_tokens(tokens: &[DeflateToken]) -> Result<Vec<u8>, CozipDeflateError> {
+    let mut writer = BitWriter::new();
+    writer.write_bits(1, 1);
+    writer.write_bits(0b01, 2);
+
+    for token in tokens {
+        match token {
+            DeflateToken::Literal(byte) => write_fixed_litlen_symbol(&mut writer, *byte as u16)?,
+            DeflateToken::Match { len, dist } => write_length_distance(&mut writer, *len, *dist)?,
+        }
+    }
+
+    write_fixed_litlen_symbol(&mut writer, 256)?;
+    Ok(writer.finish())
+}
+
+fn build_huffman_code_lengths(freq: &[u32], max_bits: u8) -> Option<Vec<u8>> {
+    #[derive(Clone, Copy)]
+    struct Node {
+        left: Option<usize>,
+        right: Option<usize>,
+        symbol: Option<usize>,
+    }
+
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut heap: BinaryHeap<(Reverse<u32>, usize)> = BinaryHeap::new();
+    let mut nodes = Vec::<Node>::new();
+
+    for (symbol, &weight) in freq.iter().enumerate() {
+        if weight == 0 {
+            continue;
+        }
+        let idx = nodes.len();
+        nodes.push(Node {
+            left: None,
+            right: None,
+            symbol: Some(symbol),
+        });
+        heap.push((Reverse(weight), idx));
+    }
+
+    if heap.is_empty() {
+        return Some(vec![0; freq.len()]);
+    }
+
+    if heap.len() == 1 {
+        let mut lengths = vec![0_u8; freq.len()];
+        if let Some((_, idx)) = heap.pop()
+            && let Some(sym) = nodes[idx].symbol
+        {
+            lengths[sym] = 1;
+            return Some(lengths);
+        }
+        return None;
+    }
+
+    while heap.len() > 1 {
+        let (Reverse(a_w), a_i) = heap.pop()?;
+        let (Reverse(b_w), b_i) = heap.pop()?;
+        let parent_idx = nodes.len();
+        nodes.push(Node {
+            left: Some(a_i),
+            right: Some(b_i),
+            symbol: None,
+        });
+        heap.push((Reverse(a_w.saturating_add(b_w)), parent_idx));
+    }
+
+    let root_idx = heap.pop()?.1;
+    let mut lengths = vec![0_u8; freq.len()];
+    let mut stack = vec![(root_idx, 0_u8)];
+    let mut max_depth = 0_u8;
+    while let Some((idx, depth)) = stack.pop() {
+        let node = nodes[idx];
+        if let Some(sym) = node.symbol {
+            let actual_depth = depth.max(1);
+            lengths[sym] = actual_depth;
+            max_depth = max_depth.max(actual_depth);
+            continue;
+        }
+        if let Some(left) = node.left {
+            stack.push((left, depth.saturating_add(1)));
+        }
+        if let Some(right) = node.right {
+            stack.push((right, depth.saturating_add(1)));
+        }
+    }
+
+    if max_depth > max_bits {
+        return None;
+    }
+
+    Some(lengths)
+}
+
+fn build_canonical_codes(lengths: &[u8], max_bits: u8) -> Option<Vec<(u16, u8)>> {
+    let mut bl_count = vec![0_u16; usize::from(max_bits) + 1];
+    for &len in lengths {
+        if len > max_bits {
+            return None;
+        }
+        if len > 0 {
+            bl_count[len as usize] = bl_count[len as usize].saturating_add(1);
+        }
+    }
+
+    let mut next_code = vec![0_u16; usize::from(max_bits) + 1];
+    let mut code = 0_u16;
+    for bits in 1..=usize::from(max_bits) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    let mut out = vec![(0_u16, 0_u8); lengths.len()];
+    for (symbol, &len) in lengths.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
+        let canonical = next_code[len as usize];
+        next_code[len as usize] = next_code[len as usize].saturating_add(1);
+        out[symbol] = (reverse_bits(canonical, len), len);
+    }
+
+    Some(out)
+}
+
+fn encode_code_lengths_rle(lengths: &[u8]) -> Vec<(u8, u8)> {
+    // tuple: (symbol, extra_value)
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lengths.len() {
+        let current = lengths[i];
+        let mut run = 1usize;
+        while i + run < lengths.len() && lengths[i + run] == current {
+            run += 1;
+        }
+
+        if current == 0 {
+            let mut remaining = run;
+            while remaining > 0 {
+                if remaining >= 11 {
+                    let count = remaining.min(138);
+                    out.push((18, (count - 11) as u8));
+                    remaining -= count;
+                } else if remaining >= 3 {
+                    let count = remaining.min(10);
+                    out.push((17, (count - 3) as u8));
+                    remaining -= count;
+                } else {
+                    out.push((0, 0));
+                    remaining -= 1;
+                }
+            }
+        } else {
+            out.push((current, 0));
+            let mut remaining = run - 1;
+            while remaining > 0 {
+                if remaining >= 3 {
+                    let count = remaining.min(6);
+                    out.push((16, (count - 3) as u8));
+                    remaining -= count;
+                } else {
+                    out.push((current, 0));
+                    remaining -= 1;
+                }
+            }
+        }
+
+        i += run;
+    }
+    out
+}
+
+fn encode_deflate_dynamic_from_tokens(
+    tokens: &[DeflateToken],
+    litlen_freq_in: &[u32],
+    dist_freq_in: &[u32],
+) -> Result<Vec<u8>, CozipDeflateError> {
+    const MAX_BITS: u8 = 15;
+    const CODELEN_MAX_BITS: u8 = 7;
+    const CODELEN_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    if litlen_freq_in.len() != LITLEN_SYMBOL_COUNT || dist_freq_in.len() != DIST_SYMBOL_COUNT {
+        return Err(CozipDeflateError::Internal("invalid frequency table size"));
+    }
+
+    let mut litlen_freq = litlen_freq_in.to_vec();
+    let mut dist_freq = dist_freq_in.to_vec();
+    litlen_freq[256] = litlen_freq[256].saturating_add(1);
+    if dist_freq.iter().all(|value| *value == 0) {
+        dist_freq[0] = 1;
+    }
+
+    let litlen_lengths = build_huffman_code_lengths(&litlen_freq, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build litlen huffman lengths"))?;
+    let dist_lengths = build_huffman_code_lengths(&dist_freq, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build dist huffman lengths"))?;
+
+    let hlit_count = litlen_lengths
+        .iter()
+        .rposition(|len| *len != 0)
+        .map(|index| (index + 1).max(257))
+        .unwrap_or(257);
+    let hdist_count = dist_lengths
+        .iter()
+        .rposition(|len| *len != 0)
+        .map(|index| (index + 1).max(1))
+        .unwrap_or(1);
+
+    let mut header_lengths = Vec::with_capacity(hlit_count + hdist_count);
+    header_lengths.extend_from_slice(&litlen_lengths[..hlit_count]);
+    header_lengths.extend_from_slice(&dist_lengths[..hdist_count]);
+    let cl_rle = encode_code_lengths_rle(&header_lengths);
+
+    let mut cl_freq = vec![0_u32; 19];
+    for (symbol, _) in &cl_rle {
+        cl_freq[*symbol as usize] = cl_freq[*symbol as usize].saturating_add(1);
+    }
+    if cl_freq.iter().all(|value| *value == 0) {
+        cl_freq[0] = 1;
+    }
+
+    let cl_lengths = build_huffman_code_lengths(&cl_freq, CODELEN_MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build codelen huffman lengths"))?;
+    let hclen_count = CODELEN_ORDER
+        .iter()
+        .rposition(|&sym| cl_lengths[sym] != 0)
+        .map(|index| (index + 1).max(4))
+        .unwrap_or(4);
+
+    let litlen_codes = build_canonical_codes(&litlen_lengths, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build litlen codes"))?;
+    let dist_codes = build_canonical_codes(&dist_lengths, MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build dist codes"))?;
+    let cl_codes = build_canonical_codes(&cl_lengths, CODELEN_MAX_BITS)
+        .ok_or(CozipDeflateError::Internal("failed to build codelen codes"))?;
+
+    let mut writer = BitWriter::new();
+    writer.write_bits(1, 1);
+    writer.write_bits(0b10, 2);
+    writer.write_bits((hlit_count - 257) as u32, 5);
+    writer.write_bits((hdist_count - 1) as u32, 5);
+    writer.write_bits((hclen_count - 4) as u32, 4);
+    for &sym in CODELEN_ORDER.iter().take(hclen_count) {
+        writer.write_bits(cl_lengths[sym] as u32, 3);
+    }
+
+    for (symbol, extra) in cl_rle {
+        let (code, bits) = cl_codes[symbol as usize];
+        if bits == 0 {
+            return Err(CozipDeflateError::Internal("missing code-length code"));
+        }
+        writer.write_bits(code as u32, bits);
+        match symbol {
+            16 => writer.write_bits(extra as u32, 2),
+            17 => writer.write_bits(extra as u32, 3),
+            18 => writer.write_bits(extra as u32, 7),
+            _ => {}
+        }
+    }
+
+    for token in tokens {
+        match token {
+            DeflateToken::Literal(byte) => {
+                let (code, bits) = litlen_codes[*byte as usize];
+                if bits == 0 {
+                    return Err(CozipDeflateError::Internal("missing literal code"));
+                }
+                writer.write_bits(code as u32, bits);
+            }
+            DeflateToken::Match { len, dist } => {
+                let (len_symbol, len_extra_value, len_extra_bits) = length_symbol_extra(*len)?;
+                let (len_code, len_bits) = litlen_codes[len_symbol as usize];
+                if len_bits == 0 {
+                    return Err(CozipDeflateError::Internal("missing length code"));
+                }
+                writer.write_bits(len_code as u32, len_bits);
+                if len_extra_bits > 0 {
+                    writer.write_bits(len_extra_value, len_extra_bits);
+                }
+
+                let (dist_symbol, dist_extra_value, dist_extra_bits) = distance_symbol_extra(*dist)?;
+                let (dist_code, dist_bits) = dist_codes[dist_symbol as usize];
+                if dist_bits == 0 {
+                    return Err(CozipDeflateError::Internal("missing distance code"));
+                }
+                writer.write_bits(dist_code as u32, dist_bits);
+                if dist_extra_bits > 0 {
+                    writer.write_bits(dist_extra_value, dist_extra_bits);
+                }
+            }
+        }
+    }
+
+    let (eob_code, eob_bits) = litlen_codes[256];
+    if eob_bits == 0 {
+        return Err(CozipDeflateError::Internal("missing end-of-block code"));
+    }
+    writer.write_bits(eob_code as u32, eob_bits);
+    Ok(writer.finish())
 }
 
 fn encode_deflate_fixed_from_runs(
@@ -4259,6 +5286,7 @@ fn encode_frame(original_len: usize, chunks: &[ChunkMember]) -> Result<Vec<u8>, 
     for chunk in chunks {
         out.push(chunk.backend.to_u8());
         out.push(chunk.transform.to_u8());
+        out.push(chunk.codec.to_u8());
         write_u32(&mut out, chunk.raw_len);
         write_u32(
             &mut out,
@@ -4283,7 +5311,7 @@ fn parse_frame(frame: &[u8]) -> Result<(usize, Vec<ChunkDescriptor>), CozipDefla
     }
 
     let version = frame[4];
-    if version != 1 && version != FRAME_VERSION {
+    if version != 1 && version != 2 && version != FRAME_VERSION {
         return Err(CozipDeflateError::InvalidFrame("unsupported frame version"));
     }
 
@@ -4291,10 +5319,10 @@ fn parse_frame(frame: &[u8]) -> Result<(usize, Vec<ChunkDescriptor>), CozipDefla
     let original_len = usize::try_from(read_u64(frame, 14)?)
         .map_err(|_| CozipDeflateError::InvalidFrame("original length overflow"))?;
 
-    let chunk_meta_len = if version == 1 {
-        CHUNK_META_LEN_V1
-    } else {
-        CHUNK_META_LEN_V2
+    let chunk_meta_len = match version {
+        1 => CHUNK_META_LEN_V1,
+        2 => CHUNK_META_LEN_V2,
+        _ => CHUNK_META_LEN_V3,
     };
 
     let meta_len = chunk_count
@@ -4313,14 +5341,29 @@ fn parse_frame(frame: &[u8]) -> Result<(usize, Vec<ChunkDescriptor>), CozipDefla
 
     for index in 0..chunk_count {
         let backend = ChunkBackend::from_u8(frame[cursor])?;
-        let (transform, raw_off, comp_off) = if version == 1 {
-            (ChunkTransform::None, 1_usize, 5_usize)
-        } else {
-            (
+        let (transform, codec, raw_off, comp_off) = match version {
+            1 => (
+                ChunkTransform::None,
+                ChunkCodec::DeflateCpu,
+                1_usize,
+                5_usize,
+            ),
+            2 => (
                 ChunkTransform::from_u8(frame[cursor + 1])?,
+                if backend == ChunkBackend::GpuAssisted {
+                    ChunkCodec::DeflateGpuFast
+                } else {
+                    ChunkCodec::DeflateCpu
+                },
                 2_usize,
                 6_usize,
-            )
+            ),
+            _ => (
+                ChunkTransform::from_u8(frame[cursor + 1])?,
+                ChunkCodec::from_u8(frame[cursor + 2])?,
+                3_usize,
+                7_usize,
+            ),
         };
 
         let raw_len = read_u32(frame, cursor + raw_off)?;
@@ -4340,6 +5383,7 @@ fn parse_frame(frame: &[u8]) -> Result<(usize, Vec<ChunkDescriptor>), CozipDefla
             index,
             backend,
             transform,
+            codec,
             raw_len,
             compressed: frame[payload_cursor..payload_end].to_vec(),
         });
@@ -4455,5 +5499,48 @@ mod tests {
 
         let error = decompress_hybrid(&frame, &options).expect_err("invalid frame should fail");
         assert!(matches!(error, CozipDeflateError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn ratio_mode_roundtrip() {
+        let input = patterned_data(1024 * 1024 + 73);
+        let options = HybridOptions {
+            compression_mode: CompressionMode::Ratio,
+            prefer_gpu: false,
+            gpu_fraction: 0.0,
+            ..HybridOptions::default()
+        };
+
+        let compressed = compress_hybrid(&input, &options).expect("compress should succeed");
+        let decompressed =
+            decompress_hybrid(&compressed.bytes, &options).expect("decompress should succeed");
+
+        assert_eq!(decompressed.bytes, input);
+    }
+
+    #[test]
+    fn decode_v2_frame_compatibility() {
+        let input = b"v2-frame-compat-v2-frame-compat-v2";
+        let compressed = deflate_compress_cpu(input, 6).expect("compress should succeed");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&FRAME_MAGIC);
+        frame.push(2);
+        frame.push(0);
+        write_u32(&mut frame, 1);
+        write_u32(&mut frame, u32::try_from(input.len()).expect("len fits"));
+        write_u64(&mut frame, u64::try_from(input.len()).expect("len fits"));
+        frame.push(ChunkBackend::Cpu.to_u8());
+        frame.push(ChunkTransform::None.to_u8());
+        write_u32(&mut frame, u32::try_from(input.len()).expect("len fits"));
+        write_u32(
+            &mut frame,
+            u32::try_from(compressed.len()).expect("compressed len fits"),
+        );
+        frame.extend_from_slice(&compressed);
+
+        let decoded =
+            decompress_hybrid(&frame, &HybridOptions::default()).expect("decode should succeed");
+        assert_eq!(decoded.bytes, input);
     }
 }
