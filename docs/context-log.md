@@ -912,3 +912,84 @@ mode別GPU品質パラメータ:
 備考:
 - 未使用関数/定数に関する warning は残る（既存設計由来）。
 - 今回は panic/validation error を出さずに ratio 経路をGPU bitpack 化できた状態。
+
+## 2026-02-24 - bench_1gb: gpu_fraction引数追加 + ratio 4GiB試験(1.0)
+
+変更:
+- `cozip_deflate/examples/bench_1gb.rs` に `--gpu-fraction <F>` を追加
+- CPU+GPUケースの `HybridOptions.gpu_fraction` をCLI指定値で上書き
+- ベンチ出力に `gpu_fraction` を表示
+
+実行:
+- `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 4096 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256 --mode ratio --gpu-fraction 1.0`
+
+結果:
+- CPU_ONLY: comp=518.47 MiB/s, decomp=4412.30 MiB/s, ratio=0.3364
+- CPU+GPU : comp=583.18 MiB/s, decomp=5803.31 MiB/s, ratio=0.3375
+- speedup(cpu/hybrid): compress=1.125x, decompress=1.315x
+- chunk配分: cpu_chunks=833, gpu_chunks=191
+
+所見:
+- `gpu_fraction=1.0` でも実配分は動的調整でCPU側へ多く戻る（予約比率=実配分ではない）。
+- 圧縮率差は小さいまま、圧縮/解凍ともCPU+GPUが優位。
+
+## 2026-02-24 - デフォルトgpu_fractionを1.0へ変更
+
+変更:
+- `HybridOptions::default().gpu_fraction` を `0.5 -> 1.0` に変更
+- `bench_1gb` の `--gpu-fraction` デフォルト表示/実値を `1.0` に変更
+
+確認:
+- `cargo test -p cozip_deflate --lib` 通過
+
+## 2026-02-24 - balanced低GPU利用の原因調査と修正
+
+現象:
+- `--mode balanced` で `gpu_chunks` が極端に少ない / 0 になるケースが発生
+- 圧縮速度がCPU_ONLYより悪化
+
+原因(確認済み):
+1. dynamic Huffman計画の code-length 木生成失敗
+- エラー: `failed to build codelen huffman lengths`
+- これにより GPUバッチ全体がCPUフォールバックし、`gpu_chunks` が増えない
+
+2. 予約降格タイミングが短く、GPU予約が早期にCPUへ流れる
+- 旧設計は予約時刻が同時刻で、watchdogがまとめて降格しやすかった
+
+実装修正:
+- dynamic Huffman code-length木生成にフォールバックを追加
+  - `fallback_codelen_lengths()`
+  - 生成不能時は code-lengthシンボルに安全な固定長(5bit)を割当
+- 予約降格のモード別チューニング
+  - `GPU_RESERVATION_TIMEOUT_MS_DYNAMIC = 100`
+  - `GPU_RESERVATION_STAGGER_MS_DYNAMIC = 8`
+- 予約時刻を段階的にずらす初期化を追加
+  - `reserved_at_ms = now + seq * stagger_ms`
+  - 一斉降格を抑止し、GPUが連続してバッチ取得しやすくした
+- `balanced` は引き続き dynamic Huffman + speed探索（tokenize modeはSpeed）
+- GPU検証は `balanced/ratio` で有効維持（誤圧縮防止）
+
+補助デバッグ:
+- `COZIP_LOG_GPU_FALLBACK=1` で以下をstderr出力
+  - GPUバッチエラー
+  - GPUバッチサイズ不整合
+  - GPU検証失敗によるCPUフォールバック
+
+ローカル確認(1GiB, balanced, gpu_fraction=1.0):
+- 修正前: gpu_chunks=0 相当のケースあり
+- 修正後例: gpu_chunks=72 / cpu_chunks=184
+- ただし圧縮率はまだ高め (`ratio=0.3967` 例) で、balancedの圧縮品質は引き続き改善余地あり
+
+## 2026-02-24 - gpu-fractionフラグ再追加（再適用）
+
+対応内容:
+- `cozip_deflate/examples/bench_1gb.rs`
+  - `--gpu-fraction <R>` を再追加（0.0..=1.0）
+  - デフォルトを `1.0` に設定
+  - CPU+GPU 実行時の `HybridOptions.gpu_fraction` に反映
+  - ベンチ出力に `gpu_fraction=...` を表示
+- `cozip_deflate/src/lib.rs`
+  - `HybridOptions::default().gpu_fraction` を `1.0` に変更
+
+確認:
+- `cargo check -p cozip_deflate --example bench_1gb` 通過

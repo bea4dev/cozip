@@ -10,6 +10,7 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     gpu_subchunk_kib: usize,
+    gpu_fraction: f32,
     mode: CompressionMode,
 }
 
@@ -21,6 +22,7 @@ impl Default for BenchConfig {
             warmups: 0,
             chunk_mib: 4,
             gpu_subchunk_kib: 256,
+            gpu_fraction: 1.0,
             mode: CompressionMode::Speed,
         }
     }
@@ -66,6 +68,11 @@ impl BenchConfig {
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-subchunk-kib".to_string())?;
                 }
+                "--gpu-fraction" => {
+                    cfg.gpu_fraction = value
+                        .parse::<f32>()
+                        .map_err(|_| "invalid --gpu-fraction".to_string())?;
+                }
                 "--mode" => {
                     cfg.mode = match value.as_str() {
                         "speed" => CompressionMode::Speed,
@@ -87,6 +94,9 @@ impl BenchConfig {
         if cfg.size_mib == 0 || cfg.iters == 0 || cfg.chunk_mib == 0 || cfg.gpu_subchunk_kib == 0 {
             return Err("size/iters/chunk/subchunk must be > 0".to_string());
         }
+        if !(0.0..=1.0).contains(&cfg.gpu_fraction) {
+            return Err("gpu-fraction must be in range 0.0..=1.0".to_string());
+        }
 
         Ok(cfg)
     }
@@ -99,6 +109,7 @@ fn help_text() -> String {
   --warmups <N>            warmup iterations (default: 0)
   --chunk-mib <N>          host chunk size in MiB (default: 4)
   --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)
+  --gpu-fraction <R>       gpu scheduling target ratio 0.0..=1.0 (default: 1.0)
   --mode <M>               speed|balanced|ratio (default: speed)"#;
     text.to_string()
 }
@@ -238,7 +249,7 @@ fn main() {
         compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: true,
-        gpu_fraction: 0.5,
+        gpu_fraction: cfg.gpu_fraction,
         gpu_min_chunk_size: 64 * 1024,
     };
 
@@ -247,6 +258,7 @@ fn main() {
         "size_mib={} iters={} warmups={} chunk_mib={} gpu_subchunk_kib={} mode={:?}",
         cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib, cfg.mode
     );
+    println!("gpu_fraction={:.2}", cfg.gpu_fraction);
 
     if cfg.warmups > 0 {
         let _ = run_case(&input, &cpu_only, cfg.warmups);

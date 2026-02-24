@@ -76,7 +76,7 @@ impl Default for HybridOptions {
             compression_level: 6,
             compression_mode: CompressionMode::Speed,
             prefer_gpu: true,
-            gpu_fraction: 0.5,
+            gpu_fraction: 1.0,
             gpu_min_chunk_size: 64 * 1024,
         }
     }
