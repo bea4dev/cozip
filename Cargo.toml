@@ -1,0 +1,10 @@
+[workspace]
+members = ["cozip_deflate", "cozip_zip"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+thiserror = "=2.0.17"

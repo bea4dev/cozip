@@ -1,0 +1,11 @@
+[package]
+name = "cozip_deflate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytemuck = "=1.24.0"
+flate2 = "=1.1.8"
+pollster = "=0.3.0"
+thiserror.workspace = true
+wgpu = "=0.19.4"
