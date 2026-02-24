@@ -597,3 +597,48 @@ command:
 - 圧縮はCPU+GPUが優位(+14%程度)
 - 解凍はCPU_ONLYが優位
 - speedup表記の注記(`>1.0 means CPU_ONLY faster`)は逆で、実際はCPU_ONLY/hybrid比なので>1はhybridが速い
+
+## 2026-02-24 - GPU転送/readback最適化 (実装4)
+
+### 対応
+
+1. 不要なCPUゼロ書き込みを削減
+- `deflate_fixed_literals_batch()` で以下の `queue.write_buffer(0埋め)` を削除:
+  - `token_total_buffer`
+  - `bitlens_buffer`
+  - `total_bits_buffer`
+  - `output_words_buffer` の全体ゼロ埋め
+- `output_words_buffer` は先頭ヘッダ(0b011)のみ書き込み維持
+- WebGPUのゼロ初期化前提を利用し、PCIe転送量を削減
+
+2. readbackを単一バッファ化
+- 旧: `total_readback` と `compressed_readback` を別々にmap
+- 新: `readback` 1本に `total_bits(先頭4byte) + compressed payload` を集約
+- map_async/map回数・チャネル処理を削減
+
+### 検証
+
+1. `cargo test -p cozip_deflate --lib` 通過
+2. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+3. `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 1024 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256`
+4. `cargo run --release -p cozip_deflate --example bench_hybrid`
+
+### 直近ベンチ
+
+- 1GiB (`bench_1gb`)
+  - CPU_ONLY: comp_mib_s=476.38 decomp_mib_s=4146.80 ratio=0.3364
+  - CPU+GPU : comp_mib_s=572.34 decomp_mib_s=5232.33 ratio=0.4373
+  - chunk配分: cpu=176 gpu=80
+
+- `bench_hybrid`
+  - 4MiB:
+    - CPU_ONLY comp_mib_s=39.12 ratio=0.3361
+    - CPU+GPU  comp_mib_s=237.52 ratio=0.6593
+  - 16MiB:
+    - CPU_ONLY comp_mib_s=95.98 ratio=0.3364
+    - CPU+GPU  comp_mib_s=155.51 ratio=0.4978
+
+### メモ
+
+- 圧縮スループットは改善傾向
+- 圧縮率は依然としてCPU_ONLYより悪化しやすく、GPU match品質の改善が次段課題

@@ -275,7 +275,7 @@ fn main() {
         hybrid.last_stats.gpu_available,
     );
     println!(
-        "speedup(cpu/hybrid): compress={:.3}x decompress={:.3}x ( >1.0 means CPU_ONLY faster )",
+        "speedup(cpu/hybrid): compress={:.3}x decompress={:.3}x ( >1.0 means CPU+GPU faster )",
         comp_speedup, decomp_speedup
     );
 }

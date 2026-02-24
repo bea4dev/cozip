@@ -2088,8 +2088,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         struct PendingDeflateReadback {
             chunk_index: usize,
-            total_readback: wgpu::Buffer,
-            compressed_readback: wgpu::Buffer,
+            readback: wgpu::Buffer,
+            output_storage_size: u64,
         }
 
         let mut results = vec![Vec::new(); chunks.len()];
@@ -2189,17 +2189,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue
-                .write_buffer(&token_total_buffer, 0, bytemuck::bytes_of(&0_u32));
 
             let bitlens_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-bitlens"),
                 size: lane_storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
-            let zero_lanes = vec![0_u8; len * std::mem::size_of::<u32>()];
-            self.queue.write_buffer(&bitlens_buffer, 0, &zero_lanes);
 
             let bit_offsets_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-bit-offsets"),
@@ -2216,8 +2212,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            self.queue
-                .write_buffer(&total_bits_buffer, 0, bytemuck::bytes_of(&0_u32));
 
             let output_words_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-out-words"),
@@ -2227,8 +2221,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let zero_words = vec![0_u8; output_words * std::mem::size_of::<u32>()];
-            self.queue.write_buffer(&output_words_buffer, 0, &zero_words);
             self.queue
                 .write_buffer(&output_words_buffer, 0, bytemuck::bytes_of(&0b011_u32));
 
@@ -2248,15 +2240,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             self.queue
                 .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
 
-            let total_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-total-readback"),
-                size: 4,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let compressed_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-compressed-readback"),
-                size: output_storage_size,
+            let readback_size = output_storage_size
+                .checked_add(4)
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-deflate-readback"),
+                size: u64::try_from(readback_size).map_err(|_| CozipDeflateError::DataTooLarge)?,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -2424,19 +2413,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
             }
 
-            encoder.copy_buffer_to_buffer(&total_bits_buffer, 0, &total_readback, 0, 4);
+            encoder.copy_buffer_to_buffer(&total_bits_buffer, 0, &readback, 0, 4);
             encoder.copy_buffer_to_buffer(
                 &output_words_buffer,
                 0,
-                &compressed_readback,
-                0,
+                &readback,
+                4,
                 output_storage_size,
             );
 
             pending.push(PendingDeflateReadback {
                 chunk_index,
-                total_readback,
-                compressed_readback,
+                readback,
+                output_storage_size,
             });
             dispatched = true;
         }
@@ -2447,64 +2436,57 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         self.queue.submit(Some(encoder.finish()));
 
-        let mut total_receivers = Vec::with_capacity(pending.len());
-        let mut output_receivers = Vec::with_capacity(pending.len());
+        let mut receivers = Vec::with_capacity(pending.len());
         for item in &pending {
-            let (tx_total, rx_total) = std::sync::mpsc::channel();
-            item.total_readback
+            let (tx, rx) = std::sync::mpsc::channel();
+            item.readback
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx_total.send(result);
+                    let _ = tx.send(result);
                 });
-            total_receivers.push(rx_total);
-
-            let (tx_out, rx_out) = std::sync::mpsc::channel();
-            item.compressed_readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx_out.send(result);
-                });
-            output_receivers.push(rx_out);
+            receivers.push(rx);
         }
 
         self.device.poll(wgpu::Maintain::Wait);
 
-        for (item, (total_rx, out_rx)) in pending
-            .into_iter()
-            .zip(total_receivers.into_iter().zip(output_receivers.into_iter()))
-        {
-            match total_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-            }
-            match out_rx.recv() {
+        for (item, rx) in pending.into_iter().zip(receivers.into_iter()) {
+            match rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
                 Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
 
-            let total_mapped = item.total_readback.slice(..).get_mapped_range();
-            let total_words: &[u32] = bytemuck::cast_slice(&total_mapped);
+            let mapped = item.readback.slice(..).get_mapped_range();
+            if mapped.len() < 4 {
+                return Err(CozipDeflateError::Internal("gpu readback too small"));
+            }
+            let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
             let literal_bits = total_words.first().copied().unwrap_or(0) as usize;
-            drop(total_mapped);
-            item.total_readback.unmap();
 
             let total_bits = literal_bits
                 .checked_add(10)
                 .ok_or(CozipDeflateError::DataTooLarge)?;
             let total_bytes = total_bits.div_ceil(8);
 
-            let output_mapped = item.compressed_readback.slice(..).get_mapped_range();
-            if total_bytes > output_mapped.len() {
+            let output_storage_size = usize::try_from(item.output_storage_size)
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            if total_bytes > output_storage_size {
                 return Err(CozipDeflateError::Internal(
                     "gpu compressed output exceeded allocated readback",
                 ));
             }
+            let payload_start = 4usize;
+            let payload_end = payload_start
+                .checked_add(output_storage_size)
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+            if payload_end > mapped.len() {
+                return Err(CozipDeflateError::Internal("gpu readback payload out of range"));
+            }
+            let payload = &mapped[payload_start..payload_end];
             let mut compressed = Vec::with_capacity(total_bytes);
-            compressed.extend_from_slice(&output_mapped[..total_bytes]);
-            drop(output_mapped);
-            item.compressed_readback.unmap();
+            compressed.extend_from_slice(&payload[..total_bytes]);
+            drop(mapped);
+            item.readback.unmap();
 
             results[item.chunk_index] = compressed;
         }
