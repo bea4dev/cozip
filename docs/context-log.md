@@ -690,3 +690,39 @@ command:
 
 - `1` は反映済み
 - `2` の完全版(二重バッファ submit/collect 分離による upload/compute/readback 重畳)は次段実装候補
+
+## 2026-02-24 - 速度最適化(2完全版): submit/collect 重畳の実装
+
+### 実装
+
+1. `deflate_fixed_literals_batch()` をスロットプール型に変更
+- `chunk_index` 固定スロットではなく、`free_slots` + `pending` で再利用する方式へ移行
+- プール上限: `GPU_DEFLATE_SLOT_POOL (= GPU_BATCH_CHUNKS)`
+
+2. submit と collect の重畳
+- `GPU_PIPELINED_SUBMIT_CHUNKS` ごとに `queue.submit` して `map_async` 登録
+- 直後に `poll(Maintain::Poll)` + `try_recv` で回収可能分を先行 collect
+- 空きスロットがない場合のみ `poll(Maintain::Wait)` で1件回収して再利用
+
+3. readback復元処理の共通化
+- `collect_deflate_readback()` を追加
+- `total_bits + payload` 形式の readback から圧縮バイト列を復元し、`unmap` まで一元化
+
+### 検証
+
+1. `cargo test -p cozip_deflate --lib` 通過
+2. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+3. `cargo run --release -p cozip_deflate --example bench_1gb` 実行
+
+### 直近ベンチ
+
+- 1GiB (`bench_1gb`, default)
+  - CPU_ONLY: comp_mib_s=499.68 decomp_mib_s=4031.88 ratio=0.3364
+  - CPU+GPU : comp_mib_s=635.92 decomp_mib_s=5209.82 ratio=0.4574
+  - speedup(cpu/hybrid): compress=1.273x decompress=1.292x
+  - 配分: cpu_chunks=160 gpu_chunks=96
+
+### メモ
+
+- 前回実装の「部分的重畳」から、実際に submit/collect を分離したパイプラインへ移行
+- 圧縮率は CPU_ONLY より悪いままだが、スループットは引き続き CPU+GPU が優位
