@@ -1082,3 +1082,185 @@ mode別GPU品質パラメータ:
 - `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
 - `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 1 --chunk-mib 4 --gpu-subchunk-kib 256 --mode ratio --gpu-fraction 1.0`
   - 実行成功（roundtrip OK）
+
+## 2026-02-25 - GPU圧縮の時間計測ログ追加（COZIP_PROFILE_TIMING）
+
+目的:
+- 大幅改善余地の有無を切り分けるため、GPU圧縮パスのどこで時間を使っているかを可視化。
+
+実装:
+- `cozip_deflate/src/lib.rs`
+  - `COZIP_PROFILE_TIMING=1` で有効化される軽量タイミング計測を追加
+  - 追加ヘルパー:
+    - `timing_profile_enabled()`
+    - `elapsed_ms()`
+    - `GPU_TIMING_CALL_SEQ`（ログ追跡用call id）
+  - fixed GPU path (`deflate_fixed_literals_batch`) サマリ出力:
+    - `t_encode_submit_ms`
+    - `t_bits_rb_ms`（total_bits readback待ち）
+    - `t_payload_submit_ms`
+    - `t_payload_rb_ms`
+    - `t_cpu_fallback_ms`
+    - `payload_chunks/fallback_chunks/readback量`
+  - dynamic GPU path (`deflate_dynamic_hybrid_batch`) サマリ出力:
+    - `t_freq_submit_ms`
+    - `t_freq_wait_plan_ms`（freq回収+CPU木生成）
+    - `t_pack_submit_ms`
+    - `t_pack_bits_rb_ms`（total_bits回収）
+    - `t_payload_submit_ms`
+    - `t_payload_rb_ms`
+    - `t_cpu_fallback_ms`
+    - `payload_chunks/fallback_chunks/readback量`
+  - adaptive scheduler (`compress_hybrid_adaptive_scheduler`) サマリ出力:
+    - 総時間、CPU/GPUチャンク数、入出力サイズ
+
+使い方:
+- 例:
+  - `COZIP_PROFILE_TIMING=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 4096 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256 --mode speed --gpu-fraction 1.0`
+
+ローカル動作確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo check -p cozip_deflate --example bench_1gb` 通過
+- `COZIP_PROFILE_TIMING=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 8 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 256 --mode speed --gpu-fraction 1.0`
+  - `[cozip][timing][gpu-fixed] ...`
+  - `[cozip][timing][scheduler] ...`
+  が出力されることを確認
+
+## 2026-02-25 - dynamic freq区間の犯人切り分け（poll/map/plan分離）
+
+目的:
+- `t_freq_wait_plan_ms` が大きい問題を、GPU待機かCPU木生成かまで分解して特定する。
+
+実装:
+- `GpuDynamicTiming` を分割:
+  - `t_freq_poll_wait_ms`
+  - `t_freq_recv_ms`
+  - `t_freq_map_copy_ms`
+  - `t_freq_plan_ms`
+- `deflate_dynamic_hybrid_batch` で
+  - `device.poll(Wait)` 区間
+  - receiver `recv` 区間
+  - map + copy + unmap 区間
+  - `build_dynamic_huffman_plan` 区間
+  を個別計測。
+
+ローカル確認 (64MiB, ratio):
+- `COZIP_PROFILE_TIMING=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+- 出力例:
+  - `t_freq_poll_wait_ms=283.916`
+  - `t_freq_recv_ms=0.001`
+  - `t_freq_map_copy_ms=0.021`
+  - `t_freq_plan_ms=0.386`
+
+所見:
+- 少なくともこの実行では、`freq`区間の大半は「GPU freqカーネル完了待ち (`poll wait`)」。
+- CPU側の木生成は支配的でない。
+
+## 2026-02-25 - ratio: freq集計をworkgroup局所化 + capped dispatch
+
+目的:
+- `freq` フェーズの global atomic 競合を下げ、`t_freq_poll_wait_ms` を短縮する。
+
+実装:
+- `cozip_deflate/src/lib.rs`
+  - 追加: `GPU_FREQ_MAX_WORKGROUPS = 4096`
+  - 追加: `dispatch_grid_for_items_capped(items, group_size, max_groups)`
+  - dynamic の freq pass dispatch を
+    - `dispatch_grid_for_items(len, 128)` から
+    - `dispatch_grid_for_items_capped(len, 128, GPU_FREQ_MAX_WORKGROUPS)`
+    に変更
+  - `freq` WGSL を変更:
+    - 直接 `litlen_freq/dist_freq` へ atomicAdd する方式を廃止
+    - `var<workgroup> local_litlen_freq/local_dist_freq` に集計
+    - workgroup内で集計後、非0 binのみ global freq へ atomicAdd
+    - grid-stride loop (`idx += num_workgroups*workgroup_size`) で1スレッドが複数トークン処理
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `COZIP_PROFILE_TIMING=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+  - ローカル結果:
+    - `t_freq_poll_wait_ms=269.699`（前回計測 283.916 から減少）
+    - `t_freq_plan_ms=0.756`（CPU木生成は依然支配的でない）
+
+メモ:
+- 改善幅は限定的で、さらに詰めるには `GPU_FREQ_MAX_WORKGROUPS` のチューニング、
+  または partial histogram バッファを使った完全2pass reduce（global atomic最小化）が候補。
+
+## 2026-02-25 - dynamic Phase1 深掘りプローブ追加（tokenize/finalize/freq分離）
+
+目的:
+- Phase1(`tokenize + token_finalize + freq`)の真犯人を予測ではなく計測で特定する。
+
+実装:
+- `COZIP_PROFILE_DEEP=1` を追加（`COZIP_PROFILE_TIMING` と併用推奨）
+- `GpuAssist::profile_dynamic_phase1_probe()` を追加し、dynamic pathで最初の非空chunkに対して
+  - tokenize pass を単独submit+wait
+  - token_finalize pass を単独submit+wait
+  - freq pass を単独submit+wait
+  を実行し、各msを出力
+- 出力形式:
+  - `[cozip][timing][gpu-dynamic-probe] ... t_tokenize_ms=... t_finalize_ms=... t_freq_ms=...`
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_DEEP=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+- ローカル例:
+  - `t_tokenize_ms=17.369`
+  - `t_finalize_ms=2.386`
+  - `t_freq_ms=0.171`
+
+所見:
+- 少なくともこの計測では、`freq` ではなく `tokenize` がPhase1支配要因。
+
+## 2026-02-25 - tokenize内訳プローブ（literal/head/extend 差分計測）
+
+目的:
+- `tokenize` 内の真犯人を特定するため、処理内訳を差分で計測。
+
+実装:
+- tokenize WGSL に deep profile用 mode を追加
+  - `100`: literal-only（候補探索なし）
+  - `101`: head-only speed
+  - `102`: head-only balanced
+  - `103`: head-only ratio
+- `profile_dynamic_phase1_probe()` を拡張
+  - `tokenize` を 3回実行（lit/head/full）
+  - `head_only = head_total - lit`
+  - `extend_only = full - head_total`
+  - 各モードは warmup 1回 + 計測1回でブレを低減
+- 出力形式:
+  - `[cozip][timing][gpu-dynamic-probe] ... t_tokenize_lit_ms=... t_tokenize_head_total_ms=... t_tokenize_full_ms=... t_tokenize_head_only_ms=... t_tokenize_extend_only_ms=...`
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_DEEP=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+- ローカル例(4MiB probe):
+  - `t_tokenize_lit_ms=0.313`
+  - `t_tokenize_head_only_ms=0.486`
+  - `t_tokenize_extend_only_ms=15.653`
+
+所見:
+- tokenize内では `extend_only`（一致後の長さ延長ループ）が圧倒的に支配的。
+
+## 2026-02-25 - tokenize延長ループ最適化（4byte比較）
+
+目的:
+- 真犯人だった `tokenize_extend_only` を直接短縮する。
+
+実装:
+- tokenize WGSL に `load_u32_unaligned()` を追加
+- 一致後延長ループを
+  - 旧: 1byteずつ `byte_at(p) == byte_at(p-dist)` 比較
+  - 新: 4byte比較 (`left4 == right4`) を先行し、ミスマッチ時は `countTrailingZeros(xor)>>3` で差分byte位置まで一気に進める
+  - 残りは tail の1byteループで処理
+- 先頭3byte判定の `byte_at(i), byte_at(i+1), byte_at(i+2)` を事前読み出しして再利用
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `COZIP_PROFILE_TIMING=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+  - `t_freq_poll_wait_ms`: 283ms級 -> 149ms級（ローカル）
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_DEEP=1 ...` で深掘り
+  - `t_tokenize_extend_only_ms`: 15.6ms級 -> 7.3ms級（4MiB probe, ローカル）
+
+メモ:
+- 深掘り (`COZIP_PROFILE_DEEP=1`) は計測用追加実行が入るため、実運用ベンチ比較には使わない。

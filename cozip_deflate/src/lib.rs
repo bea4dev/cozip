@@ -44,6 +44,7 @@ const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUN
 const GPU_BATCH_CHUNKS: usize = 16;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
+const GPU_FREQ_MAX_WORKGROUPS: u32 = 4096;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
@@ -191,6 +192,74 @@ pub enum CozipDeflateError {
     #[error("internal error: {0}")]
     Internal(&'static str),
 }
+
+fn timing_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(raw) = std::env::var("COZIP_PROFILE_TIMING") else {
+            return false;
+        };
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn deep_timing_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(raw) = std::env::var("COZIP_PROFILE_DEEP") else {
+            return false;
+        };
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
+struct GpuFixedTiming {
+    call_id: u64,
+    mode: CompressionMode,
+    groups: usize,
+    chunks: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+    payload_chunks: usize,
+    fallback_chunks: usize,
+    bits_readback_bytes: usize,
+    payload_readback_bytes: usize,
+    encode_submit_ms: f64,
+    bits_readback_ms: f64,
+    payload_submit_ms: f64,
+    payload_readback_ms: f64,
+    cpu_fallback_ms: f64,
+}
+
+struct GpuDynamicTiming {
+    call_id: u64,
+    mode: CompressionMode,
+    chunks: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+    payload_chunks: usize,
+    fallback_chunks: usize,
+    bits_readback_bytes: usize,
+    payload_readback_bytes: usize,
+    freq_submit_ms: f64,
+    freq_poll_wait_ms: f64,
+    freq_recv_ms: f64,
+    freq_map_copy_ms: f64,
+    freq_plan_ms: f64,
+    pack_submit_ms: f64,
+    pack_bits_readback_ms: f64,
+    payload_submit_ms: f64,
+    payload_readback_ms: f64,
+    cpu_fallback_ms: f64,
+}
+
+static GPU_TIMING_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 struct ChunkTask {
@@ -448,6 +517,10 @@ var<uniform> params: Params;
 
 fn mode_max_match_scan(mode: u32) -> u32 {
     switch (mode) {
+        case 100u: { return 0u; } // profile: literal-only
+        case 101u: { return 0u; } // profile: head-only speed
+        case 102u: { return 0u; } // profile: head-only balanced
+        case 103u: { return 0u; } // profile: head-only ratio
         case 1u: { return 128u; } // Balanced
         case 2u: { return 192u; } // Ratio
         default: { return 64u; }  // Speed
@@ -456,6 +529,10 @@ fn mode_max_match_scan(mode: u32) -> u32 {
 
 fn mode_max_match_len(mode: u32) -> u32 {
     switch (mode) {
+        case 100u: { return 3u; } // profile: literal-only
+        case 101u: { return 3u; } // profile: head-only speed
+        case 102u: { return 3u; } // profile: head-only balanced
+        case 103u: { return 3u; } // profile: head-only ratio
         case 1u: { return 128u; } // Balanced
         case 2u: { return 258u; } // Ratio
         default: { return 64u; }  // Speed
@@ -464,6 +541,10 @@ fn mode_max_match_len(mode: u32) -> u32 {
 
 fn mode_dist_candidate_count(mode: u32) -> u32 {
     switch (mode) {
+        case 100u: { return 0u; }  // profile: literal-only
+        case 101u: { return 20u; } // profile: head-only speed
+        case 102u: { return 28u; } // profile: head-only balanced
+        case 103u: { return 32u; } // profile: head-only ratio
         case 1u: { return 28u; } // up to 8192
         case 2u: { return 32u; } // up to 32768
         default: { return 20u; } // up to 512
@@ -474,6 +555,18 @@ fn byte_at(index: u32) -> u32 {
     let word = input_words[index >> 2u];
     let shift = (index & 3u) * 8u;
     return (word >> shift) & 0xFFu;
+}
+
+fn load_u32_unaligned(index: u32) -> u32 {
+    let word_index = index >> 2u;
+    let byte_offset = index & 3u;
+    if (byte_offset == 0u) {
+        return input_words[word_index];
+    }
+    let low = input_words[word_index] >> (byte_offset * 8u);
+    let high_shift = (4u - byte_offset) * 8u;
+    let high = input_words[word_index + 1u] << high_shift;
+    return low | high;
 }
 
 fn dist_candidate(slot: u32) -> u32 {
@@ -530,6 +623,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let match_scan_limit = mode_max_match_scan(params.mode);
     let match_len_limit = mode_max_match_len(params.mode);
     let dist_limit = mode_dist_candidate_count(params.mode);
+    let b0 = lit;
+    var b1: u32 = 0u;
+    var b2: u32 = 0u;
+    if (i + 2u < params.len) {
+        b1 = byte_at(i + 1u);
+        b2 = byte_at(i + 2u);
+    }
     var c: u32 = 0u;
     loop {
         if (c >= dist_limit) {
@@ -537,13 +637,34 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let dist = dist_candidate(c);
         if (dist <= i && i + 2u < params.len) {
-            if (byte_at(i) == byte_at(i - dist)
-                && byte_at(i + 1u) == byte_at(i + 1u - dist)
-                && byte_at(i + 2u) == byte_at(i + 2u - dist))
+            if (b0 == byte_at(i - dist)
+                && b1 == byte_at(i + 1u - dist)
+                && b2 == byte_at(i + 2u - dist))
             {
                 var mlen: u32 = 3u;
                 var p = i + 3u;
                 var scanned: u32 = 0u;
+
+                loop {
+                    if (p + 3u >= params.len || mlen + 4u > match_len_limit || scanned + 4u > match_scan_limit) {
+                        break;
+                    }
+                    let left4 = load_u32_unaligned(p);
+                    let right4 = load_u32_unaligned(p - dist);
+                    if (left4 == right4) {
+                        mlen = mlen + 4u;
+                        p = p + 4u;
+                        scanned = scanned + 4u;
+                    } else {
+                        let diff = left4 ^ right4;
+                        let same_bytes = countTrailingZeros(diff) >> 3u;
+                        mlen = mlen + same_bytes;
+                        p = p + same_bytes;
+                        scanned = scanned + same_bytes;
+                        break;
+                    }
+                }
+
                 loop {
                     if (p >= params.len || mlen >= match_len_limit || scanned >= match_scan_limit) {
                         break;
@@ -884,23 +1005,82 @@ fn dist_symbol_for_dist(mdist_in: u32) -> u32 {
     return 29u;
 }
 
+const LITLEN_SYMBOLS: u32 = 286u;
+const DIST_SYMBOLS: u32 = 30u;
+const FREQ_WORKGROUP_SIZE: u32 = 128u;
+
+var<workgroup> local_litlen_freq: array<atomic<u32>, 286>;
+var<workgroup> local_dist_freq: array<atomic<u32>, 30>;
+
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len || token_flags[idx] == 0u) {
-        return;
+fn main(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    var s: u32 = lid;
+    loop {
+        if (s >= LITLEN_SYMBOLS) {
+            break;
+        }
+        atomicStore(&local_litlen_freq[s], 0u);
+        s = s + FREQ_WORKGROUP_SIZE;
     }
 
-    if (token_kind[idx] == 0u) {
-        let lit = min(token_lit[idx], 255u);
-        atomicAdd(&litlen_freq[lit], 1u);
-        return;
+    s = lid;
+    loop {
+        if (s >= DIST_SYMBOLS) {
+            break;
+        }
+        atomicStore(&local_dist_freq[s], 0u);
+        s = s + FREQ_WORKGROUP_SIZE;
+    }
+    workgroupBarrier();
+
+    let thread_count = max(1u, num_wg.x * num_wg.y * FREQ_WORKGROUP_SIZE);
+    var idx = id.x + (id.y * 8388480u);
+    loop {
+        if (idx >= params.len) {
+            break;
+        }
+        if (token_flags[idx] != 0u) {
+            if (token_kind[idx] == 0u) {
+                let lit = min(token_lit[idx], 255u);
+                atomicAdd(&local_litlen_freq[lit], 1u);
+            } else {
+                let len_symbol = litlen_symbol_for_len(token_match_len[idx]);
+                let dist_symbol = dist_symbol_for_dist(token_match_dist[idx]);
+                atomicAdd(&local_litlen_freq[len_symbol], 1u);
+                atomicAdd(&local_dist_freq[dist_symbol], 1u);
+            }
+        }
+        idx = idx + thread_count;
+    }
+    workgroupBarrier();
+
+    s = lid;
+    loop {
+        if (s >= LITLEN_SYMBOLS) {
+            break;
+        }
+        let value = atomicLoad(&local_litlen_freq[s]);
+        if (value > 0u) {
+            atomicAdd(&litlen_freq[s], value);
+        }
+        s = s + FREQ_WORKGROUP_SIZE;
     }
 
-    let len_symbol = litlen_symbol_for_len(token_match_len[idx]);
-    let dist_symbol = dist_symbol_for_dist(token_match_dist[idx]);
-    atomicAdd(&litlen_freq[len_symbol], 1u);
-    atomicAdd(&dist_freq[dist_symbol], 1u);
+    s = lid;
+    loop {
+        if (s >= DIST_SYMBOLS) {
+            break;
+        }
+        let value = atomicLoad(&local_dist_freq[s]);
+        if (value > 0u) {
+            atomicAdd(&dist_freq[s], value);
+        }
+        s = s + FREQ_WORKGROUP_SIZE;
+    }
 }
 "#,
             )),
@@ -2942,6 +3122,177 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         })
     }
 
+    fn profile_dynamic_phase1_probe(
+        &self,
+        slot: &DeflateSlot,
+        len: usize,
+        mode: CompressionMode,
+        chunk_index: usize,
+    ) -> Result<(), CozipDeflateError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let call_id = GPU_TIMING_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let (tokenize_x, tokenize_y) = dispatch_grid_for_items(len, 128)?;
+        let (finalize_x, finalize_y) = dispatch_grid_for_items(len, TOKEN_FINALIZE_SEGMENT_SIZE)?;
+        let (freq_x, freq_y) =
+            dispatch_grid_for_items_capped(len, 128, GPU_FREQ_MAX_WORKGROUPS)?;
+        let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let mode_id = compression_mode_id(mode);
+        let head_only_mode = match mode {
+            CompressionMode::Speed => 101,
+            CompressionMode::Balanced => 102,
+            CompressionMode::Ratio => 103,
+        };
+
+        let tokenize_lit_ms = self.profile_tokenize_probe_pass(
+            slot,
+            len_u32,
+            100,
+            tokenize_x,
+            tokenize_y,
+            "cozip-deflate-dyn-probe-tokenize-lit",
+        )?;
+        let tokenize_head_total_ms = self.profile_tokenize_probe_pass(
+            slot,
+            len_u32,
+            head_only_mode,
+            tokenize_x,
+            tokenize_y,
+            "cozip-deflate-dyn-probe-tokenize-head",
+        )?;
+        let tokenize_full_ms = self.profile_tokenize_probe_pass(
+            slot,
+            len_u32,
+            mode_id,
+            tokenize_x,
+            tokenize_y,
+            "cozip-deflate-dyn-probe-tokenize-full",
+        )?;
+        let tokenize_head_only_ms = (tokenize_head_total_ms - tokenize_lit_ms).max(0.0);
+        let tokenize_extend_only_ms = (tokenize_full_ms - tokenize_head_total_ms).max(0.0);
+
+        let params = [
+            len_u32,
+            u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE).map_err(|_| CozipDeflateError::DataTooLarge)?,
+            mode_id,
+            0,
+        ];
+        self.queue
+            .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
+
+        let finalize_start = Instant::now();
+        let mut finalize_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-deflate-dyn-probe-finalize"),
+            });
+        {
+            let mut pass = finalize_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-deflate-dyn-probe-finalize-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.token_finalize_pipeline);
+            pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+            pass.dispatch_workgroups(finalize_x, finalize_y, 1);
+        }
+        self.queue.submit(Some(finalize_encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        let finalize_ms = elapsed_ms(finalize_start);
+
+        let freq_start = Instant::now();
+        let mut freq_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-deflate-dyn-probe-freq"),
+            });
+        freq_encoder.clear_buffer(&slot.litlen_freq_buffer, 0, None);
+        freq_encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
+        {
+            let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-deflate-dyn-probe-freq-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.freq_pipeline);
+            pass.set_bind_group(0, &slot.freq_bg, &[]);
+            pass.dispatch_workgroups(freq_x, freq_y, 1);
+        }
+        self.queue.submit(Some(freq_encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        let freq_ms = elapsed_ms(freq_start);
+
+        eprintln!(
+            "[cozip][timing][gpu-dynamic-probe] call={} mode={:?} chunk_index={} len_mib={:.2} t_tokenize_lit_ms={:.3} t_tokenize_head_total_ms={:.3} t_tokenize_full_ms={:.3} t_tokenize_head_only_ms={:.3} t_tokenize_extend_only_ms={:.3} t_finalize_ms={:.3} t_freq_ms={:.3} t_phase1_ms={:.3}",
+            call_id,
+            mode,
+            chunk_index,
+            len as f64 / (1024.0 * 1024.0),
+            tokenize_lit_ms,
+            tokenize_head_total_ms,
+            tokenize_full_ms,
+            tokenize_head_only_ms,
+            tokenize_extend_only_ms,
+            finalize_ms,
+            freq_ms,
+            tokenize_full_ms + finalize_ms + freq_ms,
+        );
+
+        Ok(())
+    }
+
+    fn profile_tokenize_probe_pass(
+        &self,
+        slot: &DeflateSlot,
+        len_u32: u32,
+        mode_id: u32,
+        dispatch_x: u32,
+        dispatch_y: u32,
+        label: &'static str,
+    ) -> Result<f64, CozipDeflateError> {
+        let params = [
+            len_u32,
+            u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE).map_err(|_| CozipDeflateError::DataTooLarge)?,
+            mode_id,
+            0,
+        ];
+        self.queue
+            .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
+
+        // Warmup pass to reduce one-time effects in deep profiling.
+        let mut warmup_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = warmup_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tokenize_pipeline);
+            pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+        self.queue.submit(Some(warmup_encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let start = Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tokenize_pipeline);
+            pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        Ok(elapsed_ms(start))
+    }
+
     fn run_start_positions(
         &self,
         data: &[u8],
@@ -3292,6 +3643,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
+        let timing_enabled = timing_profile_enabled();
+        let mut timing = GpuFixedTiming {
+            call_id: GPU_TIMING_CALL_SEQ.fetch_add(1, Ordering::Relaxed),
+            mode,
+            groups: 0,
+            chunks: 0,
+            input_bytes: chunks.iter().map(|chunk| chunk.len()).sum(),
+            output_bytes: 0,
+            payload_chunks: 0,
+            fallback_chunks: 0,
+            bits_readback_bytes: 0,
+            payload_readback_bytes: 0,
+            encode_submit_ms: 0.0,
+            bits_readback_ms: 0.0,
+            payload_submit_ms: 0.0,
+            payload_readback_ms: 0.0,
+            cpu_fallback_ms: 0.0,
+        };
 
         let mut results = vec![Vec::new(); chunks.len()];
         let mut slots = lock(&self.deflate_slots)?;
@@ -3310,6 +3679,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         for chunk_group in work_indices.chunks(GPU_PIPELINED_SUBMIT_CHUNKS.max(1)) {
+            timing.groups += 1;
+            timing.chunks += chunk_group.len();
+            let encode_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3420,7 +3796,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             self.queue.submit(Some(encoder.finish()));
+            if let Some(start) = encode_start {
+                timing.encode_submit_ms += elapsed_ms(start);
+            }
 
+            let bits_readback_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let mut bit_receivers = Vec::with_capacity(chunk_group.len());
             for &chunk_index in chunk_group {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -3432,6 +3816,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     });
                 bit_receivers.push((chunk_index, rx));
             }
+            timing.bits_readback_bytes += 4 * bit_receivers.len();
             self.device.poll(wgpu::Maintain::Wait);
 
             let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
@@ -3463,8 +3848,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let copy_size = bytes_len::<u32>(copy_words)?;
                 payload_jobs.push((chunk_index, total_bytes, copy_size));
             }
+            if let Some(start) = bits_readback_start {
+                timing.bits_readback_ms += elapsed_ms(start);
+            }
 
             if !payload_jobs.is_empty() {
+                timing.payload_chunks += payload_jobs.len();
+                timing.payload_readback_bytes += payload_jobs
+                    .iter()
+                    .try_fold(0usize, |acc, (_, _, copy_size)| {
+                        let copy_size = usize::try_from(*copy_size)
+                            .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                        acc.checked_add(copy_size).ok_or(CozipDeflateError::DataTooLarge)
+                    })?;
+                let payload_submit_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut payload_encoder = self
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3481,7 +3882,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     );
                 }
                 self.queue.submit(Some(payload_encoder.finish()));
+                if let Some(start) = payload_submit_start {
+                    timing.payload_submit_ms += elapsed_ms(start);
+                }
 
+                let payload_readback_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
                 for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -3510,14 +3919,55 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     compressed.extend_from_slice(&mapped[..total_bytes]);
                     drop(mapped);
                     slots[chunk_index].readback.unmap();
+                    timing.output_bytes = timing
+                        .output_bytes
+                        .checked_add(total_bytes)
+                        .ok_or(CozipDeflateError::DataTooLarge)?;
                     results[chunk_index] = compressed;
+                }
+                if let Some(start) = payload_readback_start {
+                    timing.payload_readback_ms += elapsed_ms(start);
                 }
             }
 
+            timing.fallback_chunks += cpu_fallback.len();
+            let fallback_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             for chunk_index in cpu_fallback {
                 results[chunk_index] =
                     deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+                timing.output_bytes = timing
+                    .output_bytes
+                    .checked_add(results[chunk_index].len())
+                    .ok_or(CozipDeflateError::DataTooLarge)?;
             }
+            if let Some(start) = fallback_start {
+                timing.cpu_fallback_ms += elapsed_ms(start);
+            }
+        }
+
+        if timing_enabled {
+            eprintln!(
+                "[cozip][timing][gpu-fixed] call={} mode={:?} groups={} chunks={} in_mib={:.2} out_mib={:.2} payload_chunks={} fallback_chunks={} bits_rb_kib={:.1} payload_rb_mib={:.2} t_encode_submit_ms={:.3} t_bits_rb_ms={:.3} t_payload_submit_ms={:.3} t_payload_rb_ms={:.3} t_cpu_fallback_ms={:.3}",
+                timing.call_id,
+                timing.mode,
+                timing.groups,
+                timing.chunks,
+                timing.input_bytes as f64 / (1024.0 * 1024.0),
+                timing.output_bytes as f64 / (1024.0 * 1024.0),
+                timing.payload_chunks,
+                timing.fallback_chunks,
+                timing.bits_readback_bytes as f64 / 1024.0,
+                timing.payload_readback_bytes as f64 / (1024.0 * 1024.0),
+                timing.encode_submit_ms,
+                timing.bits_readback_ms,
+                timing.payload_submit_ms,
+                timing.payload_readback_ms,
+                timing.cpu_fallback_ms,
+            );
         }
 
         Ok(results)
@@ -3532,6 +3982,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
+        let timing_enabled = timing_profile_enabled();
+        let mut timing = GpuDynamicTiming {
+            call_id: GPU_TIMING_CALL_SEQ.fetch_add(1, Ordering::Relaxed),
+            mode,
+            chunks: 0,
+            input_bytes: chunks.iter().map(|chunk| chunk.len()).sum(),
+            output_bytes: 0,
+            payload_chunks: 0,
+            fallback_chunks: 0,
+            bits_readback_bytes: 0,
+            payload_readback_bytes: 0,
+            freq_submit_ms: 0.0,
+            freq_poll_wait_ms: 0.0,
+            freq_recv_ms: 0.0,
+            freq_map_copy_ms: 0.0,
+            freq_plan_ms: 0.0,
+            pack_submit_ms: 0.0,
+            pack_bits_readback_ms: 0.0,
+            payload_submit_ms: 0.0,
+            payload_readback_ms: 0.0,
+            cpu_fallback_ms: 0.0,
+        };
+        let deep_timing_enabled = deep_timing_profile_enabled();
+        let mut deep_probe_done = false;
 
         struct PendingDynFreqReadback {
             chunk_index: usize,
@@ -3578,6 +4052,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 results[chunk_index] = vec![0x03, 0x00];
                 continue;
             }
+            timing.chunks += 1;
 
             let len = data.len();
             let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
@@ -3608,6 +4083,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             ];
             self.queue
                 .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
+
+            if deep_timing_enabled && !deep_probe_done {
+                self.profile_dynamic_phase1_probe(slot, len, mode, chunk_index)?;
+                deep_probe_done = true;
+            }
 
             let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-litlen-freq-rb"),
@@ -3649,7 +4129,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
+                let (dispatch_x, dispatch_y) =
+                    dispatch_grid_for_items_capped(len, 128, GPU_FREQ_MAX_WORKGROUPS)?;
                 let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-freq-pass"),
                     timestamp_writes: None,
@@ -3683,7 +4164,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             freq_submit_chunk_count += 1;
 
             if freq_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+                let freq_submit_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 self.queue.submit(Some(freq_encoder.finish()));
+                if let Some(start) = freq_submit_start {
+                    timing.freq_submit_ms += elapsed_ms(start);
+                }
                 for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
                     staged_freq_readbacks.drain(..)
                 {
@@ -3715,7 +4204,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         if freq_submit_chunk_count > 0 {
+            let freq_submit_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             self.queue.submit(Some(freq_encoder.finish()));
+            if let Some(start) = freq_submit_start {
+                timing.freq_submit_ms += elapsed_ms(start);
+            }
             for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
                 staged_freq_readbacks.drain(..)
             {
@@ -3740,9 +4237,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let mut prepared = Vec::with_capacity(freq_pending.len());
         if !freq_pending.is_empty() {
+            let freq_poll_wait_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             self.device.poll(wgpu::Maintain::Wait);
+            if let Some(start) = freq_poll_wait_start {
+                timing.freq_poll_wait_ms += elapsed_ms(start);
+            }
         }
         for pending in freq_pending {
+            let freq_recv_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             match pending.litlen_receiver.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
@@ -3753,7 +4263,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
                 Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
+            if let Some(start) = freq_recv_start {
+                timing.freq_recv_ms += elapsed_ms(start);
+            }
 
+            let freq_map_copy_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
             let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
             let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
@@ -3766,13 +4284,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             drop(dist_freq_map);
             pending.litlen_freq_readback.unmap();
             pending.dist_freq_readback.unmap();
+            if let Some(start) = freq_map_copy_start {
+                timing.freq_map_copy_ms += elapsed_ms(start);
+            }
 
+            let freq_plan_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
             let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
             dyn_table.extend_from_slice(&plan.litlen_codes);
             dyn_table.extend_from_slice(&plan.litlen_bits);
             dyn_table.extend_from_slice(&plan.dist_codes);
             dyn_table.extend_from_slice(&plan.dist_bits);
+            if let Some(start) = freq_plan_start {
+                timing.freq_plan_ms += elapsed_ms(start);
+            }
 
             let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
                 .map_err(|_| CozipDeflateError::DataTooLarge)?;
@@ -3907,7 +4436,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             pack_submit_chunk_count += 1;
 
             if pack_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+                let pack_submit_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 self.queue.submit(Some(pack_encoder.finish()));
+                if let Some(start) = pack_submit_start {
+                    timing.pack_submit_ms += elapsed_ms(start);
+                }
                 for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
                     let (tx, rx) = std::sync::mpsc::channel();
                     slots[pending_slot_index]
@@ -3933,7 +4470,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         if pack_submit_chunk_count > 0 {
+            let pack_submit_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             self.queue.submit(Some(pack_encoder.finish()));
+            if let Some(start) = pack_submit_start {
+                timing.pack_submit_ms += elapsed_ms(start);
+            }
             for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
                 let (tx, rx) = std::sync::mpsc::channel();
                 slots[pending_slot_index]
@@ -3952,9 +4497,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
         let mut cpu_fallback = Vec::new();
+        let pack_bits_readback_start = if timing_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         if !pack_pending.is_empty() {
             self.device.poll(wgpu::Maintain::Wait);
         }
+        timing.bits_readback_bytes += 4 * pack_pending.len();
         for pending in pack_pending {
             match pending.receiver.recv() {
                 Ok(Ok(())) => {}
@@ -3979,8 +4530,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let copy_size = bytes_len::<u32>(copy_words)?;
             payload_jobs.push((pending.chunk_index, total_bytes, copy_size));
         }
+        if let Some(start) = pack_bits_readback_start {
+            timing.pack_bits_readback_ms += elapsed_ms(start);
+        }
 
         if !payload_jobs.is_empty() {
+            timing.payload_chunks += payload_jobs.len();
+            timing.payload_readback_bytes += payload_jobs
+                .iter()
+                .try_fold(0usize, |acc, (_, _, copy_size)| {
+                    let copy_size = usize::try_from(*copy_size)
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                    acc.checked_add(copy_size).ok_or(CozipDeflateError::DataTooLarge)
+                })?;
+            let payload_submit_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let mut payload_encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3997,7 +4564,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 );
             }
             self.queue.submit(Some(payload_encoder.finish()));
+            if let Some(start) = payload_submit_start {
+                timing.payload_submit_ms += elapsed_ms(start);
+            }
 
+            let payload_readback_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
             for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -4024,12 +4599,57 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 compressed.extend_from_slice(&mapped[..total_bytes]);
                 drop(mapped);
                 slots[chunk_index].readback.unmap();
+                timing.output_bytes = timing
+                    .output_bytes
+                    .checked_add(total_bytes)
+                    .ok_or(CozipDeflateError::DataTooLarge)?;
                 results[chunk_index] = compressed;
+            }
+            if let Some(start) = payload_readback_start {
+                timing.payload_readback_ms += elapsed_ms(start);
             }
         }
 
+        timing.fallback_chunks += cpu_fallback.len();
+        let cpu_fallback_start = if timing_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for chunk_index in cpu_fallback {
             results[chunk_index] = deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+            timing.output_bytes = timing
+                .output_bytes
+                .checked_add(results[chunk_index].len())
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+        }
+        if let Some(start) = cpu_fallback_start {
+            timing.cpu_fallback_ms += elapsed_ms(start);
+        }
+
+        if timing_enabled {
+            eprintln!(
+                "[cozip][timing][gpu-dynamic] call={} mode={:?} chunks={} in_mib={:.2} out_mib={:.2} payload_chunks={} fallback_chunks={} bits_rb_kib={:.1} payload_rb_mib={:.2} t_freq_submit_ms={:.3} t_freq_poll_wait_ms={:.3} t_freq_recv_ms={:.3} t_freq_map_copy_ms={:.3} t_freq_plan_ms={:.3} t_pack_submit_ms={:.3} t_pack_bits_rb_ms={:.3} t_payload_submit_ms={:.3} t_payload_rb_ms={:.3} t_cpu_fallback_ms={:.3}",
+                timing.call_id,
+                timing.mode,
+                timing.chunks,
+                timing.input_bytes as f64 / (1024.0 * 1024.0),
+                timing.output_bytes as f64 / (1024.0 * 1024.0),
+                timing.payload_chunks,
+                timing.fallback_chunks,
+                timing.bits_readback_bytes as f64 / 1024.0,
+                timing.payload_readback_bytes as f64 / (1024.0 * 1024.0),
+                timing.freq_submit_ms,
+                timing.freq_poll_wait_ms,
+                timing.freq_recv_ms,
+                timing.freq_map_copy_ms,
+                timing.freq_plan_ms,
+                timing.pack_submit_ms,
+                timing.pack_bits_readback_ms,
+                timing.payload_submit_ms,
+                timing.payload_readback_ms,
+                timing.cpu_fallback_ms,
+            );
         }
 
         Ok(results)
@@ -4063,6 +4683,16 @@ fn dispatch_grid_for_items(
 ) -> Result<(u32, u32), CozipDeflateError> {
     let groups = workgroup_count(items, group_size)?;
     Ok(dispatch_grid_for_groups(groups))
+}
+
+fn dispatch_grid_for_items_capped(
+    items: usize,
+    group_size: usize,
+    max_groups: u32,
+) -> Result<(u32, u32), CozipDeflateError> {
+    let groups = workgroup_count(items, group_size)?;
+    let capped = groups.min(max_groups.max(1));
+    Ok(dispatch_grid_for_groups(capped))
 }
 
 fn bytes_len<T>(items: usize) -> Result<u64, CozipDeflateError> {
@@ -4469,6 +5099,12 @@ fn compress_hybrid_adaptive_scheduler(
     options: &HybridOptions,
     gpu: Arc<GpuAssist>,
 ) -> Result<CompressedFrame, CozipDeflateError> {
+    let timing_enabled = timing_profile_enabled();
+    let scheduler_start = if timing_enabled {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let chunk_count = tasks.len();
     let start = Arc::new(Instant::now());
     let now_ms = monotonic_ms(&start);
@@ -4568,6 +5204,21 @@ fn compress_hybrid_adaptive_scheduler(
 
     let stats = summarize_encoded_chunks(&chunks, true);
     let frame = encode_frame(original_len, &chunks)?;
+
+    if let Some(start) = scheduler_start {
+        eprintln!(
+            "[cozip][timing][scheduler] mode={:?} chunk_size_kib={} gpu_fraction={:.2} chunks={} cpu_chunks={} gpu_chunks={} in_mib={:.2} out_mib={:.2} elapsed_ms={:.3}",
+            options.compression_mode,
+            options.chunk_size / 1024,
+            options.gpu_fraction,
+            stats.chunk_count,
+            stats.cpu_chunks,
+            stats.gpu_chunks,
+            original_len as f64 / (1024.0 * 1024.0),
+            frame.len() as f64 / (1024.0 * 1024.0),
+            elapsed_ms(start),
+        );
+    }
 
     Ok(CompressedFrame { bytes: frame, stats })
 }
