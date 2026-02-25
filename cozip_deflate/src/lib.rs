@@ -46,7 +46,7 @@ const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
-const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 20;
+const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
 const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
 const GPU_RESERVATION_TIMEOUT_MS: u64 = 3;
 const SCHEDULER_WAIT_MS: u64 = 1;
@@ -3284,158 +3284,45 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         &self,
         chunks: &[&[u8]],
         mode: CompressionMode,
+        compression_level: u32,
     ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
         if mode == CompressionMode::Ratio {
-            return self.deflate_dynamic_hybrid_batch(chunks, mode);
+            return self.deflate_dynamic_hybrid_batch(chunks, mode, compression_level);
         }
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
 
-        struct PendingDeflateReadback {
-            chunk_index: usize,
-            slot_index: usize,
-            output_storage_size: u64,
-            receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-        }
-
         let mut results = vec![Vec::new(); chunks.len()];
-        let mut pending = VecDeque::with_capacity(chunks.len());
-        let mut free_slots = VecDeque::new();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cozip-deflate-batch-encoder"),
-            });
-        let mut staged_after_submit: Vec<(usize, usize, u64)> = Vec::new();
-        let mut submit_chunk_count = 0usize;
         let mut slots = lock(&self.deflate_slots)?;
-
-        for slot_index in 0..slots.len() {
-            free_slots.push_back(slot_index);
-        }
-
+        let mut work_indices = Vec::with_capacity(chunks.len());
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
                 results[chunk_index] = vec![0x03, 0x00];
                 continue;
             }
-
-            let len = data.len();
-            let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
-            let slot_index = loop {
-                if let Some(index) = free_slots.pop_front() {
-                    break index;
-                }
-
-                if slots.len() < GPU_DEFLATE_SLOT_POOL {
-                    slots.push(self.create_deflate_slot(len)?);
-                    break slots.len() - 1;
-                }
-
-                if submit_chunk_count > 0 {
-                    self.queue.submit(Some(encoder.finish()));
-                    for (pending_chunk_index, slot_index, output_storage_size) in
-                        staged_after_submit.drain(..)
-                    {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        slots[slot_index]
-                            .readback
-                            .slice(..)
-                            .map_async(wgpu::MapMode::Read, move |result| {
-                                let _ = tx.send(result);
-                            });
-                        pending.push_back(PendingDeflateReadback {
-                            chunk_index: pending_chunk_index,
-                            slot_index,
-                            output_storage_size,
-                            receiver: rx,
-                        });
-                    }
-                    self.device.poll(wgpu::Maintain::Poll);
-                    encoder = self
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("cozip-deflate-batch-encoder"),
-                        });
-                    submit_chunk_count = 0;
-                }
-
-                if pending.is_empty() {
-                    return Err(CozipDeflateError::Internal(
-                        "gpu deflate slot pool exhausted without pending work",
-                    ));
-                }
-
-                self.device.poll(wgpu::Maintain::Wait);
-                let mut collected_any = false;
-                loop {
-                    let recv_result = match pending.front() {
-                        Some(item) => match item.receiver.try_recv() {
-                            Ok(result) => Some(result),
-                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                return Err(CozipDeflateError::GpuExecution(
-                                    "gpu readback channel disconnected".to_string(),
-                                ))
-                            }
-                        },
-                        None => None,
-                    };
-                    let Some(recv_result) = recv_result else {
-                        break;
-                    };
-                    let item = pending
-                        .pop_front()
-                        .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
-                    match recv_result {
-                        Ok(()) => {}
-                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                    }
-                    results[item.chunk_index] = collect_deflate_readback(
-                        &slots[item.slot_index],
-                        item.output_storage_size,
-                    )?;
-                    free_slots.push_back(item.slot_index);
-                    collected_any = true;
-                }
-
-                if !collected_any {
-                    let item = pending
-                        .pop_front()
-                        .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
-                    match item.receiver.recv() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                    }
-                    results[item.chunk_index] = collect_deflate_readback(
-                        &slots[item.slot_index],
-                        item.output_storage_size,
-                    )?;
-                    free_slots.push_back(item.slot_index);
-                }
-
-                if let Some(index) = free_slots.pop_front() {
-                    break index;
-                }
-            };
-
-            if slots[slot_index].len_capacity < len {
-                slots[slot_index] = self.create_deflate_slot(len)?;
+            work_indices.push(chunk_index);
+            if slots.len() <= chunk_index {
+                slots.push(self.create_deflate_slot(data.len())?);
+            } else if slots[chunk_index].len_capacity < data.len() {
+                slots[chunk_index] = self.create_deflate_slot(data.len())?;
             }
+        }
 
-            let input_words = len.div_ceil(std::mem::size_of::<u32>());
-            let params = [
-                len_u32,
-                u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
-                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                compression_mode_id(mode),
-                3,
-            ];
-            let output_storage_size = slots[slot_index].output_storage_size;
-            {
-                let slot = &mut slots[slot_index];
+        for chunk_group in work_indices.chunks(GPU_PIPELINED_SUBMIT_CHUNKS.max(1)) {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-deflate-batch-encoder"),
+                });
+
+            for &chunk_index in chunk_group {
+                let data = chunks[chunk_index];
+                let len = data.len();
+                let len_u32 = u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+                let slot = &mut slots[chunk_index];
+                let input_words = len.div_ceil(std::mem::size_of::<u32>());
+
                 if data.len() % std::mem::size_of::<u32>() == 0 {
                     self.queue.write_buffer(&slot.input_buffer, 0, data);
                 } else {
@@ -3443,6 +3330,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     padded[..data.len()].copy_from_slice(data);
                     self.queue.write_buffer(&slot.input_buffer, 0, &padded);
                 }
+                let params = [
+                    len_u32,
+                    u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                    compression_mode_id(mode),
+                    3,
+                ];
                 self.queue
                     .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
@@ -3523,113 +3417,107 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
 
                 encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
-                encoder.copy_buffer_to_buffer(
-                    &slot.output_words_buffer,
-                    0,
-                    &slot.readback,
-                    4,
-                    slot.output_storage_size,
-                );
             }
 
-            staged_after_submit.push((chunk_index, slot_index, output_storage_size));
-            submit_chunk_count += 1;
-
-            if submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
-                self.queue.submit(Some(encoder.finish()));
-                for (pending_chunk_index, slot_index, output_storage_size) in
-                    staged_after_submit.drain(..)
-                {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    slots[slot_index]
-                        .readback
-                        .slice(..)
-                        .map_async(wgpu::MapMode::Read, move |result| {
-                            let _ = tx.send(result);
-                        });
-                    pending.push_back(PendingDeflateReadback {
-                        chunk_index: pending_chunk_index,
-                        slot_index,
-                        output_storage_size,
-                        receiver: rx,
-                    });
-                }
-
-                self.device.poll(wgpu::Maintain::Poll);
-
-                loop {
-                    let recv_result = match pending.front() {
-                        Some(item) => match item.receiver.try_recv() {
-                            Ok(result) => Some(result),
-                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                return Err(CozipDeflateError::GpuExecution(
-                                    "gpu readback channel disconnected".to_string(),
-                                ))
-                            }
-                        },
-                        None => None,
-                    };
-                    let Some(recv_result) = recv_result else {
-                        break;
-                    };
-                    let item = pending
-                        .pop_front()
-                        .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
-                    match recv_result {
-                        Ok(()) => {}
-                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                    }
-                    results[item.chunk_index] = collect_deflate_readback(
-                        &slots[item.slot_index],
-                        item.output_storage_size,
-                    )?;
-                    free_slots.push_back(item.slot_index);
-                }
-
-                encoder = self
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("cozip-deflate-batch-encoder"),
-                    });
-                submit_chunk_count = 0;
-            }
-        }
-
-        if submit_chunk_count > 0 {
             self.queue.submit(Some(encoder.finish()));
-            for (pending_chunk_index, slot_index, output_storage_size) in staged_after_submit.drain(..)
-            {
+
+            let mut bit_receivers = Vec::with_capacity(chunk_group.len());
+            for &chunk_index in chunk_group {
                 let (tx, rx) = std::sync::mpsc::channel();
-                slots[slot_index]
+                slots[chunk_index]
                     .readback
-                    .slice(..)
+                    .slice(0..4)
                     .map_async(wgpu::MapMode::Read, move |result| {
                         let _ = tx.send(result);
                     });
-                pending.push_back(PendingDeflateReadback {
-                    chunk_index: pending_chunk_index,
-                    slot_index,
-                    output_storage_size,
-                    receiver: rx,
-                });
+                bit_receivers.push((chunk_index, rx));
             }
-        }
+            self.device.poll(wgpu::Maintain::Wait);
 
-        if pending.is_empty() {
-            return Ok(results);
-        }
+            let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
+            let mut cpu_fallback = Vec::new();
+            for (chunk_index, rx) in bit_receivers {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                }
+                let mapped = slots[chunk_index].readback.slice(0..4).get_mapped_range();
+                let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
+                let literal_bits = total_words.first().copied().unwrap_or(0) as usize;
+                let total_bits = literal_bits
+                    .checked_add(10)
+                    .ok_or(CozipDeflateError::DataTooLarge)?;
+                let total_bytes = total_bits.div_ceil(8);
+                drop(mapped);
+                slots[chunk_index].readback.unmap();
 
-        self.device.poll(wgpu::Maintain::Wait);
-        while let Some(item) = pending.pop_front() {
-            match item.receiver.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                let output_storage_size = usize::try_from(slots[chunk_index].output_storage_size)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                if total_bytes > output_storage_size {
+                    cpu_fallback.push(chunk_index);
+                    continue;
+                }
+
+                let copy_words = total_bytes.div_ceil(std::mem::size_of::<u32>());
+                let copy_size = bytes_len::<u32>(copy_words)?;
+                payload_jobs.push((chunk_index, total_bytes, copy_size));
             }
-            results[item.chunk_index] =
-                collect_deflate_readback(&slots[item.slot_index], item.output_storage_size)?;
-            free_slots.push_back(item.slot_index);
+
+            if !payload_jobs.is_empty() {
+                let mut payload_encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("cozip-deflate-payload-readback-encoder"),
+                    });
+                for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                    let slot = &slots[*chunk_index];
+                    payload_encoder.copy_buffer_to_buffer(
+                        &slot.output_words_buffer,
+                        0,
+                        &slot.readback,
+                        0,
+                        *copy_size,
+                    );
+                }
+                self.queue.submit(Some(payload_encoder.finish()));
+
+                let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
+                for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slots[*chunk_index]
+                        .readback
+                        .slice(0..*copy_size)
+                        .map_async(wgpu::MapMode::Read, move |result| {
+                            let _ = tx.send(result);
+                        });
+                    payload_receivers.push(rx);
+                }
+                self.device.poll(wgpu::Maintain::Wait);
+
+                for ((chunk_index, total_bytes, copy_size), rx) in
+                    payload_jobs.into_iter().zip(payload_receivers.into_iter())
+                {
+                    match rx.recv() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            return Err(CozipDeflateError::GpuExecution(err.to_string()));
+                        }
+                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    }
+                    let mapped = slots[chunk_index].readback.slice(0..copy_size).get_mapped_range();
+                    let mut compressed = Vec::with_capacity(total_bytes);
+                    compressed.extend_from_slice(&mapped[..total_bytes]);
+                    drop(mapped);
+                    slots[chunk_index].readback.unmap();
+                    results[chunk_index] = compressed;
+                }
+            }
+
+            for chunk_index in cpu_fallback {
+                results[chunk_index] =
+                    deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+            }
         }
 
         Ok(results)
@@ -3639,6 +3527,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         &self,
         chunks: &[&[u8]],
         mode: CompressionMode,
+        compression_level: u32,
     ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
         if chunks.is_empty() {
             return Ok(Vec::new());
@@ -3664,10 +3553,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             eob_bits: u8,
         }
 
-        struct PendingDynPackReadback {
+        struct PendingDynPackBitsReadback {
             chunk_index: usize,
             slot_index: usize,
-            output_storage_size: u64,
             receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
         }
 
@@ -3900,8 +3788,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             });
         }
 
-        let mut pack_pending: Vec<PendingDynPackReadback> = Vec::with_capacity(prepared.len());
-        let mut staged_pack: Vec<(usize, usize, u64)> = Vec::new();
+        let mut pack_pending: Vec<PendingDynPackBitsReadback> = Vec::with_capacity(prepared.len());
+        let mut staged_pack: Vec<(usize, usize)> = Vec::new();
         let mut pack_submit_chunk_count = 0usize;
         let mut pack_encoder = self
             .device
@@ -4014,33 +3902,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             pack_encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
-            pack_encoder.copy_buffer_to_buffer(
-                &slot.output_words_buffer,
-                0,
-                &slot.readback,
-                4,
-                slot.output_storage_size,
-            );
 
-            staged_pack.push((item.chunk_index, item.slot_index, slot.output_storage_size));
+            staged_pack.push((item.chunk_index, item.slot_index));
             pack_submit_chunk_count += 1;
 
             if pack_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
                 self.queue.submit(Some(pack_encoder.finish()));
-                for (pending_chunk_index, pending_slot_index, output_storage_size) in
-                    staged_pack.drain(..)
-                {
+                for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
                     let (tx, rx) = std::sync::mpsc::channel();
                     slots[pending_slot_index]
                         .readback
-                        .slice(..)
+                        .slice(0..4)
                         .map_async(wgpu::MapMode::Read, move |result| {
                             let _ = tx.send(result);
                         });
-                    pack_pending.push(PendingDynPackReadback {
+                    pack_pending.push(PendingDynPackBitsReadback {
                         chunk_index: pending_chunk_index,
                         slot_index: pending_slot_index,
-                        output_storage_size,
                         receiver: rx,
                     });
                 }
@@ -4056,25 +3934,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         if pack_submit_chunk_count > 0 {
             self.queue.submit(Some(pack_encoder.finish()));
-            for (pending_chunk_index, pending_slot_index, output_storage_size) in
-                staged_pack.drain(..)
-            {
+            for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
                 let (tx, rx) = std::sync::mpsc::channel();
                 slots[pending_slot_index]
                     .readback
-                    .slice(..)
+                    .slice(0..4)
                     .map_async(wgpu::MapMode::Read, move |result| {
                         let _ = tx.send(result);
                     });
-                pack_pending.push(PendingDynPackReadback {
+                pack_pending.push(PendingDynPackBitsReadback {
                     chunk_index: pending_chunk_index,
                     slot_index: pending_slot_index,
-                    output_storage_size,
                     receiver: rx,
                 });
             }
         }
 
+        let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
+        let mut cpu_fallback = Vec::new();
         if !pack_pending.is_empty() {
             self.device.poll(wgpu::Maintain::Wait);
         }
@@ -4084,10 +3961,75 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
                 Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
-            results[pending.chunk_index] = collect_deflate_readback_dynamic(
-                &slots[pending.slot_index],
-                pending.output_storage_size,
-            )?;
+            let mapped = slots[pending.slot_index].readback.slice(0..4).get_mapped_range();
+            let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
+            let total_bits = total_words.first().copied().unwrap_or(0) as usize;
+            let total_bytes = total_bits.div_ceil(8);
+            drop(mapped);
+            slots[pending.slot_index].readback.unmap();
+
+            let output_storage_size = usize::try_from(slots[pending.slot_index].output_storage_size)
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            if total_bytes > output_storage_size {
+                cpu_fallback.push(pending.chunk_index);
+                continue;
+            }
+
+            let copy_words = total_bytes.div_ceil(std::mem::size_of::<u32>());
+            let copy_size = bytes_len::<u32>(copy_words)?;
+            payload_jobs.push((pending.chunk_index, total_bytes, copy_size));
+        }
+
+        if !payload_jobs.is_empty() {
+            let mut payload_encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-deflate-dynamic-payload-readback-encoder"),
+                });
+            for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                let slot = &slots[*chunk_index];
+                payload_encoder.copy_buffer_to_buffer(
+                    &slot.output_words_buffer,
+                    0,
+                    &slot.readback,
+                    0,
+                    *copy_size,
+                );
+            }
+            self.queue.submit(Some(payload_encoder.finish()));
+
+            let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
+            for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                let (tx, rx) = std::sync::mpsc::channel();
+                slots[*chunk_index]
+                    .readback
+                    .slice(0..*copy_size)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = tx.send(result);
+                    });
+                payload_receivers.push(rx);
+            }
+            self.device.poll(wgpu::Maintain::Wait);
+
+            for ((chunk_index, total_bytes, copy_size), rx) in
+                payload_jobs.into_iter().zip(payload_receivers.into_iter())
+            {
+                match rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                }
+                let mapped = slots[chunk_index].readback.slice(0..copy_size).get_mapped_range();
+                let mut compressed = Vec::with_capacity(total_bytes);
+                compressed.extend_from_slice(&mapped[..total_bytes]);
+                drop(mapped);
+                slots[chunk_index].readback.unmap();
+                results[chunk_index] = compressed;
+            }
+        }
+
+        for chunk_index in cpu_fallback {
+            results[chunk_index] = deflate_compress_cpu(chunks[chunk_index], compression_level)?;
         }
 
         Ok(results)
@@ -4707,7 +4649,11 @@ fn compress_gpu_worker_adaptive(
         }
 
         let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
-        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options.compression_mode);
+        let compressed_batch = gpu.deflate_fixed_literals_batch(
+            &task_data,
+            options.compression_mode,
+            options.compression_level,
+        );
 
         match compressed_batch {
             Ok(compressed_items) if compressed_items.len() == batch.len() => {
@@ -5159,7 +5105,11 @@ fn compress_chunk_gpu_batch(
     }
 
     let task_data: Vec<&[u8]> = tasks.iter().map(|task| task.raw.as_slice()).collect();
-    let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options.compression_mode)?;
+    let compressed_batch = gpu.deflate_fixed_literals_batch(
+        &task_data,
+        options.compression_mode,
+        options.compression_level,
+    )?;
 
     if compressed_batch.len() != tasks.len() {
         return Err(CozipDeflateError::Internal(
