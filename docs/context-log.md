@@ -1492,3 +1492,317 @@ mode別GPU品質パラメータ:
 確認:
 - `cargo check -p cozip_deflate` 通過。
 - `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - gpu-dynamic ログ深掘り用の追加計測
+
+目的:
+- `t_freq_poll_wait_ms` の支配要因を「待機の種類」まで分解して、次の in-flight 深掘り設計の根拠を作る。
+
+追加した計測（`[cozip][timing][gpu-dynamic]`）:
+- in-flight 深さ:
+  - `pending_avg_chunks`
+  - `pending_max_chunks`
+- submit→collect 遅延:
+  - `submit_collect_avg_ms`
+  - `submit_collect_max_ms`
+- recv 待機内訳:
+  - `recv_immediate`
+  - `recv_blocked`
+  - `recv_blocked_ms`
+
+実装メモ:
+- `PendingDynFreqReadback` に `submitted_at` を保持。
+- collect 時に `submitted_at` から遅延を集計。
+- map_async の待機は `try_recv` で即時/待機を判別して集計。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - 3. submit/collect重畳の強化（freq Waitバリア縮小）
+
+目的:
+- `t_freq_poll_wait_ms` の支配を弱めるため、freq 段の collect を非ブロッキング化し、submit中の `Maintain::Wait` を避ける。
+
+実装:
+- `PendingDynFreqReadback` に `litlen_ready/dist_ready` を追加。
+- freq collect を「front要素の `try_recv` で ready 判定し、ready のみ回収」へ変更。
+- submitループ中:
+  - `device.poll(Maintain::Poll)` 後に ready 分だけ collect。
+  - これまでの「2wave到達時に `Maintain::Wait`」を撤去。
+- 最終flush:
+  - まず `Poll` で ready 回収。
+  - 進捗がない場合のみ `Maintain::Wait` を実施して残件を回収（最小限バリア）。
+
+意図:
+- `Wait` を submitパスから退避し、GPU完了待ちをより後段/必要時に限定して重畳性を高める。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - 追加ログの分離（timing_detail）
+
+目的:
+- 追加した詳細計測（pending/submit-collect/recv内訳）を通常ログから分離し、通常運用時の影響を最小化する。
+
+実装:
+- 新規環境変数:
+  - `COZIP_PROFILE_TIMING_DETAIL=1` のときだけ詳細計測を有効化。
+- `COZIP_PROFILE_TIMING=1` のみ:
+  - 旧来の軽量 `gpu-dynamic` ログ形式を出力（詳細フィールドなし）。
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_TIMING_DETAIL=1`:
+  - 詳細フィールド付き `gpu-dynamic` ログを出力。
+- 詳細計測向けの時刻記録（`submitted_at`）や pending 統計更新は detail 有効時のみ実行。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - scheduler常時ログ拡張 + mode別予約タイムアウト
+
+目的:
+- 圧縮ぶれ原因の切り分け用に、暗黙フォールバック/デモートを scheduler ログで常時可視化する。
+- `GPU_RESERVATION_TIMEOUT_MS=3` 固定をやめ、modeごとに適切化する。
+
+実装:
+- scheduler ログに以下を常時追加:
+  - `demoted_reserved_gpu`
+  - `validation_fallback_chunks`
+- GPU検証フォールバック発生時（ratio/balancedの roundtrip mismatch）に `validation_fallback_chunks` を加算。
+- watchdog の予約解除タイムアウトを mode 別へ変更:
+  - `Speed`: `3ms`
+  - `Balanced`: `12ms`
+  - `Ratio`: `32ms`
+- 変更点:
+  - `gpu_reservation_timeout_ms(mode)` 追加
+  - `compress_scheduler_watchdog` に `HybridOptions` と demoteカウンタを渡す
+  - `compress_gpu_worker_adaptive` に validation fallback カウンタを渡す
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - 1.2 実装（Ratioデモート抑制）
+
+目的:
+- `demoted_reserved_gpu` が過剰に増えることで圧縮速度が不安定になる問題を抑制。
+
+実装:
+- `Ratio` の予約タイムアウトを `32ms -> 256ms` に引き上げ。
+- watchdog の `Ratio` デモートを「GPU進捗停滞時のみ」に制限:
+  - `gpu_last_progress_ms` を shared で保持。
+  - GPU worker が batch 処理完了時に進捗時刻を更新。
+  - watchdog は `now - last_progress >= 512ms` のときだけ `ReservedGpu -> Pending` を許可。
+
+期待:
+- `demoted_reserved_gpu` の常時大量発生を抑え、run間の圧縮速度ぶれを低減。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。
+
+## 2026-02-25 - GPU渋滞時デモートの実効化（DemotedCpu state）
+
+目的:
+- `ReservedGpu -> Pending` へ落としたタスクをGPU workerが再取得してしまい、
+  CPUデモートが効かない競合を解消する。
+
+実装:
+- `CompressTaskState::DemotedCpu` を追加。
+- watchdog のデモート遷移を `ReservedGpu -> DemotedCpu` に変更。
+- CPU worker の claim 優先順で `DemotedCpu` を最優先取得。
+- GPU worker は `DemotedCpu` を取得しないため、GPU渋滞時にCPUへ確実に逃がせる。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - Ratioスケジューラ安定化（GPU予約バックログ上限）
+
+背景:
+- 同一コードでも run により `cpu_chunks` が 34 まで落ち、`gpu_chunks` が 990 へ偏る外れ値が発生。
+- その際 `demoted_reserved_gpu` も小さく、GPU待ち渋滞（`t_freq_poll_wait_ms` 優勢）へ再突入していた。
+
+実装:
+- Ratio モード限定で、`ReservedGpu` の予約バックログ上限を導入。
+  - `GPU_RATIO_RESERVED_TARGET_CHUNKS = GPU_BATCH_CHUNKS * 16` (256)
+  - `GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS = GPU_BATCH_CHUNKS * 4` (64)
+- watchdog の demote 予算を以下で決定:
+  - 既存の `idle_cpu` ベース予算
+  - 予約過多（`ReservedGpu > target`）時は、CPUの空きに依存せず `min(excess, step)` を追加予算として強制demote
+- これにより GPU 予約の抱え込みを抑え、CPU へ継続的に仕事を供給する。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - Ratio demote条件の修正（過剰CPU偏りの是正）
+
+背景:
+- 直前修正後に `cpu_chunks~860 / gpu_chunks~160` へ偏り、圧縮が大幅悪化。
+- 原因は、Ratioでも idle CPU ベースdemote が常時動き、予約超過解消後も継続して GPU 予約を削っていたこと。
+
+実装:
+- watchdog の demote_budget 計算を修正。
+- `Ratio` では「予約超過 (`ReservedGpu > target`) のときのみ」demote。
+  - 予算: `min(backlog_excess, GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS)`
+- `Speed/Balanced` は従来どおり `idle_cpu` ベースdemote。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - scheduler実効スループット計測の追加
+
+目的:
+- `cpu_chunks/gpu_chunks` が妥当でも圧縮速度が落ちる原因を、CPU/GPU実効処理速度で切り分ける。
+
+実装:
+- `SchedulerPerfCounters` を追加し、adaptive scheduler 内で以下を集計:
+  - CPU: `cpu_work_chunks`, `cpu_work_bytes`, `cpu_work_ns`
+  - GPU: `gpu_batches`, `gpu_work_chunks`, `gpu_work_bytes`, `gpu_work_ns`
+- CPU worker: 各チャンク圧縮の実測時間を `cpu_work_ns` に加算。
+- GPU worker: 各バッチ `deflate_fixed_literals_batch` の実測時間を `gpu_work_ns` に加算。
+- scheduler timingログに以下を追加:
+  - `cpu_work_chunks`, `gpu_work_chunks`, `gpu_batches`
+  - `cpu_work_mib_s`, `gpu_work_mib_s`
+
+期待:
+- 遅い回で「GPUがCPUより遅い」のか「CPU側が並列効率を失っている」のかを明確化できる。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - GPUコンテキスト初期化時間ログの追加
+
+目的:
+- 1プロセス1回実行での `CPU+GPU` 圧縮遅延が、scheduler外のGPU初期化由来かを定量確認する。
+
+実装:
+- `shared_gpu_context()` で初回 `GpuAssist::new()` の経過時間を計測し、
+  `COZIP_PROFILE_TIMING=1` 時に以下を出力:
+  - `[cozip][timing] gpu_context_init_ms=... gpu_available=...`
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - 初期化コスト削減（未使用run-start GPUパス削除）
+
+背景:
+- `gpu_context_init_ms=2680ms` が単発実行の圧縮性能を大きく悪化させていた。
+- `run_start_positions*` 系の match/count/prefix/emit パイプラインは現行ベンチ/圧縮経路で未使用。
+
+実装:
+- `GpuAssist` から未使用フィールドを削除:
+  - `match_*`, `count_*`, `prefix_*`, `emit_*`
+- `GpuAssist::new_async()` で上記4系統の BGL/Shader/Pipeline 作成を削除。
+- `run_start_positions()` / `run_start_positions_batch()` を削除。
+- 既存の deflate 経路で必要な `scan_blocks/scan_add` は維持。
+
+狙い:
+- 初回 `shared_gpu_context()` の初期化時間 (`gpu_context_init_ms`) を直接短縮。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - GPU初期化をGPU workerへ遅延移譲（同期初期化の除去）
+
+目的:
+- `compress_hybrid()` 呼び出しスレッドでの同期 `shared_gpu_context()` を避け、
+  scheduler 起動後に GPU worker 側で初期化することで初回 `gpu_context_init_ms` をCPU処理と重畳する。
+
+実装:
+- `compress_hybrid()` から同期GPU初期化を削除。
+  - `gpu_requested = prefer_gpu && gpu_fraction > 0` で判定し、
+    GPU対象チャンクがある場合はそのまま adaptive scheduler を起動。
+- adaptive scheduler に `gpu_init_state` (`INITIALIZING/READY/UNAVAILABLE`) を追加。
+- GPU worker を `compress_gpu_worker_adaptive_lazy_init` に変更。
+  - スレッド内で `shared_gpu_context()` を実行して初期化。
+  - 初期化成功時: `gpu_init_state=READY` で従来GPU処理へ移行。
+  - 初期化失敗時: `gpu_init_state=UNAVAILABLE` としてCPU側に委譲。
+- watchdog を `gpu_init_state` aware に変更。
+  - `UNAVAILABLE` では ReservedGpu を即時 `DemotedCpu` へ落とす。
+  - `READY/INITIALIZING` では既存のmode別デモート方針（timeout/backlog）を適用。
+
+意図:
+- 初回起動時に「scheduler開始 -> CPU先行処理 -> GPU初期化完了後にGPU投入」という流れを作り、
+  2.6s級の初期化コストを体感時間に重畳しやすくする。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - scheduler詳細時系列ログの追加（切り分け用）
+
+目的:
+- 「本当にGPU初期化がGPU worker側へ逃げているか」「CPU先行処理が走っているか」を時系列で検証する。
+
+実装:
+- `COZIP_PROFILE_TIMING_DETAIL=1` かつ `COZIP_PROFILE_TIMING=1` のときのみ、
+  `scheduler-detail` ログを出力:
+  - `start` (scheduler起動)
+  - `cpu_first_task` (CPU worker初回着手)
+  - `gpu_init_start` / `gpu_init_ready` / `gpu_init_unavailable`
+  - `gpu_first_batch` (GPU初回バッチ着手)
+  - `demote_during_init` (初期化中にReservedをCPUへ落とした最初のイベント)
+- すべて1回だけ出力（`mark_once`）にしてオーバーヘッドを抑制。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - Ratio初期予約数の上限化（初期デモート嵐の抑制）
+
+背景:
+- `COZIP_PROFILE_TIMING_DETAIL=1` で、
+  - `gpu_init_start` と同時に `demote_during_init`
+  - `gpu_init_ready` が約2.7s後
+  - `demoted_reserved_gpu` が 768
+  を確認。`gpu_fraction=1.0` で初期状態がほぼ全件 `ReservedGpu` となり、
+  初期化待ち中に大量デモートする無駄が発生していた。
+
+実装:
+- adaptive scheduler の初期state付与を変更。
+- `Ratio` では初期 `ReservedGpu` を `GPU_RATIO_RESERVED_TARGET_CHUNKS` (256) に制限し、
+  それ以外は最初から `Pending` に置く。
+- これにより watchdog の初期デモート量を減らし、CPU先行実行の立ち上がりを安定化。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - 初期予約のcold-start制御（warm/coldで分岐）
+
+背景:
+- `initial_reserved=256` + `demoted_reserved_gpu=0` でも初回実行は遅く、
+  cold-startでは予約チャンクを待つ構造が残っていた。
+
+実装:
+- `gpu_context_cached_available()` を追加し、GPUコンテキストがプロセス内で既に温まっているか判定。
+- `Ratio` の初期予約数を warm/cold で分岐:
+  - warm (`gpu_cached_ready=true`): `GPU_RATIO_RESERVED_TARGET_CHUNKS` (256)
+  - cold (`gpu_cached_ready=false`): `GPU_BATCH_CHUNKS` (16)
+- `scheduler-detail start` に `gpu_cached_ready` を追加。
+
+狙い:
+- cold-start時の「初期予約待ち」を最小化し、CPU先行実行を阻害しない。
+
+## 2026-02-25 - cold-start初期予約数チューニング（16->32）
+
+背景:
+- cold-start `initial_reserved=16` は安定化に効いたが、`gpu_chunks` が下がりすぎて
+  圧縮上振れ余地が残った。
+
+実装:
+- `GPU_COLD_START_RESERVED_CHUNKS = GPU_BATCH_CHUNKS * 2` を追加。
+- cold-start時の初期予約数を `16 -> 32` に調整。
+
+狙い:
+- 起動直後のCPU先行性を維持しつつ、GPU投入を少し早めて圧縮スループットを改善。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+
+## 2026-02-25 - cold-start初期予約の既定値を16へ戻し
+
+背景:
+- 実測上 `32` の優位性が環境依存で、低性能GPUでの安全側設定を優先する判断。
+
+実装:
+- `GPU_COLD_START_RESERVED_CHUNKS` の既定値を `GPU_BATCH_CHUNKS` (16) に戻し。
+- 必要時は `COZIP_GPU_COLD_RESERVED_CHUNKS` で上書き可能な構成は維持。

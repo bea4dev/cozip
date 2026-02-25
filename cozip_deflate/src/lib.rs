@@ -42,15 +42,23 @@ const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
 const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUNT * 2);
 const GPU_BATCH_CHUNKS: usize = 16;
+const GPU_COLD_START_RESERVED_CHUNKS: usize = GPU_BATCH_CHUNKS;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
+const GPU_RATIO_RESERVED_TARGET_CHUNKS: usize = GPU_BATCH_CHUNKS * 16;
+const GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS: usize = GPU_BATCH_CHUNKS * 4;
 const GPU_FREQ_MAX_WORKGROUPS: u32 = 4096;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
 const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
-const GPU_RESERVATION_TIMEOUT_MS: u64 = 3;
+const GPU_RESERVATION_TIMEOUT_MS_SPEED: u64 = 3;
+const GPU_RESERVATION_TIMEOUT_MS_BALANCED: u64 = 12;
+const GPU_RESERVATION_TIMEOUT_MS_RATIO: u64 = 64;
 const SCHEDULER_WAIT_MS: u64 = 1;
+const GPU_INIT_STATE_INITIALIZING: u8 = 0;
+const GPU_INIT_STATE_READY: u8 = 1;
+const GPU_INIT_STATE_UNAVAILABLE: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct HybridOptions {
@@ -204,6 +212,17 @@ fn timing_profile_enabled() -> bool {
     })
 }
 
+fn timing_profile_detail_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(raw) = std::env::var("COZIP_PROFILE_TIMING_DETAIL") else {
+            return false;
+        };
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
 fn deep_timing_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -264,6 +283,15 @@ struct GpuDynamicTiming {
     freq_recv_ms: f64,
     freq_map_copy_ms: f64,
     freq_plan_ms: f64,
+    freq_pending_samples: usize,
+    freq_pending_sum_chunks: usize,
+    freq_pending_max_chunks: usize,
+    freq_submit_collect_samples: usize,
+    freq_submit_collect_sum_ms: f64,
+    freq_submit_collect_max_ms: f64,
+    freq_recv_immediate: usize,
+    freq_recv_blocked: usize,
+    freq_recv_blocked_ms: f64,
     pack_submit_ms: f64,
     pack_bits_readback_ms: f64,
     payload_submit_ms: f64,
@@ -290,6 +318,7 @@ enum CompressTaskState {
     RunningGpu = 2,
     RunningCpu = 3,
     Done = 4,
+    DemotedCpu = 5,
 }
 
 #[derive(Debug)]
@@ -299,6 +328,32 @@ struct ScheduledCompressTask {
     raw: Vec<u8>,
     state: AtomicU8,
     reserved_at_ms: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerPerfCounters {
+    cpu_chunks: AtomicUsize,
+    cpu_bytes: AtomicU64,
+    cpu_work_ns: AtomicU64,
+    gpu_batches: AtomicUsize,
+    gpu_chunks: AtomicUsize,
+    gpu_bytes: AtomicU64,
+    gpu_work_ns: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerTimeline {
+    first_cpu_task_logged: AtomicU8,
+    gpu_init_start_logged: AtomicU8,
+    gpu_init_done_logged: AtomicU8,
+    gpu_init_failed_logged: AtomicU8,
+    first_gpu_batch_logged: AtomicU8,
+    init_demote_logged: AtomicU8,
+}
+
+fn mark_once(flag: &AtomicU8) -> bool {
+    flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 #[derive(Debug, Clone)]
@@ -346,18 +401,10 @@ struct GpuAssist {
     litlen_pipeline: wgpu::ComputePipeline,
     bitpack_bind_group_layout: wgpu::BindGroupLayout,
     bitpack_pipeline: wgpu::ComputePipeline,
-    match_bind_group_layout: wgpu::BindGroupLayout,
-    match_pipeline: wgpu::ComputePipeline,
-    count_bind_group_layout: wgpu::BindGroupLayout,
-    count_pipeline: wgpu::ComputePipeline,
-    prefix_bind_group_layout: wgpu::BindGroupLayout,
-    prefix_pipeline: wgpu::ComputePipeline,
     scan_blocks_bind_group_layout: wgpu::BindGroupLayout,
     scan_blocks_pipeline: wgpu::ComputePipeline,
     scan_add_bind_group_layout: wgpu::BindGroupLayout,
     scan_add_pipeline: wgpu::ComputePipeline,
-    emit_bind_group_layout: wgpu::BindGroupLayout,
-    emit_pipeline: wgpu::ComputePipeline,
     deflate_slots: Mutex<Vec<DeflateSlot>>,
     deflate_header_buffer: wgpu::Buffer,
 }
@@ -2616,288 +2663,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             entry_point: "main",
         });
 
-        let match_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cozip-match-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let match_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cozip-match-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-@group(0) @binding(0)
-var<storage, read> input_words: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> eq_prev: array<u32>;
-
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(2)
-var<uniform> params: Params;
-
-fn byte_at(index: u32) -> u32 {
-    let word = input_words[index >> 2u];
-    let shift = (index & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    if (idx == 0u) {
-        eq_prev[idx] = 0u;
-    } else {
-        eq_prev[idx] = select(0u, 1u, byte_at(idx) == byte_at(idx - 1u));
-    }
-}
-"#,
-            )),
-        });
-
-        let match_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cozip-match-layout"),
-            bind_group_layouts: &[&match_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let match_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cozip-match-pipeline"),
-            layout: Some(&match_layout),
-            module: &match_shader,
-            entry_point: "main",
-        });
-
-        let count_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cozip-count-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let count_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cozip-count-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> eq_prev: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> starts: array<u32>;
-
-@group(0) @binding(2)
-var<uniform> params: Params;
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    let block_start = select(0u, 1u, params.block_size > 0u && (idx % params.block_size) == 0u);
-    let is_start = select(0u, 1u, idx == 0u || block_start == 1u || eq_prev[idx] == 0u);
-    starts[idx] = is_start;
-}
-"#,
-            )),
-        });
-
-        let count_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cozip-count-layout"),
-            bind_group_layouts: &[&count_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let count_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cozip-count-pipeline"),
-            layout: Some(&count_layout),
-            module: &count_shader,
-            entry_point: "main",
-        });
-
-        let prefix_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cozip-prefix-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let prefix_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cozip-prefix-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> starts: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> prefix: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> total: array<u32>;
-
-@group(0) @binding(3)
-var<uniform> params: Params;
-
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x != 0u) {
-        return;
-    }
-
-    var sum: u32 = 0u;
-    var i: u32 = 0u;
-    loop {
-        if (i >= params.len) {
-            break;
-        }
-        prefix[i] = sum;
-        sum = sum + starts[i];
-        i = i + 1u;
-    }
-    total[0] = sum;
-}
-"#,
-            )),
-        });
-
-        let prefix_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cozip-prefix-layout"),
-            bind_group_layouts: &[&prefix_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let prefix_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cozip-prefix-pipeline"),
-            layout: Some(&prefix_layout),
-            module: &prefix_shader,
-            entry_point: "main",
-        });
 
         let scan_blocks_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3108,104 +2873,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             entry_point: "main",
         });
 
-        let emit_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cozip-emit-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let emit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cozip-emit-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> starts: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> prefix: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> positions: array<u32>;
-
-@group(0) @binding(3)
-var<uniform> params: Params;
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    if (starts[idx] == 1u) {
-        let pos = prefix[idx];
-        positions[pos] = idx;
-    }
-}
-"#,
-            )),
-        });
-
-        let emit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cozip-emit-layout"),
-            bind_group_layouts: &[&emit_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let emit_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("cozip-emit-pipeline"),
-            layout: Some(&emit_layout),
-            module: &emit_shader,
-            entry_point: "main",
-        });
+        // run_start_positions*専用だったmatch/count/prefix/emitパイプラインは未使用のため
+        // 初期化コスト削減のため生成しない。
 
         let deflate_header_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-deflate-header"),
@@ -3233,18 +2902,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             litlen_pipeline,
             bitpack_bind_group_layout,
             bitpack_pipeline,
-            match_bind_group_layout,
-            match_pipeline,
-            count_bind_group_layout,
-            count_pipeline,
-            prefix_bind_group_layout,
-            prefix_pipeline,
             scan_blocks_bind_group_layout,
             scan_blocks_pipeline,
             scan_add_bind_group_layout,
             scan_add_pipeline,
-            emit_bind_group_layout,
-            emit_pipeline,
             deflate_slots: Mutex::new(Vec::new()),
             deflate_header_buffer,
         })
@@ -4004,344 +3665,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         Ok(elapsed_ms(start))
     }
 
-    fn run_start_positions(
-        &self,
-        data: &[u8],
-        block_size: usize,
-    ) -> Result<Vec<usize>, CozipDeflateError> {
-        let mut batch = self.run_start_positions_batch(&[data], block_size)?;
-        Ok(batch.pop().unwrap_or_default())
-    }
-
-    fn run_start_positions_batch(
-        &self,
-        chunks: &[&[u8]],
-        block_size: usize,
-    ) -> Result<Vec<Vec<usize>>, CozipDeflateError> {
-        if chunks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        struct PendingReadback {
-            chunk_index: usize,
-            len: usize,
-            total_readback: wgpu::Buffer,
-            positions_readback: wgpu::Buffer,
-        }
-
-        let mut results = vec![Vec::new(); chunks.len()];
-        let mut pending = Vec::with_capacity(chunks.len());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cozip-run-batch-encoder"),
-            });
-        let mut dispatched = false;
-
-        for (chunk_index, data) in chunks.iter().enumerate() {
-            if data.is_empty() {
-                continue;
-            }
-
-            let len = data.len();
-            let input_words = len.div_ceil(std::mem::size_of::<u32>());
-            let input_storage_size = bytes_len::<u32>(input_words)?;
-            let storage_size = bytes_len::<u32>(len)?;
-
-            let input_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-input"),
-                size: input_storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            if data.len() % std::mem::size_of::<u32>() == 0 {
-                self.queue.write_buffer(&input_buffer, 0, data);
-            } else {
-                let mut padded = vec![0_u8; input_words * std::mem::size_of::<u32>()];
-                padded[..data.len()].copy_from_slice(data);
-                self.queue.write_buffer(&input_buffer, 0, &padded);
-            }
-
-            let eq_prev_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-eq-prev"),
-                size: storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let starts_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-starts"),
-                size: storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let prefix_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-prefix"),
-                size: storage_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-            let positions_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-positions"),
-                size: storage_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let total_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-total"),
-                size: 4,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            self.queue.write_buffer(&total_buffer, 0, &[0_u8, 0, 0, 0]);
-
-            let params = [
-                u32::try_from(len).map_err(|_| CozipDeflateError::DataTooLarge)?,
-                u32::try_from(block_size.max(1)).map_err(|_| CozipDeflateError::DataTooLarge)?,
-                0,
-                0,
-            ];
-            let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-params"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.queue
-                .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
-
-            let total_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-total-readback"),
-                size: 4,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let positions_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-run-pos-readback"),
-                size: storage_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let match_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-run-match-bg"),
-                layout: &self.match_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: input_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: eq_prev_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let count_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-run-count-bg"),
-                layout: &self.count_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: eq_prev_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: starts_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let prefix_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-run-prefix-bg"),
-                layout: &self.prefix_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: starts_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: prefix_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: total_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let emit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-run-emit-bg"),
-                layout: &self.emit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: starts_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: prefix_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: positions_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-
-            {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-run-match-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.match_pipeline);
-                pass.set_bind_group(0, &match_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-            }
-
-            {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-run-count-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.count_pipeline);
-                pass.set_bind_group(0, &count_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-            }
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-run-prefix-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.prefix_pipeline);
-                pass.set_bind_group(0, &prefix_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-
-            {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-run-emit-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.emit_pipeline);
-                pass.set_bind_group(0, &emit_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-            }
-
-            encoder.copy_buffer_to_buffer(&total_buffer, 0, &total_readback, 0, 4);
-            encoder.copy_buffer_to_buffer(&positions_buffer, 0, &positions_readback, 0, storage_size);
-
-            pending.push(PendingReadback {
-                chunk_index,
-                len,
-                total_readback,
-                positions_readback,
-            });
-            dispatched = true;
-        }
-
-        if !dispatched {
-            return Ok(results);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-
-        let mut total_receivers = Vec::with_capacity(pending.len());
-        let mut pos_receivers = Vec::with_capacity(pending.len());
-        for item in &pending {
-            let (tx_total, rx_total) = std::sync::mpsc::channel();
-            item.total_readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx_total.send(result);
-                });
-            total_receivers.push(rx_total);
-
-            let (tx_pos, rx_pos) = std::sync::mpsc::channel();
-            item.positions_readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx_pos.send(result);
-                });
-            pos_receivers.push(rx_pos);
-        }
-
-        self.device.poll(wgpu::Maintain::Wait);
-
-        for (item, (total_rx, pos_rx)) in pending
-            .into_iter()
-            .zip(total_receivers.into_iter().zip(pos_receivers.into_iter()))
-        {
-            match total_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-            }
-
-            match pos_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-            }
-
-            let total_mapped = item.total_readback.slice(..).get_mapped_range();
-            let total_words: &[u32] = bytemuck::cast_slice(&total_mapped);
-            let total_count = total_words.first().copied().unwrap_or(0) as usize;
-            drop(total_mapped);
-            item.total_readback.unmap();
-
-            let pos_mapped = item.positions_readback.slice(..).get_mapped_range();
-            let pos_words: &[u32] = bytemuck::cast_slice(&pos_mapped);
-            let capped = total_count.min(pos_words.len());
-            let mut out = Vec::with_capacity(capped);
-            for value in &pos_words[..capped] {
-                out.push(*value as usize);
-            }
-            drop(pos_mapped);
-            item.positions_readback.unmap();
-
-            out.sort_unstable();
-            out.dedup();
-            out.retain(|idx| *idx < item.len);
-
-            if out.first().copied() != Some(0) {
-                out.insert(0, 0);
-            }
-
-            results[item.chunk_index] = out;
-        }
-
-        Ok(results)
-    }
-
     fn deflate_fixed_literals_batch(
         &self,
         chunks: &[&[u8]],
@@ -4694,6 +4017,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             return Ok(Vec::new());
         }
         let timing_enabled = timing_profile_enabled();
+        let timing_detail_enabled = timing_enabled && timing_profile_detail_enabled();
         let mut timing = GpuDynamicTiming {
             call_id: GPU_TIMING_CALL_SEQ.fetch_add(1, Ordering::Relaxed),
             mode,
@@ -4709,6 +4033,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             freq_recv_ms: 0.0,
             freq_map_copy_ms: 0.0,
             freq_plan_ms: 0.0,
+            freq_pending_samples: 0,
+            freq_pending_sum_chunks: 0,
+            freq_pending_max_chunks: 0,
+            freq_submit_collect_samples: 0,
+            freq_submit_collect_sum_ms: 0.0,
+            freq_submit_collect_max_ms: 0.0,
+            freq_recv_immediate: 0,
+            freq_recv_blocked: 0,
+            freq_recv_blocked_ms: 0.0,
             pack_submit_ms: 0.0,
             pack_bits_readback_ms: 0.0,
             payload_submit_ms: 0.0,
@@ -4724,6 +4057,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             dist_freq_readback: wgpu::Buffer,
             litlen_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
             dist_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+            litlen_ready: bool,
+            dist_ready: bool,
+            submitted_at: Option<Instant>,
         }
 
         struct PreparedDynamicPack {
@@ -4757,6 +4093,133 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cozip-deflate-dynamic-freq-batch-encoder"),
             });
+        let collect_ready_freq_front = |freq_pending: &mut VecDeque<PendingDynFreqReadback>,
+                                        prepared: &mut Vec<PreparedDynamicPack>,
+                                        timing: &mut GpuDynamicTiming|
+         -> Result<usize, CozipDeflateError> {
+            let mut collected = 0usize;
+            loop {
+                let freq_recv_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let ready = {
+                    let Some(front) = freq_pending.front_mut() else {
+                        break;
+                    };
+                    if !front.litlen_ready {
+                        match front.litlen_receiver.try_recv() {
+                            Ok(Ok(())) => {
+                                front.litlen_ready = true;
+                                if timing_detail_enabled {
+                                    timing.freq_recv_immediate += 1;
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Err(CozipDeflateError::GpuExecution(
+                                    "litlen map_async receiver disconnected".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if !front.dist_ready {
+                        match front.dist_receiver.try_recv() {
+                            Ok(Ok(())) => {
+                                front.dist_ready = true;
+                                if timing_detail_enabled {
+                                    timing.freq_recv_immediate += 1;
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Err(CozipDeflateError::GpuExecution(
+                                    "dist map_async receiver disconnected".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    front.litlen_ready && front.dist_ready
+                };
+                if let Some(start) = freq_recv_start {
+                    timing.freq_recv_ms += elapsed_ms(start);
+                }
+                if !ready {
+                    break;
+                }
+
+                let pending = freq_pending
+                    .pop_front()
+                    .ok_or(CozipDeflateError::Internal("freq pending pop failed"))?;
+                if timing_detail_enabled {
+                    if let Some(submitted_at) = pending.submitted_at {
+                        let delay_ms = elapsed_ms(submitted_at);
+                        timing.freq_submit_collect_samples += 1;
+                        timing.freq_submit_collect_sum_ms += delay_ms;
+                        timing.freq_submit_collect_max_ms =
+                            timing.freq_submit_collect_max_ms.max(delay_ms);
+                    }
+                }
+
+                let freq_map_copy_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
+                let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
+                let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
+                let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
+                let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
+                let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
+                litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
+                dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
+                drop(litlen_freq_map);
+                drop(dist_freq_map);
+                pending.litlen_freq_readback.unmap();
+                pending.dist_freq_readback.unmap();
+                if let Some(start) = freq_map_copy_start {
+                    timing.freq_map_copy_ms += elapsed_ms(start);
+                }
+
+                let freq_plan_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
+                let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
+                dyn_table.extend_from_slice(&plan.litlen_codes);
+                dyn_table.extend_from_slice(&plan.litlen_bits);
+                dyn_table.extend_from_slice(&plan.dist_codes);
+                dyn_table.extend_from_slice(&plan.dist_bits);
+                if let Some(start) = freq_plan_start {
+                    timing.freq_plan_ms += elapsed_ms(start);
+                }
+
+                let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                prepared.push(PreparedDynamicPack {
+                    chunk_index: pending.chunk_index,
+                    slot_index: pending.slot_index,
+                    len_u32,
+                    header_bits: plan.header_bits,
+                    header_bytes: plan.header_bytes,
+                    dyn_table,
+                    eob_code: plan.eob_code,
+                    eob_bits: plan.eob_bits,
+                });
+                collected += 1;
+            }
+            Ok(collected)
+        };
 
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
@@ -4864,6 +4327,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if let Some(start) = freq_submit_start {
                     timing.freq_submit_ms += elapsed_ms(start);
                 }
+                let submitted_at = if timing_detail_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
                     staged_freq_readbacks.drain(..)
                 {
@@ -4882,98 +4350,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                         dist_freq_readback: dist_rb,
                         litlen_receiver: lit_rx,
                         dist_receiver: dist_rx,
+                        litlen_ready: false,
+                        dist_ready: false,
+                        submitted_at,
                     });
                 }
+                if timing_detail_enabled {
+                    let pending = freq_pending.len();
+                    timing.freq_pending_samples += 1;
+                    timing.freq_pending_sum_chunks += pending;
+                    timing.freq_pending_max_chunks = timing.freq_pending_max_chunks.max(pending);
+                }
                 self.device.poll(wgpu::Maintain::Poll);
-                // Overlap: if two freq waves are in flight, collect+plan one older wave now.
-                if freq_pending.len() >= GPU_PIPELINED_SUBMIT_CHUNKS * 2 {
-                    let freq_poll_wait_start = if timing_enabled {
-                        Some(Instant::now())
-                    } else {
-                        None
-                    };
-                    self.device.poll(wgpu::Maintain::Wait);
-                    if let Some(start) = freq_poll_wait_start {
-                        timing.freq_poll_wait_ms += elapsed_ms(start);
-                    }
-                    let mut drained = 0usize;
-                    while drained < GPU_PIPELINED_SUBMIT_CHUNKS {
-                        let Some(pending) = freq_pending.pop_front() else {
-                            break;
-                        };
-                        let freq_recv_start = if timing_enabled {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        match pending.litlen_receiver.recv() {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
-                            }
-                            Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                        }
-                        match pending.dist_receiver.recv() {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
-                            }
-                            Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                        }
-                        if let Some(start) = freq_recv_start {
-                            timing.freq_recv_ms += elapsed_ms(start);
-                        }
-
-                        let freq_map_copy_start = if timing_enabled {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
-                        let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
-                        let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
-                        let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
-                        let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
-                        let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
-                        litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
-                        dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
-                        drop(litlen_freq_map);
-                        drop(dist_freq_map);
-                        pending.litlen_freq_readback.unmap();
-                        pending.dist_freq_readback.unmap();
-                        if let Some(start) = freq_map_copy_start {
-                            timing.freq_map_copy_ms += elapsed_ms(start);
-                        }
-
-                        let freq_plan_start = if timing_enabled {
-                            Some(Instant::now())
-                        } else {
-                            None
-                        };
-                        let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
-                        let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
-                        dyn_table.extend_from_slice(&plan.litlen_codes);
-                        dyn_table.extend_from_slice(&plan.litlen_bits);
-                        dyn_table.extend_from_slice(&plan.dist_codes);
-                        dyn_table.extend_from_slice(&plan.dist_bits);
-                        if let Some(start) = freq_plan_start {
-                            timing.freq_plan_ms += elapsed_ms(start);
-                        }
-
-                        let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
-                            .map_err(|_| CozipDeflateError::DataTooLarge)?;
-                        prepared.push(PreparedDynamicPack {
-                            chunk_index: pending.chunk_index,
-                            slot_index: pending.slot_index,
-                            len_u32,
-                            header_bits: plan.header_bits,
-                            header_bytes: plan.header_bytes,
-                            dyn_table,
-                            eob_code: plan.eob_code,
-                            eob_bits: plan.eob_bits,
-                        });
-                        drained += 1;
-                    }
+                if !freq_pending.is_empty() {
+                    let _ = collect_ready_freq_front(&mut freq_pending, &mut prepared, &mut timing)?;
                 }
                 freq_encoder = self
                     .device
@@ -4994,6 +4384,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             if let Some(start) = freq_submit_start {
                 timing.freq_submit_ms += elapsed_ms(start);
             }
+            let submitted_at = if timing_detail_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
             for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
                 staged_freq_readbacks.drain(..)
             {
@@ -5012,92 +4407,43 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     dist_freq_readback: dist_rb,
                     litlen_receiver: lit_rx,
                     dist_receiver: dist_rx,
+                    litlen_ready: false,
+                    dist_ready: false,
+                    submitted_at,
                 });
+            }
+            if timing_detail_enabled {
+                let pending = freq_pending.len();
+                timing.freq_pending_samples += 1;
+                timing.freq_pending_sum_chunks += pending;
+                timing.freq_pending_max_chunks = timing.freq_pending_max_chunks.max(pending);
             }
         }
 
         if prepared.capacity() < prepared.len() + freq_pending.len() {
             prepared.reserve(freq_pending.len());
         }
-        if !freq_pending.is_empty() {
-            let freq_poll_wait_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            self.device.poll(wgpu::Maintain::Wait);
-            if let Some(start) = freq_poll_wait_start {
-                timing.freq_poll_wait_ms += elapsed_ms(start);
+        while !freq_pending.is_empty() {
+            self.device.poll(wgpu::Maintain::Poll);
+            let collected = collect_ready_freq_front(&mut freq_pending, &mut prepared, &mut timing)?;
+            if collected == 0 {
+                let freq_poll_wait_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.device.poll(wgpu::Maintain::Wait);
+                if let Some(start) = freq_poll_wait_start {
+                    timing.freq_poll_wait_ms += elapsed_ms(start);
+                }
+                let collected_after_wait =
+                    collect_ready_freq_front(&mut freq_pending, &mut prepared, &mut timing)?;
+                if collected_after_wait == 0 {
+                    return Err(CozipDeflateError::Internal(
+                        "freq pending stalled after gpu wait",
+                    ));
+                }
             }
-        }
-        while let Some(pending) = freq_pending.pop_front() {
-            let freq_recv_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            match pending.litlen_receiver.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-            }
-            match pending.dist_receiver.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-            }
-            if let Some(start) = freq_recv_start {
-                timing.freq_recv_ms += elapsed_ms(start);
-            }
-
-            let freq_map_copy_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
-            let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
-            let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
-            let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
-            let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
-            let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
-            litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
-            dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
-            drop(litlen_freq_map);
-            drop(dist_freq_map);
-            pending.litlen_freq_readback.unmap();
-            pending.dist_freq_readback.unmap();
-            if let Some(start) = freq_map_copy_start {
-                timing.freq_map_copy_ms += elapsed_ms(start);
-            }
-
-            let freq_plan_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
-            let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
-            dyn_table.extend_from_slice(&plan.litlen_codes);
-            dyn_table.extend_from_slice(&plan.litlen_bits);
-            dyn_table.extend_from_slice(&plan.dist_codes);
-            dyn_table.extend_from_slice(&plan.dist_bits);
-            if let Some(start) = freq_plan_start {
-                timing.freq_plan_ms += elapsed_ms(start);
-            }
-
-            let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
-                .map_err(|_| CozipDeflateError::DataTooLarge)?;
-            prepared.push(PreparedDynamicPack {
-                chunk_index: pending.chunk_index,
-                slot_index: pending.slot_index,
-                len_u32,
-                header_bits: plan.header_bits,
-                header_bytes: plan.header_bytes,
-                dyn_table,
-                eob_code: plan.eob_code,
-                eob_bits: plan.eob_bits,
-            });
         }
 
         let mut pack_pending: Vec<PendingDynPackBitsReadback> = Vec::with_capacity(prepared.len());
@@ -5411,28 +4757,70 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         if timing_enabled {
-            eprintln!(
-                "[cozip][timing][gpu-dynamic] call={} mode={:?} chunks={} in_mib={:.2} out_mib={:.2} payload_chunks={} fallback_chunks={} bits_rb_kib={:.1} payload_rb_mib={:.2} t_freq_submit_ms={:.3} t_freq_poll_wait_ms={:.3} t_freq_recv_ms={:.3} t_freq_map_copy_ms={:.3} t_freq_plan_ms={:.3} t_pack_submit_ms={:.3} t_pack_bits_rb_ms={:.3} t_payload_submit_ms={:.3} t_payload_rb_ms={:.3} t_cpu_fallback_ms={:.3}",
-                timing.call_id,
-                timing.mode,
-                timing.chunks,
-                timing.input_bytes as f64 / (1024.0 * 1024.0),
-                timing.output_bytes as f64 / (1024.0 * 1024.0),
-                timing.payload_chunks,
-                timing.fallback_chunks,
-                timing.bits_readback_bytes as f64 / 1024.0,
-                timing.payload_readback_bytes as f64 / (1024.0 * 1024.0),
-                timing.freq_submit_ms,
-                timing.freq_poll_wait_ms,
-                timing.freq_recv_ms,
-                timing.freq_map_copy_ms,
-                timing.freq_plan_ms,
-                timing.pack_submit_ms,
-                timing.pack_bits_readback_ms,
-                timing.payload_submit_ms,
-                timing.payload_readback_ms,
-                timing.cpu_fallback_ms,
-            );
+            if timing_detail_enabled {
+                let pending_avg_chunks = if timing.freq_pending_samples > 0 {
+                    timing.freq_pending_sum_chunks as f64 / timing.freq_pending_samples as f64
+                } else {
+                    0.0
+                };
+                let submit_collect_avg_ms = if timing.freq_submit_collect_samples > 0 {
+                    timing.freq_submit_collect_sum_ms / timing.freq_submit_collect_samples as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[cozip][timing][gpu-dynamic] call={} mode={:?} chunks={} in_mib={:.2} out_mib={:.2} payload_chunks={} fallback_chunks={} bits_rb_kib={:.1} payload_rb_mib={:.2} pending_avg_chunks={:.2} pending_max_chunks={} submit_collect_avg_ms={:.3} submit_collect_max_ms={:.3} recv_immediate={} recv_blocked={} recv_blocked_ms={:.3} t_freq_submit_ms={:.3} t_freq_poll_wait_ms={:.3} t_freq_recv_ms={:.3} t_freq_map_copy_ms={:.3} t_freq_plan_ms={:.3} t_pack_submit_ms={:.3} t_pack_bits_rb_ms={:.3} t_payload_submit_ms={:.3} t_payload_rb_ms={:.3} t_cpu_fallback_ms={:.3}",
+                    timing.call_id,
+                    timing.mode,
+                    timing.chunks,
+                    timing.input_bytes as f64 / (1024.0 * 1024.0),
+                    timing.output_bytes as f64 / (1024.0 * 1024.0),
+                    timing.payload_chunks,
+                    timing.fallback_chunks,
+                    timing.bits_readback_bytes as f64 / 1024.0,
+                    timing.payload_readback_bytes as f64 / (1024.0 * 1024.0),
+                    pending_avg_chunks,
+                    timing.freq_pending_max_chunks,
+                    submit_collect_avg_ms,
+                    timing.freq_submit_collect_max_ms,
+                    timing.freq_recv_immediate,
+                    timing.freq_recv_blocked,
+                    timing.freq_recv_blocked_ms,
+                    timing.freq_submit_ms,
+                    timing.freq_poll_wait_ms,
+                    timing.freq_recv_ms,
+                    timing.freq_map_copy_ms,
+                    timing.freq_plan_ms,
+                    timing.pack_submit_ms,
+                    timing.pack_bits_readback_ms,
+                    timing.payload_submit_ms,
+                    timing.payload_readback_ms,
+                    timing.cpu_fallback_ms,
+                );
+            } else {
+                eprintln!(
+                    "[cozip][timing][gpu-dynamic] call={} mode={:?} chunks={} in_mib={:.2} out_mib={:.2} payload_chunks={} fallback_chunks={} bits_rb_kib={:.1} payload_rb_mib={:.2} t_freq_submit_ms={:.3} t_freq_poll_wait_ms={:.3} t_freq_recv_ms={:.3} t_freq_map_copy_ms={:.3} t_freq_plan_ms={:.3} t_pack_submit_ms={:.3} t_pack_bits_rb_ms={:.3} t_payload_submit_ms={:.3} t_payload_rb_ms={:.3} t_cpu_fallback_ms={:.3}",
+                    timing.call_id,
+                    timing.mode,
+                    timing.chunks,
+                    timing.input_bytes as f64 / (1024.0 * 1024.0),
+                    timing.output_bytes as f64 / (1024.0 * 1024.0),
+                    timing.payload_chunks,
+                    timing.fallback_chunks,
+                    timing.bits_readback_bytes as f64 / 1024.0,
+                    timing.payload_readback_bytes as f64 / (1024.0 * 1024.0),
+                    timing.freq_submit_ms,
+                    timing.freq_poll_wait_ms,
+                    timing.freq_recv_ms,
+                    timing.freq_map_copy_ms,
+                    timing.freq_plan_ms,
+                    timing.pack_submit_ms,
+                    timing.pack_bits_readback_ms,
+                    timing.payload_submit_ms,
+                    timing.payload_readback_ms,
+                    timing.cpu_fallback_ms,
+                );
+            }
         }
 
         Ok(results)
@@ -5575,6 +4963,7 @@ fn shared_gpu_context(prefer_gpu: bool) -> Option<Arc<GpuAssist>> {
         return None;
     }
 
+    let timing_enabled = timing_profile_enabled();
     let holder = GPU_CONTEXT.get_or_init(|| Mutex::new(None));
     let mut guard = holder.lock().ok()?;
 
@@ -5582,9 +4971,31 @@ fn shared_gpu_context(prefer_gpu: bool) -> Option<Arc<GpuAssist>> {
         return Some(existing.clone());
     }
 
+    let init_start = if timing_enabled {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let created = GpuAssist::new().ok().map(Arc::new);
+    if let Some(start) = init_start {
+        eprintln!(
+            "[cozip][timing] gpu_context_init_ms={:.3} gpu_available={}",
+            elapsed_ms(start),
+            created.is_some()
+        );
+    }
     *guard = created.clone();
     created
+}
+
+fn gpu_context_cached_available() -> bool {
+    let Some(holder) = GPU_CONTEXT.get() else {
+        return false;
+    };
+    let Ok(guard) = holder.lock() else {
+        return false;
+    };
+    guard.is_some()
 }
 
 pub fn deflate_compress_cpu(input: &[u8], level: u32) -> Result<Vec<u8>, CozipDeflateError> {
@@ -5621,15 +5032,11 @@ pub fn compress_hybrid(
         });
     }
 
-    let gpu_context = if options.gpu_fraction <= 0.0 {
-        None
-    } else {
-        shared_gpu_context(options.prefer_gpu)
-    };
-
-    let tasks = build_chunk_tasks(input, options, gpu_context.is_some())?;
-    if let Some(gpu) = gpu_context.clone() {
-        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options, gpu);
+    let gpu_requested = options.prefer_gpu && options.gpu_fraction > 0.0;
+    let tasks = build_chunk_tasks(input, options, gpu_requested)?;
+    let has_gpu_tasks = gpu_requested && tasks.iter().any(|task| task.preferred_gpu);
+    if has_gpu_tasks {
+        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options);
     }
 
     let chunk_count = tasks.len();
@@ -5637,7 +5044,7 @@ pub fn compress_hybrid(
     let results = Arc::new(Mutex::new(vec![None; chunk_count]));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
 
-    let cpu_workers = cpu_worker_count(gpu_context.is_some());
+    let cpu_workers = cpu_worker_count(false);
     let mut handles = Vec::new();
 
     for _ in 0..cpu_workers {
@@ -5645,21 +5052,10 @@ pub fn compress_hybrid(
         let result_ref = Arc::clone(&results);
         let err_ref = Arc::clone(&error);
         let opts = options.clone();
-        let gpu_enabled = gpu_context.is_some();
+        let gpu_enabled = false;
 
         handles.push(std::thread::spawn(move || {
             compress_cpu_worker(queue_ref, result_ref, err_ref, &opts, gpu_enabled)
-        }));
-    }
-
-    if let Some(gpu) = gpu_context.clone() {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-
-        handles.push(std::thread::spawn(move || {
-            compress_gpu_worker(queue_ref, result_ref, err_ref, &opts, gpu)
         }));
     }
 
@@ -5678,7 +5074,7 @@ pub fn compress_hybrid(
     }
     chunks.sort_by_key(|chunk| chunk.index);
 
-    let stats = summarize_encoded_chunks(&chunks, gpu_context.is_some());
+    let stats = summarize_encoded_chunks(&chunks, false);
     let frame = encode_frame(input.len(), &chunks)?;
 
     Ok(CompressedFrame {
@@ -5814,6 +5210,28 @@ fn compression_mode_id(mode: CompressionMode) -> u32 {
     }
 }
 
+fn gpu_reservation_timeout_ms(mode: CompressionMode) -> u64 {
+    match mode {
+        CompressionMode::Speed => GPU_RESERVATION_TIMEOUT_MS_SPEED,
+        CompressionMode::Balanced => GPU_RESERVATION_TIMEOUT_MS_BALANCED,
+        CompressionMode::Ratio => GPU_RESERVATION_TIMEOUT_MS_RATIO,
+    }
+}
+
+fn gpu_cold_start_reserved_chunks() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let default = GPU_COLD_START_RESERVED_CHUNKS;
+        let Ok(raw) = std::env::var("COZIP_GPU_COLD_RESERVED_CHUNKS") else {
+            return default;
+        };
+        let Ok(parsed) = raw.trim().parse::<usize>() else {
+            return default;
+        };
+        parsed.clamp(0, GPU_RATIO_RESERVED_TARGET_CHUNKS)
+    })
+}
+
 fn should_validate_gpu_chunk(mode: CompressionMode) -> bool {
     mode != CompressionMode::Speed
 }
@@ -5881,7 +5299,6 @@ fn compress_hybrid_adaptive_scheduler(
     original_len: usize,
     tasks: Vec<ChunkTask>,
     options: &HybridOptions,
-    gpu: Arc<GpuAssist>,
 ) -> Result<CompressedFrame, CozipDeflateError> {
     let timing_enabled = timing_profile_enabled();
     let scheduler_start = if timing_enabled {
@@ -5892,32 +5309,64 @@ fn compress_hybrid_adaptive_scheduler(
     let chunk_count = tasks.len();
     let start = Arc::new(Instant::now());
     let now_ms = monotonic_ms(&start);
-    let scheduled_tasks = Arc::new(
-        tasks
-            .into_iter()
-            .map(|task| {
-                let state = if task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size {
-                    CompressTaskState::ReservedGpu
-                } else {
-                    CompressTaskState::Pending
-                };
-                ScheduledCompressTask {
-                    index: task.index,
-                    preferred_gpu: task.preferred_gpu,
-                    raw: task.raw,
-                    state: AtomicU8::new(state as u8),
-                    reserved_at_ms: AtomicU64::new(now_ms),
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
+    let gpu_cached_ready = gpu_context_cached_available();
+    let cold_start_reserved_chunks = gpu_cold_start_reserved_chunks();
+    let initial_reserved_budget = if options.compression_mode == CompressionMode::Ratio {
+        if gpu_cached_ready {
+            GPU_RATIO_RESERVED_TARGET_CHUNKS
+        } else {
+            cold_start_reserved_chunks
+        }
+    } else {
+        usize::MAX
+    };
+    let mut initial_reserved_count = 0usize;
+    let mut scheduled = Vec::with_capacity(chunk_count);
+    for task in tasks {
+        let reserve_gpu = task.preferred_gpu
+            && task.raw.len() >= options.gpu_min_chunk_size
+            && initial_reserved_count < initial_reserved_budget;
+        if reserve_gpu {
+            initial_reserved_count += 1;
+        }
+        let state = if reserve_gpu {
+            CompressTaskState::ReservedGpu
+        } else {
+            CompressTaskState::Pending
+        };
+        scheduled.push(ScheduledCompressTask {
+            index: task.index,
+            preferred_gpu: task.preferred_gpu,
+            raw: task.raw,
+            state: AtomicU8::new(state as u8),
+            reserved_at_ms: AtomicU64::new(now_ms),
+        });
+    }
+    let scheduled_tasks = Arc::new(scheduled);
 
     let results = Arc::new(Mutex::new(vec![None; chunk_count]));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let remaining = Arc::new(AtomicUsize::new(chunk_count));
     let active_cpu = Arc::new(AtomicUsize::new(0));
+    let demoted_reserved_gpu = Arc::new(AtomicUsize::new(0));
+    let validation_fallback_chunks = Arc::new(AtomicUsize::new(0));
+    let perf_counters = Arc::new(SchedulerPerfCounters::default());
+    let timeline = Arc::new(SchedulerTimeline::default());
+    let gpu_init_state = Arc::new(AtomicU8::new(GPU_INIT_STATE_INITIALIZING));
     let wake = Arc::new((Mutex::new(()), Condvar::new()));
     let cpu_workers = cpu_worker_count(true);
+    log_scheduler_detail(
+        &start,
+        &format!(
+            "start chunks={} cpu_workers={} gpu_fraction={:.2} gpu_cached_ready={} cold_reserved_cfg={} initial_reserved={}",
+            chunk_count,
+            cpu_workers,
+            options.gpu_fraction,
+            gpu_cached_ready,
+            cold_start_reserved_chunks,
+            initial_reserved_count
+        ),
+    );
 
     let mut handles = Vec::new();
     for _ in 0..cpu_workers {
@@ -5927,6 +5376,9 @@ fn compress_hybrid_adaptive_scheduler(
         let rem_ref = Arc::clone(&remaining);
         let active_ref = Arc::clone(&active_cpu);
         let wake_ref = Arc::clone(&wake);
+        let perf_ref = Arc::clone(&perf_counters);
+        let start_ref = Arc::clone(&start);
+        let timeline_ref = Arc::clone(&timeline);
         let opts = options.clone();
 
         handles.push(std::thread::spawn(move || {
@@ -5937,6 +5389,9 @@ fn compress_hybrid_adaptive_scheduler(
                 rem_ref,
                 active_ref,
                 wake_ref,
+                perf_ref,
+                start_ref,
+                timeline_ref,
                 &opts,
             )
         }));
@@ -5949,10 +5404,26 @@ fn compress_hybrid_adaptive_scheduler(
         let rem_ref = Arc::clone(&remaining);
         let wake_ref = Arc::clone(&wake);
         let opts = options.clone();
-        let gpu_ref = Arc::clone(&gpu);
+        let validation_fallback_ref = Arc::clone(&validation_fallback_chunks);
+        let perf_ref = Arc::clone(&perf_counters);
+        let gpu_state_ref = Arc::clone(&gpu_init_state);
+        let start_ref = Arc::clone(&start);
+        let timeline_ref = Arc::clone(&timeline);
 
         handles.push(std::thread::spawn(move || {
-            compress_gpu_worker_adaptive(tasks_ref, results_ref, err_ref, rem_ref, wake_ref, &opts, gpu_ref)
+            compress_gpu_worker_adaptive_lazy_init(
+                tasks_ref,
+                results_ref,
+                err_ref,
+                rem_ref,
+                wake_ref,
+                &opts,
+                validation_fallback_ref,
+                perf_ref,
+                gpu_state_ref,
+                start_ref,
+                timeline_ref,
+            )
         }));
     }
 
@@ -5963,10 +5434,24 @@ fn compress_hybrid_adaptive_scheduler(
         let active_ref = Arc::clone(&active_cpu);
         let wake_ref = Arc::clone(&wake);
         let start_ref = Arc::clone(&start);
+        let demoted_ref = Arc::clone(&demoted_reserved_gpu);
+        let opts = options.clone();
+        let gpu_state_ref = Arc::clone(&gpu_init_state);
+        let timeline_ref = Arc::clone(&timeline);
 
         handles.push(std::thread::spawn(move || {
             compress_scheduler_watchdog(
-                tasks_ref, err_ref, rem_ref, active_ref, wake_ref, cpu_workers, start_ref,
+                tasks_ref,
+                err_ref,
+                rem_ref,
+                active_ref,
+                wake_ref,
+                cpu_workers,
+                start_ref,
+                &opts,
+                demoted_ref,
+                gpu_state_ref,
+                timeline_ref,
             )
         }));
     }
@@ -5986,18 +5471,40 @@ fn compress_hybrid_adaptive_scheduler(
     }
     chunks.sort_by_key(|chunk| chunk.index);
 
-    let stats = summarize_encoded_chunks(&chunks, true);
+    let gpu_available = gpu_init_state.load(Ordering::Acquire) == GPU_INIT_STATE_READY;
+    let stats = summarize_encoded_chunks(&chunks, gpu_available);
     let frame = encode_frame(original_len, &chunks)?;
 
     if let Some(start) = scheduler_start {
+        let cpu_work_ns = perf_counters.cpu_work_ns.load(Ordering::Acquire);
+        let gpu_work_ns = perf_counters.gpu_work_ns.load(Ordering::Acquire);
+        let cpu_bytes = perf_counters.cpu_bytes.load(Ordering::Acquire);
+        let gpu_bytes = perf_counters.gpu_bytes.load(Ordering::Acquire);
+        let cpu_mib_s = if cpu_work_ns == 0 {
+            0.0
+        } else {
+            (cpu_bytes as f64 / (1024.0 * 1024.0)) / (cpu_work_ns as f64 / 1_000_000_000.0)
+        };
+        let gpu_mib_s = if gpu_work_ns == 0 {
+            0.0
+        } else {
+            (gpu_bytes as f64 / (1024.0 * 1024.0)) / (gpu_work_ns as f64 / 1_000_000_000.0)
+        };
         eprintln!(
-            "[cozip][timing][scheduler] mode={:?} chunk_size_kib={} gpu_fraction={:.2} chunks={} cpu_chunks={} gpu_chunks={} in_mib={:.2} out_mib={:.2} elapsed_ms={:.3}",
+            "[cozip][timing][scheduler] mode={:?} chunk_size_kib={} gpu_fraction={:.2} chunks={} cpu_chunks={} gpu_chunks={} demoted_reserved_gpu={} validation_fallback_chunks={} cpu_work_chunks={} gpu_work_chunks={} gpu_batches={} cpu_work_mib_s={:.2} gpu_work_mib_s={:.2} in_mib={:.2} out_mib={:.2} elapsed_ms={:.3}",
             options.compression_mode,
             options.chunk_size / 1024,
             options.gpu_fraction,
             stats.chunk_count,
             stats.cpu_chunks,
             stats.gpu_chunks,
+            demoted_reserved_gpu.load(Ordering::Acquire),
+            validation_fallback_chunks.load(Ordering::Acquire),
+            perf_counters.cpu_chunks.load(Ordering::Acquire),
+            perf_counters.gpu_chunks.load(Ordering::Acquire),
+            perf_counters.gpu_batches.load(Ordering::Acquire),
+            cpu_mib_s,
+            gpu_mib_s,
             original_len as f64 / (1024.0 * 1024.0),
             frame.len() as f64 / (1024.0 * 1024.0),
             elapsed_ms(start),
@@ -6014,6 +5521,9 @@ fn compress_cpu_worker_adaptive(
     remaining: Arc<AtomicUsize>,
     active_cpu: Arc<AtomicUsize>,
     wake: Arc<(Mutex<()>, Condvar)>,
+    perf_counters: Arc<SchedulerPerfCounters>,
+    start: Arc<Instant>,
+    timeline: Arc<SchedulerTimeline>,
     options: &HybridOptions,
 ) {
     loop {
@@ -6025,6 +5535,9 @@ fn compress_cpu_worker_adaptive(
             wait_for_scheduler(&wake);
             continue;
         };
+        if mark_once(&timeline.first_cpu_task_logged) {
+            log_scheduler_detail(&start, &format!("cpu_first_task chunk={}", tasks[task_index].index));
+        }
 
         active_cpu.fetch_add(1, Ordering::AcqRel);
         let task = &tasks[task_index];
@@ -6035,6 +5548,7 @@ fn compress_cpu_worker_adaptive(
                 return;
             }
         };
+        let cpu_start = Instant::now();
         let compressed = deflate_compress_cpu(&task.raw, options.compression_level).map(|compressed| {
             ChunkMember {
                 index: task.index,
@@ -6045,10 +5559,18 @@ fn compress_cpu_worker_adaptive(
                 compressed,
             }
         });
+        let cpu_elapsed_ns = duration_ns_u64(cpu_start.elapsed());
         active_cpu.fetch_sub(1, Ordering::AcqRel);
 
         match compressed {
             Ok(encoded) => {
+                perf_counters.cpu_chunks.fetch_add(1, Ordering::AcqRel);
+                perf_counters
+                    .cpu_bytes
+                    .fetch_add(task.raw.len() as u64, Ordering::AcqRel);
+                perf_counters
+                    .cpu_work_ns
+                    .fetch_add(cpu_elapsed_ns, Ordering::AcqRel);
                 if let Err(err) = store_encoded_result(&results, encoded) {
                     set_error(&error, err);
                     break;
@@ -6063,6 +5585,51 @@ fn compress_cpu_worker_adaptive(
     }
 }
 
+fn compress_gpu_worker_adaptive_lazy_init(
+    tasks: Arc<Vec<ScheduledCompressTask>>,
+    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    remaining: Arc<AtomicUsize>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    options: &HybridOptions,
+    validation_fallback_chunks: Arc<AtomicUsize>,
+    perf_counters: Arc<SchedulerPerfCounters>,
+    gpu_init_state: Arc<AtomicU8>,
+    start: Arc<Instant>,
+    timeline: Arc<SchedulerTimeline>,
+) {
+    if mark_once(&timeline.gpu_init_start_logged) {
+        log_scheduler_detail(&start, "gpu_init_start");
+    }
+    let Some(gpu) = shared_gpu_context(options.prefer_gpu) else {
+        gpu_init_state.store(GPU_INIT_STATE_UNAVAILABLE, Ordering::Release);
+        if mark_once(&timeline.gpu_init_failed_logged) {
+            log_scheduler_detail(&start, "gpu_init_unavailable");
+        }
+        wake.1.notify_all();
+        return;
+    };
+    gpu_init_state.store(GPU_INIT_STATE_READY, Ordering::Release);
+    if mark_once(&timeline.gpu_init_done_logged) {
+        log_scheduler_detail(&start, "gpu_init_ready");
+    }
+    wake.1.notify_all();
+
+    compress_gpu_worker_adaptive(
+        tasks,
+        results,
+        error,
+        remaining,
+        wake,
+        options,
+        gpu,
+        validation_fallback_chunks,
+        perf_counters,
+        start,
+        timeline,
+    );
+}
+
 fn compress_gpu_worker_adaptive(
     tasks: Arc<Vec<ScheduledCompressTask>>,
     results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
@@ -6071,6 +5638,10 @@ fn compress_gpu_worker_adaptive(
     wake: Arc<(Mutex<()>, Condvar)>,
     options: &HybridOptions,
     gpu: Arc<GpuAssist>,
+    validation_fallback_chunks: Arc<AtomicUsize>,
+    perf_counters: Arc<SchedulerPerfCounters>,
+    start: Arc<Instant>,
+    timeline: Arc<SchedulerTimeline>,
 ) {
     loop {
         if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
@@ -6082,16 +5653,39 @@ fn compress_gpu_worker_adaptive(
             wait_for_scheduler(&wake);
             continue;
         }
+        if mark_once(&timeline.first_gpu_batch_logged) {
+            log_scheduler_detail(
+                &start,
+                &format!(
+                    "gpu_first_batch chunks={} first_chunk={}",
+                    batch.len(),
+                    tasks[batch[0]].index
+                ),
+            );
+        }
 
+        let gpu_batch_bytes: usize = batch.iter().map(|idx| tasks[*idx].raw.len()).sum();
+        let gpu_batch_start = Instant::now();
         let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
         let compressed_batch = gpu.deflate_fixed_literals_batch(
             &task_data,
             options.compression_mode,
             options.compression_level,
         );
+        let gpu_batch_elapsed_ns = duration_ns_u64(gpu_batch_start.elapsed());
+        perf_counters.gpu_batches.fetch_add(1, Ordering::AcqRel);
+        perf_counters
+            .gpu_work_ns
+            .fetch_add(gpu_batch_elapsed_ns, Ordering::AcqRel);
+        perf_counters
+            .gpu_bytes
+            .fetch_add(gpu_batch_bytes as u64, Ordering::AcqRel);
 
         match compressed_batch {
             Ok(compressed_items) if compressed_items.len() == batch.len() => {
+                perf_counters
+                    .gpu_chunks
+                    .fetch_add(batch.len(), Ordering::AcqRel);
                 for (task_index, compressed) in batch.iter().copied().zip(compressed_items.into_iter()) {
                     let task = &tasks[task_index];
                     let raw_len = match u32::try_from(task.raw.len()) {
@@ -6104,6 +5698,7 @@ fn compress_gpu_worker_adaptive(
                     let encoded = if should_validate_gpu_chunk(options.compression_mode)
                         && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
                     {
+                        validation_fallback_chunks.fetch_add(1, Ordering::AcqRel);
                         match deflate_compress_cpu(&task.raw, options.compression_level) {
                             Ok(cpu_compressed) => ChunkMember {
                                 index: task.index,
@@ -6180,28 +5775,53 @@ fn compress_scheduler_watchdog(
     wake: Arc<(Mutex<()>, Condvar)>,
     cpu_workers: usize,
     start: Arc<Instant>,
+    options: &HybridOptions,
+    demoted_reserved_gpu: Arc<AtomicUsize>,
+    gpu_init_state: Arc<AtomicU8>,
+    timeline: Arc<SchedulerTimeline>,
 ) {
+    let reservation_timeout_ms = gpu_reservation_timeout_ms(options.compression_mode);
     loop {
         if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
             break;
         }
 
+        let gpu_state = gpu_init_state.load(Ordering::Acquire);
         let idle_cpu = cpu_workers.saturating_sub(active_cpu.load(Ordering::Acquire));
-        if idle_cpu > 0 {
+        let demote_budget = if gpu_state == GPU_INIT_STATE_UNAVAILABLE {
+            usize::MAX
+        } else if options.compression_mode == CompressionMode::Ratio {
+            let reserved_count = tasks
+                .iter()
+                .filter(|task| {
+                    task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8
+                })
+                .count();
+            let backlog_excess = reserved_count.saturating_sub(GPU_RATIO_RESERVED_TARGET_CHUNKS);
+            // In Ratio mode, demote only when GPU reservation backlog is excessive.
+            backlog_excess.min(GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS)
+        } else {
+            idle_cpu
+        };
+
+        if demote_budget > 0 {
             let now_ms = monotonic_ms(&start);
             let mut demoted = 0usize;
             for task in tasks.iter() {
-                if demoted >= idle_cpu {
+                if demoted >= demote_budget {
                     break;
                 }
                 if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8 {
                     let reserved_at = task.reserved_at_ms.load(Ordering::Acquire);
-                    if now_ms.saturating_sub(reserved_at) >= GPU_RESERVATION_TIMEOUT_MS
+                    let demote_now = gpu_state == GPU_INIT_STATE_UNAVAILABLE
+                        || gpu_state == GPU_INIT_STATE_INITIALIZING
+                        || now_ms.saturating_sub(reserved_at) >= reservation_timeout_ms;
+                    if demote_now
                         && task
                             .state
                             .compare_exchange(
                                 CompressTaskState::ReservedGpu as u8,
-                                CompressTaskState::Pending as u8,
+                                CompressTaskState::DemotedCpu as u8,
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -6212,6 +5832,13 @@ fn compress_scheduler_watchdog(
                 }
             }
             if demoted > 0 {
+                if gpu_state == GPU_INIT_STATE_INITIALIZING && mark_once(&timeline.init_demote_logged) {
+                    log_scheduler_detail(
+                        &start,
+                        &format!("demote_during_init count={}", demoted),
+                    );
+                }
+                demoted_reserved_gpu.fetch_add(demoted, Ordering::AcqRel);
                 wake.1.notify_all();
             }
         }
@@ -6225,7 +5852,39 @@ fn monotonic_ms(start: &Instant) -> u64 {
     elapsed.min(u128::from(u64::MAX)) as u64
 }
 
+fn duration_ns_u64(duration: Duration) -> u64 {
+    let nanos = duration.as_nanos();
+    nanos.min(u128::from(u64::MAX)) as u64
+}
+
+fn log_scheduler_detail(start: &Instant, message: &str) {
+    if !(timing_profile_enabled() && timing_profile_detail_enabled()) {
+        return;
+    }
+    eprintln!(
+        "[cozip][timing][scheduler-detail] t_ms={} {}",
+        monotonic_ms(start),
+        message
+    );
+}
+
 fn claim_cpu_task(tasks: &[ScheduledCompressTask], gpu_min_chunk_size: usize) -> Option<usize> {
+    for (index, task) in tasks.iter().enumerate() {
+        if task.state.load(Ordering::Acquire) == CompressTaskState::DemotedCpu as u8
+            && task
+                .state
+                .compare_exchange(
+                    CompressTaskState::DemotedCpu as u8,
+                    CompressTaskState::RunningCpu as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            return Some(index);
+        }
+    }
+
     for (index, task) in tasks.iter().enumerate() {
         if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
             && (!task.preferred_gpu || task.raw.len() < gpu_min_chunk_size)
