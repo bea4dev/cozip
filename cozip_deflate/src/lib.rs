@@ -1328,8 +1328,9 @@ fn main(
 
             if (token_len[pos] >= 3u && token_dist[pos] > 0u) {
                 let mlen = min(token_len[pos], seg_end - pos);
-                var take_match = true;
-                if (lazy_delta > 0u && (pos + 1u) < seg_end && token_len[pos + 1u] >= 3u && token_dist[pos + 1u] > 0u) {
+                // Segment tail can clamp to 1-2 bytes; those must stay literals.
+                var take_match = (mlen >= 3u);
+                if (take_match && lazy_delta > 0u && (pos + 1u) < seg_end && token_len[pos + 1u] >= 3u && token_dist[pos + 1u] > 0u) {
                     let next_len = min(token_len[pos + 1u], seg_end - (pos + 1u));
                     if (next_len >= mlen + lazy_delta) {
                         take_match = false;
@@ -1474,8 +1475,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         if (token_len[i] >= 3u && token_dist[i] > 0u) {
             let mlen = min(token_len[i], seg_end - i);
-            var take_match = true;
-            if (lazy_delta > 0u && (i + 1u) < seg_end && token_len[i + 1u] >= 3u && token_dist[i + 1u] > 0u) {
+            // Segment tail can clamp to 1-2 bytes; those must stay literals.
+            var take_match = (mlen >= 3u);
+            if (take_match && lazy_delta > 0u && (i + 1u) < seg_end && token_len[i + 1u] >= 3u && token_dist[i + 1u] > 0u) {
                 let next_len = min(token_len[i + 1u], seg_end - (i + 1u));
                 if (next_len >= mlen + lazy_delta) {
                     take_match = false;
@@ -2630,7 +2632,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let shift = bit_offset & 31u;
 
     atomicOr(&out_words[word_index], code << shift);
-    if (shift + bits > 32u) {
+    // Avoid implementation-defined shift-by-32 when shift == 0 and bits > 32.
+    // The high part for bits > 32 is handled by the code_hi path below.
+    if (shift > 0u && shift + bits > 32u) {
         atomicOr(&out_words[word_index + 1u], code >> (32u - shift));
     }
 
@@ -4728,9 +4732,84 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 compressed.extend_from_slice(&mapped[..total_bytes]);
                 drop(mapped);
                 slots[chunk_index].readback.unmap();
+                if mode == CompressionMode::Ratio && gpu_dynamic_self_check_enabled() {
+                    if let Err(issue) = gpu_chunk_roundtrip_diagnose(chunks[chunk_index], &compressed)
+                    {
+                        let raw_hash = fnv1a64(chunks[chunk_index]);
+                        let gpu_hash = fnv1a64(&compressed);
+                        match &issue {
+                            GpuRoundtripIssue::DecodeFailed(message) => eprintln!(
+                                "[cozip][warn][gpu-dynamic] call={} chunk_index={} raw_len={} gpu_comp_len={} gpu_payload_bytes={} raw_hash={:016x} gpu_hash={:016x} reason=decode_failed msg=\"{}\" action=cpu_fallback",
+                                timing.call_id,
+                                chunk_index,
+                                chunks[chunk_index].len(),
+                                compressed.len(),
+                                total_bytes,
+                                raw_hash,
+                                gpu_hash,
+                                message,
+                            ),
+                            GpuRoundtripIssue::LengthMismatch {
+                                decoded_len,
+                                prefix_match_len,
+                                expected_next,
+                                actual_next,
+                            } => eprintln!(
+                                "[cozip][warn][gpu-dynamic] call={} chunk_index={} raw_len={} gpu_comp_len={} gpu_payload_bytes={} raw_hash={:016x} gpu_hash={:016x} reason=length_mismatch decoded_len={} prefix_match_len={} expected_next={:?} actual_next={:?} action=cpu_fallback",
+                                timing.call_id,
+                                chunk_index,
+                                chunks[chunk_index].len(),
+                                compressed.len(),
+                                total_bytes,
+                                raw_hash,
+                                gpu_hash,
+                                decoded_len,
+                                prefix_match_len,
+                                expected_next,
+                                actual_next,
+                            ),
+                            GpuRoundtripIssue::ContentMismatch {
+                                first_diff,
+                                expected,
+                                actual,
+                            } => eprintln!(
+                                "[cozip][warn][gpu-dynamic] call={} chunk_index={} raw_len={} gpu_comp_len={} gpu_payload_bytes={} raw_hash={:016x} gpu_hash={:016x} reason=content_mismatch first_diff={} expected={} actual={} action=cpu_fallback",
+                                timing.call_id,
+                                chunk_index,
+                                chunks[chunk_index].len(),
+                                compressed.len(),
+                                total_bytes,
+                                raw_hash,
+                                gpu_hash,
+                                first_diff,
+                                expected,
+                                actual,
+                            ),
+                        }
+                        let gpu_compressed = compressed.clone();
+                        let fallback_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        compressed = deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+                        dump_gpu_dynamic_bad_chunk(
+                            timing.call_id,
+                            chunk_index,
+                            chunks[chunk_index],
+                            &gpu_compressed,
+                            &compressed,
+                            &issue,
+                        );
+                        timing.fallback_chunks += 1;
+                        if let Some(start) = fallback_start {
+                            timing.cpu_fallback_ms += elapsed_ms(start);
+                        }
+                    }
+                }
                 timing.output_bytes = timing
                     .output_bytes
-                    .checked_add(total_bytes)
+                    .checked_add(compressed.len())
                     .ok_or(CozipDeflateError::DataTooLarge)?;
                 results[chunk_index] = compressed;
             }
@@ -5232,15 +5311,228 @@ fn gpu_cold_start_reserved_chunks() -> usize {
     })
 }
 
-fn should_validate_gpu_chunk(mode: CompressionMode) -> bool {
-    mode != CompressionMode::Speed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuValidationMode {
+    Always,
+    Sample,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GpuValidationConfig {
+    mode: GpuValidationMode,
+    sample_every: usize,
+}
+
+fn gpu_validation_config() -> GpuValidationConfig {
+    static VALUE: OnceLock<GpuValidationConfig> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let mode = match std::env::var("COZIP_GPU_VALIDATION_MODE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("always") => GpuValidationMode::Always,
+            Some("off") => GpuValidationMode::Off,
+            Some("sample") => GpuValidationMode::Sample,
+            _ => GpuValidationMode::Always,
+        };
+
+        let sample_every = std::env::var("COZIP_GPU_VALIDATION_SAMPLE_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1);
+
+        GpuValidationConfig { mode, sample_every }
+    })
+}
+
+fn gpu_dynamic_self_check_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(raw) = std::env::var("COZIP_GPU_DYNAMIC_SELF_CHECK") else {
+            return true;
+        };
+        let v = raw.trim().to_ascii_lowercase();
+        !matches!(v.as_str(), "0" | "false" | "no" | "off")
+    })
+}
+
+fn should_validate_gpu_chunk(mode: CompressionMode, chunk_index: usize) -> bool {
+    if mode == CompressionMode::Speed {
+        return false;
+    }
+    if mode == CompressionMode::Ratio && gpu_dynamic_self_check_enabled() {
+        // Ratio mode uses dynamic GPU path; that path performs its own per-chunk
+        // roundtrip guard and CPU fallback before returning compressed bytes.
+        return false;
+    }
+
+    let config = gpu_validation_config();
+    match config.mode {
+        GpuValidationMode::Always => true,
+        GpuValidationMode::Off => false,
+        GpuValidationMode::Sample => chunk_index % config.sample_every == 0,
+    }
+}
+
+#[derive(Debug)]
+enum GpuRoundtripIssue {
+    DecodeFailed(String),
+    LengthMismatch {
+        decoded_len: usize,
+        prefix_match_len: usize,
+        expected_next: Option<u8>,
+        actual_next: Option<u8>,
+    },
+    ContentMismatch {
+        first_diff: usize,
+        expected: u8,
+        actual: u8,
+    },
+}
+
+fn gpu_chunk_roundtrip_diagnose(raw: &[u8], compressed: &[u8]) -> Result<(), GpuRoundtripIssue> {
+    let decoded = deflate_decompress_cpu(compressed)
+        .map_err(|err| GpuRoundtripIssue::DecodeFailed(err.to_string()))?;
+    if decoded.len() != raw.len() {
+        let prefix_match_len = decoded
+            .iter()
+            .zip(raw.iter())
+            .position(|(lhs, rhs)| lhs != rhs)
+            .unwrap_or(decoded.len().min(raw.len()));
+        return Err(GpuRoundtripIssue::LengthMismatch {
+            decoded_len: decoded.len(),
+            prefix_match_len,
+            expected_next: raw.get(prefix_match_len).copied(),
+            actual_next: decoded.get(prefix_match_len).copied(),
+        });
+    }
+    if decoded != raw {
+        let first_diff = decoded
+            .iter()
+            .zip(raw.iter())
+            .position(|(lhs, rhs)| lhs != rhs)
+            .unwrap_or(0);
+        return Err(GpuRoundtripIssue::ContentMismatch {
+            first_diff,
+            expected: raw[first_diff],
+            actual: decoded[first_diff],
+        });
+    }
+    Ok(())
 }
 
 fn gpu_chunk_roundtrip_matches(raw: &[u8], compressed: &[u8]) -> bool {
-    match deflate_decompress_cpu(compressed) {
-        Ok(decoded) => decoded == raw,
-        Err(_) => false,
+    gpu_chunk_roundtrip_diagnose(raw, compressed).is_ok()
+}
+
+fn gpu_dynamic_dump_bad_chunk_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(raw) = std::env::var("COZIP_GPU_DUMP_BAD_CHUNK") else {
+            return false;
+        };
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn gpu_dynamic_dump_bad_chunk_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("COZIP_GPU_DUMP_BAD_CHUNK_LIMIT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+    })
+}
+
+fn gpu_dynamic_dump_bad_chunk_dir() -> String {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        std::env::var("COZIP_GPU_DUMP_BAD_CHUNK_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/tmp/cozip_gpu_bad_chunks".to_string())
+    })
+    .clone()
+}
+
+fn fnv1a64(data: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
     }
+    hash
+}
+
+fn dump_gpu_dynamic_bad_chunk(
+    call_id: u64,
+    chunk_index: usize,
+    raw: &[u8],
+    gpu_compressed: &[u8],
+    cpu_fallback: &[u8],
+    issue: &GpuRoundtripIssue,
+) {
+    if !gpu_dynamic_dump_bad_chunk_enabled() {
+        return;
+    }
+    static DUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    if seq >= gpu_dynamic_dump_bad_chunk_limit() {
+        return;
+    }
+    let dir = gpu_dynamic_dump_bad_chunk_dir();
+    let dir_path = std::path::Path::new(&dir);
+    if std::fs::create_dir_all(dir_path).is_err() {
+        return;
+    }
+    let base = format!("call{:04}_chunk{:04}_seq{:03}", call_id, chunk_index, seq);
+    let raw_path = dir_path.join(format!("{base}.raw.bin"));
+    let gpu_path = dir_path.join(format!("{base}.gpu.bin"));
+    let cpu_path = dir_path.join(format!("{base}.cpu_fallback.bin"));
+    let meta_path = dir_path.join(format!("{base}.meta.txt"));
+    if std::fs::write(&raw_path, raw).is_err()
+        || std::fs::write(&gpu_path, gpu_compressed).is_err()
+        || std::fs::write(&cpu_path, cpu_fallback).is_err()
+    {
+        return;
+    }
+    let issue_text = match issue {
+        GpuRoundtripIssue::DecodeFailed(message) => format!("decode_failed: {message}"),
+        GpuRoundtripIssue::LengthMismatch {
+            decoded_len,
+            prefix_match_len,
+            expected_next,
+            actual_next,
+        } => format!(
+            "length_mismatch decoded_len={decoded_len} prefix_match_len={prefix_match_len} expected_next={expected_next:?} actual_next={actual_next:?}"
+        ),
+        GpuRoundtripIssue::ContentMismatch {
+            first_diff,
+            expected,
+            actual,
+        } => format!(
+            "content_mismatch first_diff={first_diff} expected={expected} actual={actual}"
+        ),
+    };
+    let mut meta = String::new();
+    meta.push_str(&format!("call_id={call_id}\n"));
+    meta.push_str(&format!("chunk_index={chunk_index}\n"));
+    meta.push_str(&format!("issue={issue_text}\n"));
+    meta.push_str(&format!("raw_len={}\n", raw.len()));
+    meta.push_str(&format!("gpu_len={}\n", gpu_compressed.len()));
+    meta.push_str(&format!("cpu_fallback_len={}\n", cpu_fallback.len()));
+    meta.push_str(&format!("raw_fnv1a64={:016x}\n", fnv1a64(raw)));
+    meta.push_str(&format!("gpu_fnv1a64={:016x}\n", fnv1a64(gpu_compressed)));
+    meta.push_str(&format!("cpu_fallback_fnv1a64={:016x}\n", fnv1a64(cpu_fallback)));
+    let _ = std::fs::write(meta_path, meta);
 }
 
 fn build_chunk_tasks(
@@ -5695,7 +5987,7 @@ fn compress_gpu_worker_adaptive(
                             return;
                         }
                     };
-                    let encoded = if should_validate_gpu_chunk(options.compression_mode)
+                    let encoded = if should_validate_gpu_chunk(options.compression_mode, task.index)
                         && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
                     {
                         validation_fallback_chunks.fetch_add(1, Ordering::AcqRel);
@@ -6214,7 +6506,7 @@ fn compress_chunk_gpu_batch(
     let mut out = Vec::with_capacity(tasks.len());
     for (task, compressed) in tasks.iter().zip(compressed_batch.into_iter()) {
         let raw_len = u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
-        let member = if should_validate_gpu_chunk(options.compression_mode)
+        let member = if should_validate_gpu_chunk(options.compression_mode, task.index)
             && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
         {
             let cpu_compressed = deflate_compress_cpu(&task.raw, options.compression_level)?;
@@ -6428,6 +6720,15 @@ fn decode_descriptor_cpu(
     };
 
     if raw.len() != descriptor.raw_len as usize {
+        eprintln!(
+            "[cozip][error] cpu_decode_len_mismatch index={} backend={:?} codec={:?} raw_len={} decoded_len={} compressed_len={}",
+            descriptor.index,
+            descriptor.backend,
+            descriptor.codec,
+            descriptor.raw_len,
+            raw.len(),
+            descriptor.compressed.len(),
+        );
         return Err(CozipDeflateError::InvalidFrame(
             "raw chunk length mismatch in cpu path",
         ));
@@ -6454,6 +6755,15 @@ fn decode_descriptor_gpu(
     };
 
     if raw.len() != descriptor.raw_len as usize {
+        eprintln!(
+            "[cozip][error] gpu_decode_len_mismatch index={} backend={:?} codec={:?} raw_len={} decoded_len={} compressed_len={}",
+            descriptor.index,
+            descriptor.backend,
+            descriptor.codec,
+            descriptor.raw_len,
+            raw.len(),
+            descriptor.compressed.len(),
+        );
         return Err(CozipDeflateError::InvalidFrame(
             "raw chunk length mismatch in gpu path",
         ));
