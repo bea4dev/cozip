@@ -1054,3 +1054,31 @@ mode別GPU品質パラメータ:
 
 メモ:
 - 2D flatten の stride は `global_invocation_id.x` の性質上、workgroup_size込みで設定する必要がある。
+
+## 2026-02-24 - dynamic側バッチ最適化（phase分離）
+
+目的:
+- dynamic Huffman 経路のチャンク毎 `submit->map->wait` を削減し、GPU待機点を減らす。
+
+変更:
+- `deflate_dynamic_hybrid_batch` を2段階バッチに再構成
+  1. Phase1: tokenize/finalize/freq を複数チャンクまとめて submit
+     - 周期: `GPU_PIPELINED_SUBMIT_CHUNKS`
+     - submit後に freq readback を map 予約し、最後に一括 `poll(Wait)` で回収
+  2. Phase2: CPUで Huffman plan 生成後、dyn_map/bitpack/finalize を複数チャンクまとめて submit
+     - 同様に readback map を束ね、最後に一括回収
+- 追加した内部構造体
+  - `PendingDynFreqReadback`
+  - `PreparedDynamicPack`
+  - `PendingDynPackReadback`
+
+期待効果:
+- dynamic経路での同期オーバーヘッド低減
+- チャンク数が増えたときの submit/wait の効率化
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo test -p cozip_deflate --lib` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+- `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 1 --chunk-mib 4 --gpu-subchunk-kib 256 --mode ratio --gpu-fraction 1.0`
+  - 実行成功（roundtrip OK）

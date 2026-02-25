@@ -3644,8 +3644,46 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             return Ok(Vec::new());
         }
 
+        struct PendingDynFreqReadback {
+            chunk_index: usize,
+            slot_index: usize,
+            litlen_freq_readback: wgpu::Buffer,
+            dist_freq_readback: wgpu::Buffer,
+            litlen_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+            dist_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        }
+
+        struct PreparedDynamicPack {
+            chunk_index: usize,
+            slot_index: usize,
+            len_u32: u32,
+            header_bits: u32,
+            header_bytes: Vec<u8>,
+            dyn_table: Vec<u32>,
+            eob_code: u16,
+            eob_bits: u8,
+        }
+
+        struct PendingDynPackReadback {
+            chunk_index: usize,
+            slot_index: usize,
+            output_storage_size: u64,
+            receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+        }
+
         let mut results = vec![Vec::new(); chunks.len()];
         let mut slots = lock(&self.deflate_slots)?;
+        let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
+        let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
+
+        let mut freq_pending: Vec<PendingDynFreqReadback> = Vec::new();
+        let mut staged_freq_readbacks: Vec<(usize, usize, wgpu::Buffer, wgpu::Buffer)> = Vec::new();
+        let mut freq_submit_chunk_count = 0usize;
+        let mut freq_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-deflate-dynamic-freq-batch-encoder"),
+            });
 
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
@@ -3662,8 +3700,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             let slot = &slots[chunk_index];
-            let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
-            let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
+            let slot_index = chunk_index;
 
             let input_words = len.div_ceil(std::mem::size_of::<u32>());
             if data.len() % std::mem::size_of::<u32>() == 0 {
@@ -3697,18 +3734,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 mapped_at_creation: false,
             });
 
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("cozip-deflate-dynamic-batch-encoder"),
-                });
-
-            encoder.clear_buffer(&slot.litlen_freq_buffer, 0, None);
-            encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
+            freq_encoder.clear_buffer(&slot.litlen_freq_buffer, 0, None);
+            freq_encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
 
             {
                 let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-tokenize-pass"),
                     timestamp_writes: None,
                 });
@@ -3720,7 +3751,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             {
                 let (dispatch_x, dispatch_y) =
                     dispatch_grid_for_items(len, TOKEN_FINALIZE_SEGMENT_SIZE)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-token-finalize-pass"),
                     timestamp_writes: None,
                 });
@@ -3731,7 +3762,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             {
                 let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-freq-pass"),
                     timestamp_writes: None,
                 });
@@ -3740,14 +3771,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
-            encoder.copy_buffer_to_buffer(
+            freq_encoder.copy_buffer_to_buffer(
                 &slot.litlen_freq_buffer,
                 0,
                 &litlen_freq_readback,
                 0,
                 litlen_freq_size,
             );
-            encoder.copy_buffer_to_buffer(
+            freq_encoder.copy_buffer_to_buffer(
                 &slot.dist_freq_buffer,
                 0,
                 &dist_freq_readback,
@@ -3755,32 +3786,88 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 dist_freq_size,
             );
 
-            self.queue.submit(Some(encoder.finish()));
+            staged_freq_readbacks.push((
+                chunk_index,
+                slot_index,
+                litlen_freq_readback,
+                dist_freq_readback,
+            ));
+            freq_submit_chunk_count += 1;
 
-            let map_buffer = |buffer: &wgpu::Buffer| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx.send(result);
-                });
-                rx
-            };
-
-            let litlen_freq_rx = map_buffer(&litlen_freq_readback);
-            let dist_freq_rx = map_buffer(&dist_freq_readback);
-
-            self.device.poll(wgpu::Maintain::Wait);
-
-            for rx in [litlen_freq_rx, dist_freq_rx] {
-                match rx.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                    Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            if freq_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+                self.queue.submit(Some(freq_encoder.finish()));
+                for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
+                    staged_freq_readbacks.drain(..)
+                {
+                    let (lit_tx, lit_rx) = std::sync::mpsc::channel();
+                    lit_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = lit_tx.send(result);
+                    });
+                    let (dist_tx, dist_rx) = std::sync::mpsc::channel();
+                    dist_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = dist_tx.send(result);
+                    });
+                    freq_pending.push(PendingDynFreqReadback {
+                        chunk_index: pending_chunk_index,
+                        slot_index: pending_slot_index,
+                        litlen_freq_readback: lit_rb,
+                        dist_freq_readback: dist_rb,
+                        litlen_receiver: lit_rx,
+                        dist_receiver: dist_rx,
+                    });
                 }
+                self.device.poll(wgpu::Maintain::Poll);
+                freq_encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("cozip-deflate-dynamic-freq-batch-encoder"),
+                    });
+                freq_submit_chunk_count = 0;
+            }
+        }
+
+        if freq_submit_chunk_count > 0 {
+            self.queue.submit(Some(freq_encoder.finish()));
+            for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
+                staged_freq_readbacks.drain(..)
+            {
+                let (lit_tx, lit_rx) = std::sync::mpsc::channel();
+                lit_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = lit_tx.send(result);
+                });
+                let (dist_tx, dist_rx) = std::sync::mpsc::channel();
+                dist_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = dist_tx.send(result);
+                });
+                freq_pending.push(PendingDynFreqReadback {
+                    chunk_index: pending_chunk_index,
+                    slot_index: pending_slot_index,
+                    litlen_freq_readback: lit_rb,
+                    dist_freq_readback: dist_rb,
+                    litlen_receiver: lit_rx,
+                    dist_receiver: dist_rx,
+                });
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(freq_pending.len());
+        if !freq_pending.is_empty() {
+            self.device.poll(wgpu::Maintain::Wait);
+        }
+        for pending in freq_pending {
+            match pending.litlen_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            }
+            match pending.dist_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
 
-            let litlen_freq_map = litlen_freq_readback.slice(..).get_mapped_range();
-            let dist_freq_map = dist_freq_readback.slice(..).get_mapped_range();
-
+            let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
+            let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
             let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
             let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
             let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
@@ -3789,8 +3876,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
             drop(litlen_freq_map);
             drop(dist_freq_map);
-            litlen_freq_readback.unmap();
-            dist_freq_readback.unmap();
+            pending.litlen_freq_readback.unmap();
+            pending.dist_freq_readback.unmap();
 
             let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
             let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
@@ -3798,22 +3885,53 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             dyn_table.extend_from_slice(&plan.litlen_bits);
             dyn_table.extend_from_slice(&plan.dist_codes);
             dyn_table.extend_from_slice(&plan.dist_bits);
+
+            let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            prepared.push(PreparedDynamicPack {
+                chunk_index: pending.chunk_index,
+                slot_index: pending.slot_index,
+                len_u32,
+                header_bits: plan.header_bits,
+                header_bytes: plan.header_bytes,
+                dyn_table,
+                eob_code: plan.eob_code,
+                eob_bits: plan.eob_bits,
+            });
+        }
+
+        let mut pack_pending: Vec<PendingDynPackReadback> = Vec::with_capacity(prepared.len());
+        let mut staged_pack: Vec<(usize, usize, u64)> = Vec::new();
+        let mut pack_submit_chunk_count = 0usize;
+        let mut pack_encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-deflate-dynamic-pack-batch-encoder"),
+            });
+
+        for item in prepared {
+            let slot = &slots[item.slot_index];
             self.queue
-                .write_buffer(&slot.dyn_table_buffer, 0, bytemuck::cast_slice(&dyn_table));
-            let meta = [plan.header_bits, u32::from(plan.eob_code), u32::from(plan.eob_bits), 0];
+                .write_buffer(&slot.dyn_table_buffer, 0, bytemuck::cast_slice(&item.dyn_table));
+            let meta = [
+                item.header_bits,
+                u32::from(item.eob_code),
+                u32::from(item.eob_bits),
+                0,
+            ];
             self.queue
                 .write_buffer(&slot.dyn_meta_buffer, 0, bytemuck::cast_slice(&meta));
             let params = [
-                len_u32,
+                item.len_u32,
                 u32::try_from(TOKEN_FINALIZE_SEGMENT_SIZE)
                     .map_err(|_| CozipDeflateError::DataTooLarge)?,
                 compression_mode_id(mode),
-                plan.header_bits,
+                item.header_bits,
             ];
             self.queue
                 .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
-            let header_words = plan.header_bytes.len().div_ceil(std::mem::size_of::<u32>());
+            let header_words = item.header_bytes.len().div_ceil(std::mem::size_of::<u32>());
             let header_copy_size = bytes_len::<u32>(header_words)?;
             let header_copy_size_usize =
                 usize::try_from(header_copy_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
@@ -3821,7 +3939,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 return Err(CozipDeflateError::DataTooLarge);
             }
             let mut header_padded = vec![0_u8; header_copy_size_usize];
-            header_padded[..plan.header_bytes.len()].copy_from_slice(&plan.header_bytes);
+            header_padded[..item.header_bytes.len()].copy_from_slice(&item.header_bytes);
             let header_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("cozip-deflate-dyn-header"),
                 size: header_copy_size,
@@ -3830,18 +3948,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             });
             self.queue.write_buffer(&header_staging, 0, &header_padded);
 
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("cozip-deflate-dynamic-pack-encoder"),
-                });
-
-            encoder.clear_buffer(&slot.token_total_buffer, 0, None);
-            encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
-            encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
-            encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
-            encoder.clear_buffer(&slot.output_words_buffer, 0, None);
-            encoder.copy_buffer_to_buffer(
+            pack_encoder.clear_buffer(&slot.token_total_buffer, 0, None);
+            pack_encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
+            pack_encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
+            pack_encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
+            pack_encoder.clear_buffer(&slot.output_words_buffer, 0, None);
+            pack_encoder.copy_buffer_to_buffer(
                 &header_staging,
                 0,
                 &slot.output_words_buffer,
@@ -3850,17 +3962,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             );
 
             self.dispatch_parallel_prefix_scan(
-                &mut encoder,
+                &mut pack_encoder,
                 &slot.token_flags_buffer,
                 &slot.token_prefix_buffer,
                 &slot.token_total_buffer,
-                len,
+                item.len_u32 as usize,
                 "token-prefix-dynamic",
             )?;
 
             {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let (dispatch_x, dispatch_y) =
+                    dispatch_grid_for_items(item.len_u32 as usize, 128)?;
+                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-dyn-map-pass"),
                     timestamp_writes: None,
                 });
@@ -3870,17 +3983,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             self.dispatch_parallel_prefix_scan(
-                &mut encoder,
+                &mut pack_encoder,
                 &slot.bitlens_buffer,
                 &slot.bit_offsets_buffer,
                 &slot.total_bits_buffer,
-                len,
+                item.len_u32 as usize,
                 "bitlen-prefix-dynamic",
             )?;
 
             {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let (dispatch_x, dispatch_y) =
+                    dispatch_grid_for_items(item.len_u32 as usize, 128)?;
+                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-bitpack-pass"),
                     timestamp_writes: None,
                 });
@@ -3890,7 +4004,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-dyn-finalize-pass"),
                     timestamp_writes: None,
                 });
@@ -3899,8 +4013,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 pass.dispatch_workgroups(1, 1, 1);
             }
 
-            encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
-            encoder.copy_buffer_to_buffer(
+            pack_encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
+            pack_encoder.copy_buffer_to_buffer(
                 &slot.output_words_buffer,
                 0,
                 &slot.readback,
@@ -3908,23 +4022,72 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 slot.output_storage_size,
             );
 
-            self.queue.submit(Some(encoder.finish()));
+            staged_pack.push((item.chunk_index, item.slot_index, slot.output_storage_size));
+            pack_submit_chunk_count += 1;
 
-            let (tx, rx) = std::sync::mpsc::channel();
-            slot.readback
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let _ = tx.send(result);
+            if pack_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+                self.queue.submit(Some(pack_encoder.finish()));
+                for (pending_chunk_index, pending_slot_index, output_storage_size) in
+                    staged_pack.drain(..)
+                {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slots[pending_slot_index]
+                        .readback
+                        .slice(..)
+                        .map_async(wgpu::MapMode::Read, move |result| {
+                            let _ = tx.send(result);
+                        });
+                    pack_pending.push(PendingDynPackReadback {
+                        chunk_index: pending_chunk_index,
+                        slot_index: pending_slot_index,
+                        output_storage_size,
+                        receiver: rx,
+                    });
+                }
+                self.device.poll(wgpu::Maintain::Poll);
+                pack_encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("cozip-deflate-dynamic-pack-batch-encoder"),
+                    });
+                pack_submit_chunk_count = 0;
+            }
+        }
+
+        if pack_submit_chunk_count > 0 {
+            self.queue.submit(Some(pack_encoder.finish()));
+            for (pending_chunk_index, pending_slot_index, output_storage_size) in
+                staged_pack.drain(..)
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                slots[pending_slot_index]
+                    .readback
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        let _ = tx.send(result);
+                    });
+                pack_pending.push(PendingDynPackReadback {
+                    chunk_index: pending_chunk_index,
+                    slot_index: pending_slot_index,
+                    output_storage_size,
+                    receiver: rx,
                 });
+            }
+        }
+
+        if !pack_pending.is_empty() {
             self.device.poll(wgpu::Maintain::Wait);
-            match rx.recv() {
+        }
+        for pending in pack_pending {
+            match pending.receiver.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
                 Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
             }
-
-            results[chunk_index] =
-                collect_deflate_readback_dynamic(&slots[chunk_index], slots[chunk_index].output_storage_size)?;
+            results[pending.chunk_index] = collect_deflate_readback_dynamic(
+                &slots[pending.slot_index],
+                pending.output_storage_size,
+            )?;
         }
 
         Ok(results)
