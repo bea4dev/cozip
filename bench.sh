@@ -201,8 +201,14 @@ for mode in "${MODE_LIST[@]}"; do
     echo | tee -a "${LOG_FILE}"
   done
 
-  comp_speedup_values="$(rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" | sed -E 's/.*compress=([0-9.]+)x.*/\1/')"
-  decomp_speedup_values="$(rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" | sed -E 's/.*decompress=([0-9.]+)x.*/\1/')"
+  comp_speedup_values="$(
+    rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" \
+      | sed -E 's/.* compress=([0-9.]+)x decompress=.*/\1/'
+  )"
+  decomp_speedup_values="$(
+    rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" \
+      | sed -E 's/.* decompress=([0-9.]+)x.*/\1/'
+  )"
   cpu_comp_values="$(rg '^CPU_ONLY:' "${LOG_FILE}" | sed -E 's/.*avg_comp_ms=([0-9.]+).*/\1/')"
   hybrid_comp_values="$(rg '^CPU\+GPU :' "${LOG_FILE}" | sed -E 's/.*avg_comp_ms=([0-9.]+).*/\1/')"
   gpu_chunks_values="$(rg '^CPU\+GPU :' "${LOG_FILE}" | sed -E 's/.*gpu_chunks=([0-9]+).*/\1/')"

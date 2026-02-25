@@ -1367,3 +1367,61 @@ mode別GPU品質パラメータ:
 運用ルール（今後）:
 - 速度ベンチマークは、原則としてユーザー実機で `./bench.sh` を実行して取得した結果を採用する。
 - 評価比較時は `runs>=5`, `iters=1`, `warmups=0` を基本条件にする（zip実運用前提）。
+
+## 2026-02-25 - 今後の最適化候補（優先順）
+
+1. GPU phase1の1パス化（最優先）
+- `tokenize -> finalize -> freq` の複数段をできるだけ統合し、グローバルメモリ往復を削減する。
+- ワークグループ内ヒストグラム（shared memory）で集計し、最後だけglobalに反映する。
+- 期待効果（目安）: 圧縮で `+10〜25%`。
+
+2. `token_finalize` の並列prefix-scan化
+- 直列/疑似直列部分を subgroup + workgroup scan に置換する。
+- 期待効果（目安）: 圧縮で `+5〜15%`。
+
+3. GPUバッチの二重バッファ重畳（submit/collect分離）
+- batch N の待ち中に batch N+1 を投入し、CPU側処理も並行させる。
+- `t_freq_poll_wait_ms` を全体時間に埋め込む設計にする。
+- 期待効果（目安）: 圧縮で `+5〜15%`。
+
+## 2026-02-25 - 1. GPU phase1最適化に着手（fused phase1パス）
+
+目的:
+- dynamic経路の `tokenize -> token_finalize -> freq` のうち、phase1を統合してGPUパスの往復を削減する。
+
+今回の実装（着手版）:
+- 新規 `phase1_fused` compute pipeline を追加。
+- 各セグメント（`TOKEN_FINALIZE_SEGMENT_SIZE`）を1 workgroupが担当し、同一パス内で以下を実行:
+  1. token候補生成（旧tokenize相当）
+  2. lazy判定付き確定（旧token_finalize相当）
+  3. litlen/dist頻度集計（workgroupローカル集計後にglobalへ反映）
+- dynamic圧縮経路 `deflate_dynamic_hybrid_batch()` では、phase1を
+  - 旧: tokenize pass + finalize pass + freq pass
+  - 新: phase1_fused pass
+  に置換。
+- 旧 `tokenize/token_finalize/freq` pipeline は deep probe 用の互換経路として維持。
+
+補足:
+- 今回は「1.の着手」として、phase1統合を先に導入。
+- 期待していた「完全1パス化」の方向に沿うが、検証容易性のため既存probe資産は保持している。
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo test -p cozip_deflate -- --nocapture` 通過（integration含む）
+- `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0` 実行確認（roundtrip成立）
+
+## 2026-02-25 - bench.sh speedup集計バグ修正
+
+事象:
+- `bench.sh` の summary で `speedup_compress_x` と `speedup_decompress_x` が同値になることがあった。
+
+原因:
+- `sed` 抽出式の `.*` が貪欲で、`compress=` 側抽出時に後ろの `decompress=` 側の値を拾っていた。
+
+修正:
+- `bench.sh` の speedup抽出を以下へ変更:
+  - compress: `s/.* compress=([0-9.]+)x decompress=.*/\1/`
+  - decompress: `s/.* decompress=([0-9.]+)x.*/\1/`
+
+補足:
+- これにより `compress` / `decompress` の集計値は独立して算出される。
