@@ -1410,6 +1410,58 @@ mode別GPU品質パラメータ:
 - `cargo test -p cozip_deflate -- --nocapture` 通過（integration含む）
 - `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0` 実行確認（roundtrip成立）
 
+## 2026-02-25 - 2. token_finalize 並列化（phase1内）
+
+目的:
+- phase1 fused パス内で、直列 finalize 部分を並列化してGPU実行時間を短縮する。
+
+実装:
+- phase1 fused shader の finalize を以下に変更:
+  1. 各laneで lazy判定（`mode_lazy_delta`）を並列実行し、弱い候補を事前に無効化。
+  2. 「所有権クレーム」方式で overlap 解決を並列化:
+     - `token_flags` を一時的に owner バッファとして使用。
+     - 候補match `[i, i+len)` に対して `atomicMin(owner[p], i)` で最左startを確定。
+  3. owner結果から最終 token を並列確定:
+     - `owner == 0xFFFFFFFF`: literal
+     - `owner == i`: match start
+     - それ以外: covered byte（非start）
+  4. litlen/dist頻度は workgroup ローカル atomic histogram に並列集計し、最後にglobalへ集約。
+
+設計上の注意:
+- `max_storage_buffers_per_shader_stage=8` 制約回避のため、追加ownerバッファは導入せず `token_flags` を再利用。
+- finalize後に `token_flags` は 0/1 へ再設定するため後段互換は維持。
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo test -p cozip_deflate -- --nocapture` 通過
+
+追記（同日）:
+- ユーザー実機ベンチで `gpu_chunks=0` が継続し、compressが悪化（`speedup_compress_x < 1.0`）。
+- 原因は本実装の並列 finalize（ownerクレーム方式）により、ratio検証でGPU結果が不一致となり CPU フォールバックへ落ちること。
+- 対応として、phase1 fused 内の finalize は一旦「直列確定ロジック」に戻した（`1.`のfused phase1のみ維持）。
+- 以後 `2.` は「再設計が必要な未完了項目」として扱う。
+
+## 2026-02-25 - 2. token_finalize 再設計（prefix-scan系の状態伝播）
+
+目的:
+- ownerクレーム方式の不一致を避けつつ、finalizeを並列化する。
+
+実装（再設計版）:
+- phase1 fused shader 内 finalize を「レーン分割 + skip状態伝播」へ変更。
+  1. lazy判定を全laneで並列に事前適用（`token_len/token_dist` を無効化）。
+  2. セグメントを 128 lane に等分し、各laneが「入力 skip 値 -> 出力 skip 値」の遷移テーブル（幅33）を作成。
+  3. lane間の入力 skip を先頭laneから伝播（scan相当のcarry計算）し、各laneの初期状態を確定。
+  4. 各laneが自区間を独立に finalize（match/literal確定）して `token_flags/kind/len/dist` を確定。
+  5. litlen/dist頻度は workgroup local atomic histogram に並列加算し、最後にglobalへ反映。
+
+補足:
+- `token_flags` は phase1 fused shader 内のみ `array<atomic<u32>>` として扱い、`atomicStore` で 0/1 を確定。
+- 既存bind group構成（StorageBuffer本数）を増やさない形で実装。
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo test -p cozip_deflate -- --nocapture` 通過
+
 ## 2026-02-25 - bench.sh speedup集計バグ修正
 
 事象:
@@ -1425,3 +1477,18 @@ mode別GPU品質パラメータ:
 
 補足:
 - これにより `compress` / `decompress` の集計値は独立して算出される。
+
+## 2026-02-25 - 2.差し戻し後に3. submit/collect重畳を再着手
+
+目的:
+- `2.`（token_finalize 並列化）を戻した状態で、`3.`（submit/collect 分離の重畳）を進める。
+
+実装:
+- `deflate_dynamic_hybrid_batch` の freq 段で `VecDeque` を使った pending 管理を維持。
+- submit 側で pending が「2wave以上」溜まった時点で、古い 1wave をその場で collect+plan。
+- 重畳 collect 前に `device.poll(Maintain::Wait)` を入れ、map_async 完了待ちを明示。
+- `prepared` の寿命を freq ループ全体に拡張し、未初期化参照バグを修正。
+
+確認:
+- `cargo check -p cozip_deflate` 通過。
+- `cargo test -p cozip_deflate -- --nocapture` 通過。

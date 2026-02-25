@@ -4748,7 +4748,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
         let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
 
-        let mut freq_pending: Vec<PendingDynFreqReadback> = Vec::new();
+        let mut freq_pending: VecDeque<PendingDynFreqReadback> = VecDeque::new();
+        let mut prepared: Vec<PreparedDynamicPack> = Vec::with_capacity(chunks.len().max(1));
         let mut staged_freq_readbacks: Vec<(usize, usize, wgpu::Buffer, wgpu::Buffer)> = Vec::new();
         let mut freq_submit_chunk_count = 0usize;
         let mut freq_encoder = self
@@ -4874,7 +4875,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     dist_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
                         let _ = dist_tx.send(result);
                     });
-                    freq_pending.push(PendingDynFreqReadback {
+                    freq_pending.push_back(PendingDynFreqReadback {
                         chunk_index: pending_chunk_index,
                         slot_index: pending_slot_index,
                         litlen_freq_readback: lit_rb,
@@ -4884,6 +4885,96 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     });
                 }
                 self.device.poll(wgpu::Maintain::Poll);
+                // Overlap: if two freq waves are in flight, collect+plan one older wave now.
+                if freq_pending.len() >= GPU_PIPELINED_SUBMIT_CHUNKS * 2 {
+                    let freq_poll_wait_start = if timing_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    self.device.poll(wgpu::Maintain::Wait);
+                    if let Some(start) = freq_poll_wait_start {
+                        timing.freq_poll_wait_ms += elapsed_ms(start);
+                    }
+                    let mut drained = 0usize;
+                    while drained < GPU_PIPELINED_SUBMIT_CHUNKS {
+                        let Some(pending) = freq_pending.pop_front() else {
+                            break;
+                        };
+                        let freq_recv_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        match pending.litlen_receiver.recv() {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
+                            }
+                            Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                        }
+                        match pending.dist_receiver.recv() {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                return Err(CozipDeflateError::GpuExecution(err.to_string()));
+                            }
+                            Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                        }
+                        if let Some(start) = freq_recv_start {
+                            timing.freq_recv_ms += elapsed_ms(start);
+                        }
+
+                        let freq_map_copy_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
+                        let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
+                        let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
+                        let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
+                        let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
+                        let dist_words_freq: &[u32] = bytemuck::cast_slice(&dist_freq_map);
+                        litlen_freq.copy_from_slice(&litlen_words[..LITLEN_SYMBOL_COUNT]);
+                        dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
+                        drop(litlen_freq_map);
+                        drop(dist_freq_map);
+                        pending.litlen_freq_readback.unmap();
+                        pending.dist_freq_readback.unmap();
+                        if let Some(start) = freq_map_copy_start {
+                            timing.freq_map_copy_ms += elapsed_ms(start);
+                        }
+
+                        let freq_plan_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        let plan = build_dynamic_huffman_plan(&litlen_freq, &dist_freq)?;
+                        let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
+                        dyn_table.extend_from_slice(&plan.litlen_codes);
+                        dyn_table.extend_from_slice(&plan.litlen_bits);
+                        dyn_table.extend_from_slice(&plan.dist_codes);
+                        dyn_table.extend_from_slice(&plan.dist_bits);
+                        if let Some(start) = freq_plan_start {
+                            timing.freq_plan_ms += elapsed_ms(start);
+                        }
+
+                        let len_u32 = u32::try_from(chunks[pending.chunk_index].len())
+                            .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                        prepared.push(PreparedDynamicPack {
+                            chunk_index: pending.chunk_index,
+                            slot_index: pending.slot_index,
+                            len_u32,
+                            header_bits: plan.header_bits,
+                            header_bytes: plan.header_bytes,
+                            dyn_table,
+                            eob_code: plan.eob_code,
+                            eob_bits: plan.eob_bits,
+                        });
+                        drained += 1;
+                    }
+                }
                 freq_encoder = self
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4914,7 +5005,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 dist_rb.slice(..).map_async(wgpu::MapMode::Read, move |result| {
                     let _ = dist_tx.send(result);
                 });
-                freq_pending.push(PendingDynFreqReadback {
+                freq_pending.push_back(PendingDynFreqReadback {
                     chunk_index: pending_chunk_index,
                     slot_index: pending_slot_index,
                     litlen_freq_readback: lit_rb,
@@ -4925,7 +5016,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
 
-        let mut prepared = Vec::with_capacity(freq_pending.len());
+        if prepared.capacity() < prepared.len() + freq_pending.len() {
+            prepared.reserve(freq_pending.len());
+        }
         if !freq_pending.is_empty() {
             let freq_poll_wait_start = if timing_enabled {
                 Some(Instant::now())
@@ -4937,7 +5030,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 timing.freq_poll_wait_ms += elapsed_ms(start);
             }
         }
-        for pending in freq_pending {
+        while let Some(pending) = freq_pending.pop_front() {
             let freq_recv_start = if timing_enabled {
                 Some(Instant::now())
             } else {
