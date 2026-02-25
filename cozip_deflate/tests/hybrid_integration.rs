@@ -2,6 +2,21 @@ use std::time::{Duration, Instant};
 
 use cozip_deflate::{CompressionMode, HybridOptions, compress_hybrid, decompress_hybrid};
 
+fn print_adapter_details(label: &str, adapter: &wgpu::Adapter) {
+    let info = adapter.get_info();
+    println!(
+        "{}: name=\"{}\" vendor=0x{:04x} device=0x{:04x} type={:?} backend={:?} driver=\"{}\" driver_info=\"{}\"",
+        label,
+        info.name,
+        info.vendor,
+        info.device,
+        info.device_type,
+        info.backend,
+        info.driver,
+        info.driver_info
+    );
+}
+
 fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes);
     let mut state: u32 = 0x1234_5678;
@@ -47,6 +62,80 @@ fn timed_roundtrip(
         compress_elapsed,
         decompress_elapsed,
     )
+}
+
+#[test]
+fn print_current_gpu_with_nocapture() {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::default();
+        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+
+        println!("=== detected adapters ===");
+        if adapters.is_empty() {
+            println!("no adapters detected");
+        } else {
+            for (i, adapter) in adapters.iter().enumerate() {
+                print_adapter_details(&format!("adapter[{i}]"), adapter);
+            }
+        }
+
+        println!("=== selected by power preference ===");
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+        {
+            Some(adapter) => {
+                print_adapter_details("high_performance", &adapter);
+                match adapter
+                    .request_device(
+                        &wgpu::DeviceDescriptor {
+                            label: Some("cozip-gpu-probe-high-perf"),
+                            required_features: wgpu::Features::empty(),
+                            required_limits: wgpu::Limits::default(),
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    Ok((_device, _queue)) => println!("high_performance: request_device=ok"),
+                    Err(err) => println!("high_performance: request_device=err: {err}"),
+                }
+            }
+            None => println!("high_performance: adapter not found"),
+        }
+
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+        {
+            Some(adapter) => {
+                print_adapter_details("low_power", &adapter);
+                match adapter
+                    .request_device(
+                        &wgpu::DeviceDescriptor {
+                            label: Some("cozip-gpu-probe-low-power"),
+                            required_features: wgpu::Features::empty(),
+                            required_limits: wgpu::Limits::default(),
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    Ok((_device, _queue)) => println!("low_power: request_device=ok"),
+                    Err(err) => println!("low_power: request_device=err: {err}"),
+                }
+            }
+            None => println!("low_power: adapter not found"),
+        }
+    });
 }
 
 #[test]

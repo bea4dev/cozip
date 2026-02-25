@@ -47,6 +47,7 @@ const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 20;
+const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
 const GPU_RESERVATION_TIMEOUT_MS: u64 = 3;
 const SCHEDULER_WAIT_MS: u64 = 1;
 
@@ -514,7 +515,7 @@ fn dist_candidate(slot: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
+    let i = id.x + (id.y * 8388480u);
     if (i >= params.len) {
         return;
     }
@@ -885,7 +886,7 @@ fn dist_symbol_for_dist(mdist_in: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len || token_flags[idx] == 0u) {
         return;
     }
@@ -1165,7 +1166,7 @@ fn append_bits(
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len || token_flags[idx] == 0u) {
         return;
     }
@@ -1460,7 +1461,7 @@ fn reverse_bits_u32(value: u32, bit_len: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len) {
         return;
     }
@@ -1720,7 +1721,7 @@ var<uniform> params: Params;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len) {
         return;
     }
@@ -1835,7 +1836,7 @@ fn byte_at(index: u32) -> u32 {
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len) {
         return;
     }
@@ -1922,7 +1923,7 @@ var<uniform> params: Params;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len) {
         return;
     }
@@ -2131,7 +2132,7 @@ fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
     let lid = local_id.x;
-    let gid = wg_id.x;
+    let gid = wg_id.x + (wg_id.y * 65535u);
     let idx = gid * 256u + lid;
     let value = select(0u, input_data[idx], idx < params.len);
 
@@ -2157,7 +2158,7 @@ fn main(
         prefix_data[idx] = scratch[lid] - value;
     }
 
-    if (lid == 255u) {
+    if (lid == 255u && (gid * 256u) < params.len) {
         block_sums[gid] = scratch[255u];
     }
 }
@@ -2237,7 +2238,7 @@ var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 16776960u);
     if (idx >= params.len) {
         return;
     }
@@ -2334,7 +2335,7 @@ var<uniform> params: Params;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
+    let idx = id.x + (id.y * 8388480u);
     if (idx >= params.len) {
         return;
     }
@@ -2464,17 +2465,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         });
 
         {
+            let block_groups =
+                u32::try_from(blocks).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let (dispatch_x, dispatch_y) = dispatch_grid_for_groups(block_groups);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-scan-blocks-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.scan_blocks_pipeline);
             pass.set_bind_group(0, &scan_bg, &[]);
-            pass.dispatch_workgroups(
-                u32::try_from(blocks).map_err(|_| CozipDeflateError::DataTooLarge)?,
-                1,
-                1,
-            );
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
 
         if blocks == 1 {
@@ -2529,13 +2529,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         });
 
         {
+            let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, PREFIX_SCAN_BLOCK_SIZE)?;
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-scan-add-pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.scan_add_pipeline);
             pass.set_bind_group(0, &add_bg, &[]);
-            pass.dispatch_workgroups(workgroup_count(len, PREFIX_SCAN_BLOCK_SIZE)?, 1, 1);
+            pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
 
         encoder.copy_buffer_to_buffer(&block_total_buffer, 0, total_buffer, 0, 4);
@@ -3151,23 +3152,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             });
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-run-match-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.match_pipeline);
                 pass.set_bind_group(0, &match_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-run-count-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.count_pipeline);
                 pass.set_bind_group(0, &count_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             {
@@ -3181,13 +3184,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-run-emit-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.emit_pipeline);
                 pass.set_bind_group(0, &emit_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             encoder.copy_buffer_to_buffer(&total_buffer, 0, &total_readback, 0, 4);
@@ -3364,17 +3368,57 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
 
                 self.device.poll(wgpu::Maintain::Wait);
-                let item = pending
-                    .pop_front()
-                    .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
-                match item.receiver.recv() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
-                    Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                let mut collected_any = false;
+                loop {
+                    let recv_result = match pending.front() {
+                        Some(item) => match item.receiver.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Err(CozipDeflateError::GpuExecution(
+                                    "gpu readback channel disconnected".to_string(),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
+                    let Some(recv_result) = recv_result else {
+                        break;
+                    };
+                    let item = pending
+                        .pop_front()
+                        .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
+                    match recv_result {
+                        Ok(()) => {}
+                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    }
+                    results[item.chunk_index] = collect_deflate_readback(
+                        &slots[item.slot_index],
+                        item.output_storage_size,
+                    )?;
+                    free_slots.push_back(item.slot_index);
+                    collected_any = true;
                 }
-                results[item.chunk_index] =
-                    collect_deflate_readback(&slots[item.slot_index], item.output_storage_size)?;
-                break item.slot_index;
+
+                if !collected_any {
+                    let item = pending
+                        .pop_front()
+                        .ok_or(CozipDeflateError::Internal("missing pending gpu readback"))?;
+                    match item.receiver.recv() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                        Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                    }
+                    results[item.chunk_index] = collect_deflate_readback(
+                        &slots[item.slot_index],
+                        item.output_storage_size,
+                    )?;
+                    free_slots.push_back(item.slot_index);
+                }
+
+                if let Some(index) = free_slots.pop_front() {
+                    break index;
+                }
             };
 
             if slots[slot_index].len_capacity < len {
@@ -3416,23 +3460,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 );
 
                 {
+                    let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("cozip-deflate-tokenize-pass"),
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(&self.tokenize_pipeline);
                     pass.set_bind_group(0, &slot.tokenize_bg, &[]);
-                    pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                 }
 
                 {
+                    let (dispatch_x, dispatch_y) =
+                        dispatch_grid_for_items(len, TOKEN_FINALIZE_SEGMENT_SIZE)?;
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("cozip-deflate-token-finalize-pass"),
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(&self.token_finalize_pipeline);
                     pass.set_bind_group(0, &slot.tokenize_bg, &[]);
-                    pass.dispatch_workgroups(workgroup_count(len, TOKEN_FINALIZE_SEGMENT_SIZE)?, 1, 1);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                 }
 
                 self.dispatch_parallel_prefix_scan(
@@ -3445,13 +3492,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 )?;
 
                 {
+                    let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("cozip-deflate-litlen-pass"),
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(&self.litlen_pipeline);
                     pass.set_bind_group(0, &slot.litlen_bg, &[]);
-                    pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                 }
 
                 self.dispatch_parallel_prefix_scan(
@@ -3464,13 +3512,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 )?;
 
                 {
+                    let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("cozip-deflate-bitpack-pass"),
                         timestamp_writes: None,
                     });
                     pass.set_pipeline(&self.bitpack_pipeline);
                     pass.set_bind_group(0, &slot.bitpack_bg, &[]);
-                    pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                 }
 
                 encoder.copy_buffer_to_buffer(&slot.total_bits_buffer, 0, &slot.readback, 0, 4);
@@ -3571,8 +3620,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             return Ok(results);
         }
 
+        self.device.poll(wgpu::Maintain::Wait);
         while let Some(item) = pending.pop_front() {
-            self.device.poll(wgpu::Maintain::Wait);
             match item.receiver.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
@@ -3580,6 +3629,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             results[item.chunk_index] =
                 collect_deflate_readback(&slots[item.slot_index], item.output_storage_size)?;
+            free_slots.push_back(item.slot_index);
         }
 
         Ok(results)
@@ -3657,33 +3707,37 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-tokenize-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.tokenize_pipeline);
                 pass.set_bind_group(0, &slot.tokenize_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             {
+                let (dispatch_x, dispatch_y) =
+                    dispatch_grid_for_items(len, TOKEN_FINALIZE_SEGMENT_SIZE)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-token-finalize-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.token_finalize_pipeline);
                 pass.set_bind_group(0, &slot.tokenize_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, TOKEN_FINALIZE_SEGMENT_SIZE)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-freq-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.freq_pipeline);
                 pass.set_bind_group(0, &slot.freq_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             encoder.copy_buffer_to_buffer(
@@ -3805,13 +3859,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             )?;
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-dyn-map-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.dyn_map_pipeline);
                 pass.set_bind_group(0, &slot.dyn_map_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             self.dispatch_parallel_prefix_scan(
@@ -3824,13 +3879,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             )?;
 
             {
+                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(len, 128)?;
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("cozip-deflate-bitpack-pass"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.bitpack_pipeline);
                 pass.set_bind_group(0, &slot.bitpack_bg, &[]);
-                pass.dispatch_workgroups(workgroup_count(len, 128)?, 1, 1);
+                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
             }
 
             {
@@ -3883,6 +3939,25 @@ fn workgroup_count(items: usize, group_size: usize) -> Result<u32, CozipDeflateE
     }
     let count = items.div_ceil(group_size);
     u32::try_from(count).map_err(|_| CozipDeflateError::DataTooLarge)
+}
+
+fn dispatch_grid_for_groups(total_groups: u32) -> (u32, u32) {
+    if total_groups <= MAX_DISPATCH_WORKGROUPS_PER_DIM {
+        (total_groups, 1)
+    } else {
+        (
+            MAX_DISPATCH_WORKGROUPS_PER_DIM,
+            total_groups.div_ceil(MAX_DISPATCH_WORKGROUPS_PER_DIM),
+        )
+    }
+}
+
+fn dispatch_grid_for_items(
+    items: usize,
+    group_size: usize,
+) -> Result<(u32, u32), CozipDeflateError> {
+    let groups = workgroup_count(items, group_size)?;
+    Ok(dispatch_grid_for_groups(groups))
 }
 
 fn bytes_len<T>(items: usize) -> Result<u64, CozipDeflateError> {

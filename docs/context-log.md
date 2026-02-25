@@ -993,3 +993,64 @@ mode別GPU品質パラメータ:
 
 確認:
 - `cargo check -p cozip_deflate --example bench_1gb` 通過
+
+## 2026-02-24 - GPU検出確認用 nocapture テスト追加
+
+目的:
+- `cargo test ... -- --nocapture` で、現在環境で見えているGPUと、PowerPreference別に選択されるGPUを確認できるようにする。
+
+変更:
+- `cozip_deflate/tests/hybrid_integration.rs`
+  - `print_current_gpu_with_nocapture` テストを追加
+  - 検出アダプタ一覧（name/vendor/device/type/backend/driver）を表示
+  - `HighPerformance` / `LowPower` それぞれで `request_adapter` 結果を表示
+  - それぞれ `request_device` の成否を表示
+  - GPU未検出でも panic せずに情報出力して通る
+
+ローカル実行結果:
+- 検出:
+  - NVIDIA GeForce RTX 5070 Laptop GPU (Vulkan)
+  - AMD Radeon 890M Graphics (GL)
+- 選択:
+  - HighPerformance: NVIDIA
+  - LowPower: NVIDIA
+
+## 2026-02-24 - GPU dispatch 2D化 + submit/collect待機点削減 (着手: 1,2)
+
+目的:
+- 16MiB級チャンクで `dispatch_workgroups(x>65535)` に当たる問題を解消
+- GPU圧縮バッチで待機点を減らし、submit/collectをより分離
+
+実装:
+1) 2D dispatch 対応
+- 追加:
+  - `MAX_DISPATCH_WORKGROUPS_PER_DIM = 65535`
+  - `dispatch_grid_for_groups()`
+  - `dispatch_grid_for_items()`
+- 変更:
+  - `pass.dispatch_workgroups(..)` を主要GPUパスで `(x,y,1)` に変更
+  - 対象: tokenize/litlen/bitpack/freq/dyn_map/scan blocks/scan add/match/count/emit
+- WGSL側 index を 2D flatten 対応
+  - workgroup_size=128 系: `idx = id.x + id.y * 8388480`
+  - workgroup_size=256 系: `idx = id.x + id.y * 16776960`
+  - scan_blocks は `gid = wg_id.x + wg_id.y * 65535`
+- scan_blocks の over-dispatch 対策
+  - `block_sums[gid]` 書き込み時に `gid*256 < len` ガード追加
+
+2) submit/collect の待機点削減（fixed GPU batch path）
+- `deflate_fixed_literals_batch` で、slot枯渇時に `Wait` 後まとめて ready readback を回収
+- 最終回収で `poll(Wait)` を1回化し、pendingを連続 drain
+- 1件ずつ `Wait` していた箇所を削減
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `cargo test -p cozip_deflate --lib` 通過
+- `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過
+- `cargo run --release -p cozip_deflate --example bench_hybrid` 実行
+  - 4MiB: CPU+GPU comp ~11.679ms
+  - 16MiB: CPU+GPU comp ~94.245ms
+- `cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 16 --iters 1 --warmups 1 --chunk-mib 16 --gpu-subchunk-kib 256 --mode speed --gpu-fraction 1.0`
+  - 16MiB単一チャンク (chunk_mib=16) が panicせず通ることを確認
+
+メモ:
+- 2D flatten の stride は `global_invocation_id.x` の性質上、workgroup_size込みで設定する必要がある。
