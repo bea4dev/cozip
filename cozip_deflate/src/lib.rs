@@ -215,6 +215,18 @@ fn deep_timing_profile_enabled() -> bool {
     })
 }
 
+fn maybe_warn_deep_profile_enabled() {
+    if deep_timing_profile_enabled()
+        && DEEP_PROFILE_WARNED
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        eprintln!(
+            "[cozip][timing] COZIP_PROFILE_DEEP is enabled; throughput numbers include probe overhead and are not suitable for A/B speed comparison."
+        );
+    }
+}
+
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -260,6 +272,8 @@ struct GpuDynamicTiming {
 }
 
 static GPU_TIMING_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
+static DEEP_DYNAMIC_PROBE_TAKEN: AtomicU8 = AtomicU8::new(0);
+static DEEP_PROFILE_WARNED: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone)]
 struct ChunkTask {
@@ -393,6 +407,13 @@ impl GpuAssist {
             })
             .await
             .ok_or_else(|| CozipDeflateError::GpuUnavailable("adapter not found".to_string()))?;
+        if timing_profile_enabled() {
+            let info = adapter.get_info();
+            eprintln!(
+                "[cozip][timing] gpu_adapter name=\"{}\" vendor=0x{:x} device=0x{:x} backend={:?} type={:?}",
+                info.name, info.vendor, info.device, info.backend, info.device_type
+            );
+        }
 
         let (device, queue) = adapter
             .request_device(
@@ -644,6 +665,63 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 var mlen: u32 = 3u;
                 var p = i + 3u;
                 var scanned: u32 = 0u;
+
+                loop {
+                    if (p + 15u >= params.len || mlen + 16u > match_len_limit || scanned + 16u > match_scan_limit) {
+                        break;
+                    }
+
+                    var mismatch = false;
+                    let diff0 = load_u32_unaligned(p) ^ load_u32_unaligned(p - dist);
+                    if (diff0 != 0u) {
+                        let same = countTrailingZeros(diff0) >> 3u;
+                        mlen = mlen + same;
+                        p = p + same;
+                        scanned = scanned + same;
+                        mismatch = true;
+                    }
+
+                    if (!mismatch) {
+                        let diff1 = load_u32_unaligned(p + 4u) ^ load_u32_unaligned(p + 4u - dist);
+                        if (diff1 != 0u) {
+                            let same = countTrailingZeros(diff1) >> 3u;
+                            mlen = mlen + 4u + same;
+                            p = p + 4u + same;
+                            scanned = scanned + 4u + same;
+                            mismatch = true;
+                        }
+                    }
+
+                    if (!mismatch) {
+                        let diff2 = load_u32_unaligned(p + 8u) ^ load_u32_unaligned(p + 8u - dist);
+                        if (diff2 != 0u) {
+                            let same = countTrailingZeros(diff2) >> 3u;
+                            mlen = mlen + 8u + same;
+                            p = p + 8u + same;
+                            scanned = scanned + 8u + same;
+                            mismatch = true;
+                        }
+                    }
+
+                    if (!mismatch) {
+                        let diff3 = load_u32_unaligned(p + 12u) ^ load_u32_unaligned(p + 12u - dist);
+                        if (diff3 != 0u) {
+                            let same = countTrailingZeros(diff3) >> 3u;
+                            mlen = mlen + 12u + same;
+                            p = p + 12u + same;
+                            scanned = scanned + 12u + same;
+                            mismatch = true;
+                        }
+                    }
+
+                    if (mismatch) {
+                        break;
+                    }
+
+                    mlen = mlen + 16u;
+                    p = p + 16u;
+                    scanned = scanned + 16u;
+                }
 
                 loop {
                     if (p + 3u >= params.len || mlen + 4u > match_len_limit || scanned + 4u > match_scan_limit) {
@@ -4005,7 +4083,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             cpu_fallback_ms: 0.0,
         };
         let deep_timing_enabled = deep_timing_profile_enabled();
-        let mut deep_probe_done = false;
 
         struct PendingDynFreqReadback {
             chunk_index: usize,
@@ -4084,9 +4161,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             self.queue
                 .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
-            if deep_timing_enabled && !deep_probe_done {
+            if deep_timing_enabled
+                && DEEP_DYNAMIC_PROBE_TAKEN
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 self.profile_dynamic_phase1_probe(slot, len, mode, chunk_index)?;
-                deep_probe_done = true;
             }
 
             let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -4821,6 +4901,7 @@ pub fn compress_hybrid(
     input: &[u8],
     options: &HybridOptions,
 ) -> Result<CompressedFrame, CozipDeflateError> {
+    maybe_warn_deep_profile_enabled();
     validate_options(options)?;
 
     if input.is_empty() {

@@ -1264,3 +1264,42 @@ mode別GPU品質パラメータ:
 
 メモ:
 - 深掘り (`COZIP_PROFILE_DEEP=1`) は計測用追加実行が入るため、実運用ベンチ比較には使わない。
+
+## 2026-02-25 - tokenize延長ループの追加最適化（16byte先行比較）
+
+目的:
+- 4byte比較化の次段として、長い一致ランでの反復回数をさらに削減する。
+
+実装:
+- tokenize WGSL の延長ループに 16byte 先行比較を追加
+  - 4byte×4本の `load_u32_unaligned` 比較
+  - 途中不一致時は `xor + countTrailingZeros >> 3` で一致バイト数を即時反映
+  - 16byte一致時のみ `mlen/p/scanned` を `+16`
+  - その後は既存の4byteループ -> 1byte tail へフォールバック
+
+確認:
+- `cargo check -p cozip_deflate` 通過
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_DEEP=1 cargo run --release -p cozip_deflate --example bench_1gb -- --size-mib 64 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+  - ローカル例(4MiB probe):
+    - `t_tokenize_extend_only_ms`: 15.6ms級 -> 7.6ms級
+    - `t_tokenize_full_ms`: 16.8ms級 -> 8.4ms級
+  - dynamic全体:
+    - `t_freq_poll_wait_ms`: 280-313ms級 -> 148-170ms級
+
+メモ:
+- `COZIP_PROFILE_DEEP=1` 実行では追加プローブ分のオーバーヘッドがあるため、最終スループット比較は
+  `COZIP_PROFILE_TIMING=1` のみで行う。
+
+## 2026-02-25 - deep計測の誤比較防止
+
+実装:
+- `COZIP_PROFILE_DEEP` 有効時に警告を1回だけ表示
+  - `throughput numbers include probe overhead ...`
+- deep probe 実行回数を「各dynamicバッチ」から「プロセス全体で1回」に変更
+  - `DEEP_DYNAMIC_PROBE_TAKEN` で制御
+- `COZIP_PROFILE_TIMING=1` 時に選択GPUアダプタ情報を出力
+  - name/vendor/device/backend/type
+
+目的:
+- deep計測が有効なままベンチ比較してしまう事故を減らす
+- ハイブリッドGPU環境でアダプタ揺れを観測しやすくする
