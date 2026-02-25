@@ -1303,3 +1303,67 @@ mode別GPU品質パラメータ:
 目的:
 - deep計測が有効なままベンチ比較してしまう事故を減らす
 - ハイブリッドGPU環境でアダプタ揺れを観測しやすくする
+
+## 2026-02-25 - ベースライン再計測（ウォームアップなし / プロセス再起動）
+
+目的:
+- zip実運用想定（事前ウォームアップなし）に合わせ、`iters=1 warmups=0` で毎回プロセス起動し直して現状ベースラインを取得。
+
+条件:
+- コマンド:
+  - `env -u COZIP_PROFILE_DEEP -u COZIP_PROFILE_TIMING target/release/examples/bench_1gb --size-mib 4096 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --mode ratio --gpu-fraction 1.0`
+- 実行回数: 5回（毎回プロセス再起動）
+
+観測値:
+- Run1: CPU_ONLY comp=7898.563ms / CPU+GPU comp=19398.078ms / speedup(comp)=0.407x / speedup(decomp)=0.984x
+- Run2: CPU_ONLY comp=7893.687ms / CPU+GPU comp=19294.458ms / speedup(comp)=0.409x / speedup(decomp)=1.002x
+- Run3: CPU_ONLY comp=7996.905ms / CPU+GPU comp=19235.450ms / speedup(comp)=0.416x / speedup(decomp)=1.011x
+- Run4: CPU_ONLY comp=8005.602ms / CPU+GPU comp=19223.456ms / speedup(comp)=0.416x / speedup(decomp)=1.002x
+- Run5: CPU_ONLY comp=8011.265ms / CPU+GPU comp=19300.104ms / speedup(comp)=0.415x / speedup(decomp)=1.013x
+
+集計:
+- speedup(comp) median=0.415x, mean=0.413x
+- speedup(decomp) median=1.002x, mean=1.002x
+
+補足:
+- 本実行環境では `libEGL warning: failed to open /dev/dri/... Permission denied` が発生。
+- `gpu_chunks=16/1024` と極端に少なく、GPU性能比較としては無効寄り（GPUデバイス権限制約の影響）。
+- この記録は「手順の再現確認」と「無ウォームアップ条件での揺れ確認」目的。
+
+## 2026-02-25 - bench.sh 追加（無ウォームアップ・プロセス再起動ベンチ用）
+
+実装:
+- ルートに `bench.sh` を追加（実行権限付き）。
+- `target/release/examples/bench_1gb` を直接呼び出し、各runを独立プロセスとして実行。
+- デフォルト条件:
+  - `--size-mib 4096 --runs 5 --iters 1 --warmups 0 --chunk-mib 4 --gpu-subchunk-kib 512 --gpu-fraction 1.0 --mode ratio`
+- 機能:
+  - `--mode speed,balanced,ratio` の複数モード一括実行
+  - ログ保存: `bench_results/bench_<mode>_<timestamp>.log`
+  - 各モードで mean/median/min/max の要約出力
+  - デフォルトで `COZIP_PROFILE_TIMING/DEEP` を解除（`--keep-profile-vars` で保持可能）
+
+確認:
+- `bash -n bench.sh` 通過
+- `./bench.sh --help` 表示確認
+
+## 2026-02-25 - ベンチ結果更新（ユーザー実機 / bench.sh, ratio）
+
+上書き方針:
+- 直前の「ベースライン再計測（ウォームアップなし / プロセス再起動）」は、GPU権限制約付き環境での値だったため、速度比較の基準としては本節のユーザー実機結果を優先する。
+
+入力（ユーザー共有の summary）:
+- mode=ratio
+- runs=5
+- size_mib=4096, iters=1, warmups=0, chunk_mib=4, gpu_subchunk_kib=512, gpu_fraction=1.0
+
+結果:
+- speedup_compress_x: n=5 mean=1.327 median=1.301 min=1.258 max=1.415
+- speedup_decompress_x: n=5 mean=1.327 median=1.301 min=1.258 max=1.415
+- cpu_only_avg_comp_ms: n=5 mean=8295.713 median=8341.937 min=8083.128 max=8367.391
+- cpu_gpu_avg_comp_ms: n=5 mean=6616.473 median=6590.035 min=6549.101 max=6740.110
+- gpu_chunks: n=5 mean=283.600 median=285.000 min=268 max=302
+
+運用ルール（今後）:
+- 速度ベンチマークは、原則としてユーザー実機で `./bench.sh` を実行して取得した結果を採用する。
+- 評価比較時は `runs>=5`, `iters=1`, `warmups=0` を基本条件にする（zip実運用前提）。
