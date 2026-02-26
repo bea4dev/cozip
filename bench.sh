@@ -202,12 +202,8 @@ for mode in "${MODE_LIST[@]}"; do
   done
 
   comp_speedup_values="$(
-    rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" \
-      | sed -E 's/.* compress=([0-9.]+)x decompress=.*/\1/'
-  )"
-  decomp_speedup_values="$(
-    rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" \
-      | sed -E 's/.* decompress=([0-9.]+)x.*/\1/'
+    (rg '^speedup\(cpu/hybrid\):' "${LOG_FILE}" || true) \
+      | sed -E 's/.* compress=([0-9.]+)x.*/\1/'
   )"
   cpu_comp_values="$(rg '^CPU_ONLY:' "${LOG_FILE}" | sed -E 's/.*avg_comp_ms=([0-9.]+).*/\1/')"
   hybrid_comp_values="$(rg '^CPU\+GPU :' "${LOG_FILE}" | sed -E 's/.*avg_comp_ms=([0-9.]+).*/\1/')"
@@ -215,7 +211,7 @@ for mode in "${MODE_LIST[@]}"; do
 
   echo "----- SUMMARY mode=${mode} -----" | tee -a "${LOG_FILE}"
   stats_line "speedup_compress_x" "${comp_speedup_values}" | tee -a "${LOG_FILE}"
-  stats_line "speedup_decompress_x" "${decomp_speedup_values}" | tee -a "${LOG_FILE}"
+  echo "speedup_decompress_x: n=0 (deprecated: decompress is CPU-only path)" | tee -a "${LOG_FILE}"
   stats_line "cpu_only_avg_comp_ms" "${cpu_comp_values}" | tee -a "${LOG_FILE}"
   stats_line "cpu_gpu_avg_comp_ms" "${hybrid_comp_values}" | tee -a "${LOG_FILE}"
   stats_line "gpu_chunks" "${gpu_chunks_values}" | tee -a "${LOG_FILE}"

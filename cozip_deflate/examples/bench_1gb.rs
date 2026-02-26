@@ -1,7 +1,7 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{CoZip, CompressionMode, HybridOptions, HybridStats};
+use cozip_deflate::{CoZipDeflate, CompressionMode, HybridOptions, HybridStats};
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -120,7 +120,8 @@ struct BenchAgg {
     decompress_total: Duration,
     compressed_total: usize,
     input_total: usize,
-    last_stats: HybridStats,
+    last_compress_stats: HybridStats,
+    last_decompress_stats: HybridStats,
 }
 
 impl BenchAgg {
@@ -130,13 +131,15 @@ impl BenchAgg {
         compressed_len: usize,
         compress_elapsed: Duration,
         decompress_elapsed: Duration,
-        stats: HybridStats,
+        compress_stats: HybridStats,
+        decompress_stats: HybridStats,
     ) {
         self.compress_total += compress_elapsed;
         self.decompress_total += decompress_elapsed;
         self.compressed_total += compressed_len;
         self.input_total += input_len;
-        self.last_stats = stats;
+        self.last_compress_stats = compress_stats;
+        self.last_decompress_stats = decompress_stats;
     }
 
     fn avg_compress_ms(&self, iters: usize) -> f64 {
@@ -189,7 +192,7 @@ fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
     out
 }
 
-fn run_case(input: &[u8], cozip: &CoZip, iters: usize) -> BenchAgg {
+fn run_case(input: &[u8], cozip: &CoZipDeflate, iters: usize) -> BenchAgg {
     let mut agg = BenchAgg::default();
     for _ in 0..iters {
         let t0 = Instant::now();
@@ -198,7 +201,7 @@ fn run_case(input: &[u8], cozip: &CoZip, iters: usize) -> BenchAgg {
 
         let t1 = Instant::now();
         let decompressed = cozip
-            .decompress(&compressed.bytes)
+            .decompress_on_cpu(&compressed.bytes)
             .expect("decompress should succeed");
         let decompress_elapsed = t1.elapsed();
 
@@ -210,6 +213,7 @@ fn run_case(input: &[u8], cozip: &CoZip, iters: usize) -> BenchAgg {
             compress_elapsed,
             decompress_elapsed,
             compressed.stats,
+            decompressed.stats,
         );
     }
     agg
@@ -263,8 +267,8 @@ fn main() {
     );
     println!("gpu_fraction={:.2}", cfg.gpu_fraction);
 
-    let cpu_only_cozip = CoZip::init(cpu_only).expect("cpu-only init should succeed");
-    let cpu_gpu_cozip = CoZip::init(cpu_gpu).expect("cpu+gpu init should succeed");
+    let cpu_only_cozip = CoZipDeflate::init(cpu_only).expect("cpu-only init should succeed");
+    let cpu_gpu_cozip = CoZipDeflate::init(cpu_gpu).expect("cpu+gpu init should succeed");
 
     if cfg.warmups > 0 {
         let _ = run_case(&input, &cpu_only_cozip, cfg.warmups);
@@ -279,38 +283,41 @@ fn main() {
     } else {
         0.0
     };
-    let decomp_speedup = if hybrid.avg_decompress_ms(cfg.iters) > 0.0 {
-        cpu.avg_decompress_ms(cfg.iters) / hybrid.avg_decompress_ms(cfg.iters)
-    } else {
-        0.0
-    };
 
     println!(
-        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={}",
+        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         cpu.avg_compress_ms(cfg.iters),
         cpu.avg_decompress_ms(cfg.iters),
         cpu.compress_mib_s(),
         cpu.decompress_mib_s(),
         cpu.ratio(),
-        cpu.last_stats.chunk_count,
-        cpu.last_stats.cpu_chunks,
-        cpu.last_stats.gpu_chunks,
-        cpu.last_stats.gpu_available,
+        cpu.last_compress_stats.chunk_count,
+        cpu.last_compress_stats.cpu_chunks,
+        cpu.last_compress_stats.gpu_chunks,
+        cpu.last_compress_stats.gpu_available,
+        cpu.last_decompress_stats.chunk_count,
+        cpu.last_decompress_stats.cpu_chunks,
+        cpu.last_decompress_stats.gpu_chunks,
+        cpu.last_decompress_stats.gpu_available,
     );
     println!(
-        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={}",
+        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         hybrid.avg_compress_ms(cfg.iters),
         hybrid.avg_decompress_ms(cfg.iters),
         hybrid.compress_mib_s(),
         hybrid.decompress_mib_s(),
         hybrid.ratio(),
-        hybrid.last_stats.chunk_count,
-        hybrid.last_stats.cpu_chunks,
-        hybrid.last_stats.gpu_chunks,
-        hybrid.last_stats.gpu_available,
+        hybrid.last_compress_stats.chunk_count,
+        hybrid.last_compress_stats.cpu_chunks,
+        hybrid.last_compress_stats.gpu_chunks,
+        hybrid.last_compress_stats.gpu_available,
+        hybrid.last_decompress_stats.chunk_count,
+        hybrid.last_decompress_stats.cpu_chunks,
+        hybrid.last_decompress_stats.gpu_chunks,
+        hybrid.last_decompress_stats.gpu_available,
     );
     println!(
-        "speedup(cpu/hybrid): compress={:.3}x decompress={:.3}x ( >1.0 means CPU+GPU faster )",
-        comp_speedup, decomp_speedup
+        "speedup(cpu/hybrid): compress={:.3}x ( >1.0 means CPU+GPU faster; decompress speedup omitted: CPU-only path )",
+        comp_speedup
     );
 }
