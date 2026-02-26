@@ -1806,3 +1806,28 @@ mode別GPU品質パラメータ:
 実装:
 - `GPU_COLD_START_RESERVED_CHUNKS` の既定値を `GPU_BATCH_CHUNKS` (16) に戻し。
 - 必要時は `COZIP_GPU_COLD_RESERVED_CHUNKS` で上書き可能な構成は維持。
+
+## 2026-02-26 - `gpu_chunks` 偏りの主因を特定（GPU初期化時間ジッタ）
+
+背景:
+- 同一コマンド・同一設定でも `gpu_chunks` が 200台と300台で偏る現象が継続。
+- scheduler調整のみでは再現パターン（初回低め、後続で高め）が解消しなかった。
+
+観測:
+- `COZIP_PROFILE_TIMING=1 COZIP_PROFILE_TIMING_DETAIL=1` で、同一コマンドにて:
+  - 遅い回: `gpu_context_init_ms=2646.749`
+  - 速い回: `gpu_context_init_ms=208.249`
+- この差に対応して `gpu_ready_snapshot` が大きく変化:
+  - 遅い回: `done=320`（GPU ready前にCPUが先行消化）
+  - 速い回: `done=7`
+- 最終配分も連動:
+  - 遅い回: `gpu_chunks=240`
+  - 速い回: `gpu_chunks=336`
+
+結論:
+- `gpu_chunks` の主な偏り要因は scheduler 内の量子化より、`GpuAssist` 初期化完了時刻のジッタ。
+- 要因の中心は `wgpu`/Vulkan/driver 側の cold/warm 差（パイプライン・ドライバキャッシュ等）である可能性が高い。
+- 実装側はこの外部ジッタを観測しやすい実行形態（`bench.sh` の runごとプロセス再起動）であるため、偏りが顕在化した。
+
+補足:
+- 解凍ベンチが比較的安定していたのは、初期化ジッタの影響が主に圧縮側スケジューリングへ現れるためと整合する。

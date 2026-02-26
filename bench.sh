@@ -15,9 +15,6 @@ GPU_FRACTION=1.0
 MODES="ratio"
 BUILD=1
 KEEP_PROFILE_VARS=0
-GPU_VALIDATION_MODE_DEFAULT="${COZIP_GPU_VALIDATION_MODE:-off}"
-GPU_DYNAMIC_SELF_CHECK_DEFAULT="${COZIP_GPU_DYNAMIC_SELF_CHECK:-0}"
-GPU_DUMP_BAD_CHUNK_DEFAULT="${COZIP_GPU_DUMP_BAD_CHUNK:-0}"
 
 usage() {
   cat <<'EOF'
@@ -35,7 +32,6 @@ Options:
   --mode <M>               speed|balanced|ratio or comma list (default: ratio)
   --no-build               Skip cargo build
   --keep-profile-vars      Keep COZIP_PROFILE_TIMING/DEEP from current shell
-                           (GPU validation defaults remain off unless env override)
   -h, --help               Show this help
 
 Example:
@@ -175,39 +171,32 @@ for mode in "${MODE_LIST[@]}"; do
     echo "timestamp=${TS}"
     echo "mode=${mode}"
     echo "size_mib=${SIZE_MIB} runs=${RUNS} iters=${ITERS} warmups=${WARMUPS} chunk_mib=${CHUNK_MIB} gpu_subchunk_kib=${GPU_SUBCHUNK_KIB} gpu_fraction=${GPU_FRACTION}"
-    echo "gpu_validation_mode=${GPU_VALIDATION_MODE_DEFAULT} gpu_dynamic_self_check=${GPU_DYNAMIC_SELF_CHECK_DEFAULT} gpu_dump_bad_chunk=${GPU_DUMP_BAD_CHUNK_DEFAULT}"
     echo
   } | tee "${LOG_FILE}"
 
   for run_idx in $(seq 1 "${RUNS}"); do
     echo "===== RUN ${run_idx}/${RUNS} mode=${mode} =====" | tee -a "${LOG_FILE}"
     if [[ "${KEEP_PROFILE_VARS}" -eq 1 ]]; then
-      env COZIP_GPU_VALIDATION_MODE="${GPU_VALIDATION_MODE_DEFAULT}" \
-        COZIP_GPU_DYNAMIC_SELF_CHECK="${GPU_DYNAMIC_SELF_CHECK_DEFAULT}" \
-        COZIP_GPU_DUMP_BAD_CHUNK="${GPU_DUMP_BAD_CHUNK_DEFAULT}" \
-        "${BIN_PATH}" \
-        --size-mib "${SIZE_MIB}" \
-        --iters "${ITERS}" \
-        --warmups "${WARMUPS}" \
-        --chunk-mib "${CHUNK_MIB}" \
-        --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
-        --mode "${mode}" \
-        --gpu-fraction "${GPU_FRACTION}" \
-        2>&1 | tee -a "${LOG_FILE}"
+      "${BIN_PATH}" \
+      --size-mib "${SIZE_MIB}" \
+      --iters "${ITERS}" \
+      --warmups "${WARMUPS}" \
+      --chunk-mib "${CHUNK_MIB}" \
+      --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
+      --mode "${mode}" \
+      --gpu-fraction "${GPU_FRACTION}" \
+      2>&1 | tee -a "${LOG_FILE}"
     else
       env -u COZIP_PROFILE_TIMING -u COZIP_PROFILE_DEEP \
-        COZIP_GPU_VALIDATION_MODE="${GPU_VALIDATION_MODE_DEFAULT}" \
-        COZIP_GPU_DYNAMIC_SELF_CHECK="${GPU_DYNAMIC_SELF_CHECK_DEFAULT}" \
-        COZIP_GPU_DUMP_BAD_CHUNK="${GPU_DUMP_BAD_CHUNK_DEFAULT}" \
-        "${BIN_PATH}" \
-        --size-mib "${SIZE_MIB}" \
-        --iters "${ITERS}" \
-        --warmups "${WARMUPS}" \
-        --chunk-mib "${CHUNK_MIB}" \
-        --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
-        --mode "${mode}" \
-        --gpu-fraction "${GPU_FRACTION}" \
-        2>&1 | tee -a "${LOG_FILE}"
+      "${BIN_PATH}" \
+      --size-mib "${SIZE_MIB}" \
+      --iters "${ITERS}" \
+      --warmups "${WARMUPS}" \
+      --chunk-mib "${CHUNK_MIB}" \
+      --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
+      --mode "${mode}" \
+      --gpu-fraction "${GPU_FRACTION}" \
+      2>&1 | tee -a "${LOG_FILE}"
     fi
     echo | tee -a "${LOG_FILE}"
   done

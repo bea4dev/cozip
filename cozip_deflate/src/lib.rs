@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use flate2::Compression;
@@ -42,7 +42,6 @@ const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
 const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUNT * 2);
 const GPU_BATCH_CHUNKS: usize = 16;
-const GPU_COLD_START_RESERVED_CHUNKS: usize = GPU_BATCH_CHUNKS;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
 const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
 const GPU_RATIO_RESERVED_TARGET_CHUNKS: usize = GPU_BATCH_CHUNKS * 16;
@@ -56,9 +55,6 @@ const GPU_RESERVATION_TIMEOUT_MS_SPEED: u64 = 3;
 const GPU_RESERVATION_TIMEOUT_MS_BALANCED: u64 = 12;
 const GPU_RESERVATION_TIMEOUT_MS_RATIO: u64 = 64;
 const SCHEDULER_WAIT_MS: u64 = 1;
-const GPU_INIT_STATE_INITIALIZING: u8 = 0;
-const GPU_INIT_STATE_READY: u8 = 1;
-const GPU_INIT_STATE_UNAVAILABLE: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct HybridOptions {
@@ -69,6 +65,12 @@ pub struct HybridOptions {
     pub prefer_gpu: bool,
     pub gpu_fraction: f32,
     pub gpu_min_chunk_size: usize,
+    pub gpu_validation_mode: GpuValidationMode,
+    pub gpu_validation_sample_every: usize,
+    pub gpu_dynamic_self_check: bool,
+    pub gpu_dump_bad_chunk: bool,
+    pub gpu_dump_bad_chunk_limit: usize,
+    pub gpu_dump_bad_chunk_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,13 @@ pub enum CompressionMode {
     Speed,
     Balanced,
     Ratio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuValidationMode {
+    Always,
+    Sample,
+    Off,
 }
 
 impl Default for HybridOptions {
@@ -88,6 +97,12 @@ impl Default for HybridOptions {
             prefer_gpu: true,
             gpu_fraction: 1.0,
             gpu_min_chunk_size: 64 * 1024,
+            gpu_validation_mode: GpuValidationMode::Off,
+            gpu_validation_sample_every: 8,
+            gpu_dynamic_self_check: false,
+            gpu_dump_bad_chunk: false,
+            gpu_dump_bad_chunk_limit: 8,
+            gpu_dump_bad_chunk_dir: None,
         }
     }
 }
@@ -112,6 +127,56 @@ pub struct CompressedFrame {
 pub struct DecompressedFrame {
     pub bytes: Vec<u8>,
     pub stats: HybridStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoZipInitStats {
+    pub gpu_context_init_ms: f64,
+    pub gpu_available: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoZip {
+    options: HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
+    init_stats: CoZipInitStats,
+}
+
+impl CoZip {
+    pub fn init(options: HybridOptions) -> Result<Self, CozipDeflateError> {
+        validate_options(&options)?;
+        let mut init_stats = CoZipInitStats::default();
+        let gpu_context = if options.prefer_gpu && options.gpu_fraction > 0.0 {
+            let start = Instant::now();
+            let ctx = GpuAssist::new().ok().map(Arc::new);
+            init_stats.gpu_context_init_ms = elapsed_ms(start);
+            init_stats.gpu_available = ctx.is_some();
+            ctx
+        } else {
+            None
+        };
+        Ok(Self {
+            options,
+            gpu_context,
+            init_stats,
+        })
+    }
+
+    pub fn init_stats(&self) -> CoZipInitStats {
+        self.init_stats
+    }
+
+    pub fn gpu_context_init_ms(&self) -> f64 {
+        self.init_stats.gpu_context_init_ms
+    }
+
+    pub fn compress(&self, input: &[u8]) -> Result<CompressedFrame, CozipDeflateError> {
+        compress_hybrid_with_context(input, &self.options, self.gpu_context.clone())
+    }
+
+    pub fn decompress(&self, frame: &[u8]) -> Result<DecompressedFrame, CozipDeflateError> {
+        decompress_hybrid_with_context(frame, &self.options, self.gpu_context.clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,49 +267,18 @@ pub enum CozipDeflateError {
 }
 
 fn timing_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let Ok(raw) = std::env::var("COZIP_PROFILE_TIMING") else {
-            return false;
-        };
-        let v = raw.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "1" | "true" | "yes" | "on")
-    })
+    false
 }
 
 fn timing_profile_detail_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let Ok(raw) = std::env::var("COZIP_PROFILE_TIMING_DETAIL") else {
-            return false;
-        };
-        let v = raw.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "1" | "true" | "yes" | "on")
-    })
+    false
 }
 
 fn deep_timing_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let Ok(raw) = std::env::var("COZIP_PROFILE_DEEP") else {
-            return false;
-        };
-        let v = raw.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "1" | "true" | "yes" | "on")
-    })
+    false
 }
 
-fn maybe_warn_deep_profile_enabled() {
-    if deep_timing_profile_enabled()
-        && DEEP_PROFILE_WARNED
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
-        eprintln!(
-            "[cozip][timing] COZIP_PROFILE_DEEP is enabled; throughput numbers include probe overhead and are not suitable for A/B speed comparison."
-        );
-    }
-}
+fn maybe_warn_deep_profile_enabled() {}
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -301,7 +335,6 @@ struct GpuDynamicTiming {
 
 static GPU_TIMING_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
 static DEEP_DYNAMIC_PROBE_TAKEN: AtomicU8 = AtomicU8::new(0);
-static DEEP_PROFILE_WARNED: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Debug, Clone)]
 struct ChunkTask {
@@ -344,11 +377,7 @@ struct SchedulerPerfCounters {
 #[derive(Debug, Default)]
 struct SchedulerTimeline {
     first_cpu_task_logged: AtomicU8,
-    gpu_init_start_logged: AtomicU8,
-    gpu_init_done_logged: AtomicU8,
-    gpu_init_failed_logged: AtomicU8,
     first_gpu_batch_logged: AtomicU8,
-    init_demote_logged: AtomicU8,
 }
 
 fn mark_once(flag: &AtomicU8) -> bool {
@@ -407,6 +436,7 @@ struct GpuAssist {
     scan_add_pipeline: wgpu::ComputePipeline,
     deflate_slots: Mutex<Vec<DeflateSlot>>,
     deflate_header_buffer: wgpu::Buffer,
+    dump_bad_chunk_seq: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -556,273 +586,7 @@ impl GpuAssist {
 
         let tokenize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-tokenize-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    mode: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> input_words: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> token_flags: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> token_kind: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read_write> token_len: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read_write> token_dist: array<u32>;
-
-@group(0) @binding(5)
-var<storage, read_write> token_lit: array<u32>;
-
-@group(0) @binding(6)
-var<uniform> params: Params;
-
-fn mode_max_match_scan(mode: u32) -> u32 {
-    switch (mode) {
-        case 100u: { return 0u; } // profile: literal-only
-        case 101u: { return 0u; } // profile: head-only speed
-        case 102u: { return 0u; } // profile: head-only balanced
-        case 103u: { return 0u; } // profile: head-only ratio
-        case 1u: { return 128u; } // Balanced
-        case 2u: { return 192u; } // Ratio
-        default: { return 64u; }  // Speed
-    }
-}
-
-fn mode_max_match_len(mode: u32) -> u32 {
-    switch (mode) {
-        case 100u: { return 3u; } // profile: literal-only
-        case 101u: { return 3u; } // profile: head-only speed
-        case 102u: { return 3u; } // profile: head-only balanced
-        case 103u: { return 3u; } // profile: head-only ratio
-        case 1u: { return 128u; } // Balanced
-        case 2u: { return 258u; } // Ratio
-        default: { return 64u; }  // Speed
-    }
-}
-
-fn mode_dist_candidate_count(mode: u32) -> u32 {
-    switch (mode) {
-        case 100u: { return 0u; }  // profile: literal-only
-        case 101u: { return 20u; } // profile: head-only speed
-        case 102u: { return 28u; } // profile: head-only balanced
-        case 103u: { return 32u; } // profile: head-only ratio
-        case 1u: { return 28u; } // up to 8192
-        case 2u: { return 32u; } // up to 32768
-        default: { return 20u; } // up to 512
-    }
-}
-
-fn byte_at(index: u32) -> u32 {
-    let word = input_words[index >> 2u];
-    let shift = (index & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_u32_unaligned(index: u32) -> u32 {
-    let word_index = index >> 2u;
-    let byte_offset = index & 3u;
-    if (byte_offset == 0u) {
-        return input_words[word_index];
-    }
-    let low = input_words[word_index] >> (byte_offset * 8u);
-    let high_shift = (4u - byte_offset) * 8u;
-    let high = input_words[word_index + 1u] << high_shift;
-    return low | high;
-}
-
-fn dist_candidate(slot: u32) -> u32 {
-    switch (slot) {
-        case 0u: { return 1u; }
-        case 1u: { return 2u; }
-        case 2u: { return 3u; }
-        case 3u: { return 4u; }
-        case 4u: { return 5u; }
-        case 5u: { return 6u; }
-        case 6u: { return 8u; }
-        case 7u: { return 10u; }
-        case 8u: { return 12u; }
-        case 9u: { return 16u; }
-        case 10u: { return 24u; }
-        case 11u: { return 32u; }
-        case 12u: { return 48u; }
-        case 13u: { return 64u; }
-        case 14u: { return 96u; }
-        case 15u: { return 128u; }
-        case 16u: { return 192u; }
-        case 17u: { return 256u; }
-        case 18u: { return 384u; }
-        case 19u: { return 512u; }
-        case 20u: { return 768u; }
-        case 21u: { return 1024u; }
-        case 22u: { return 1536u; }
-        case 23u: { return 2048u; }
-        case 24u: { return 3072u; }
-        case 25u: { return 4096u; }
-        case 26u: { return 6144u; }
-        case 27u: { return 8192u; }
-        case 28u: { return 12288u; }
-        case 29u: { return 16384u; }
-        case 30u: { return 24576u; }
-        default: { return 32768u; }
-    }
-}
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x + (id.y * 8388480u);
-    if (i >= params.len) {
-        return;
-    }
-
-    let lit = byte_at(i);
-    token_lit[i] = lit;
-    token_flags[i] = 0u;
-    token_kind[i] = 0u;
-
-    var best_dist: u32 = 0u;
-    var best_len: u32 = 0u;
-    let match_scan_limit = mode_max_match_scan(params.mode);
-    let match_len_limit = mode_max_match_len(params.mode);
-    let dist_limit = mode_dist_candidate_count(params.mode);
-    let b0 = lit;
-    var b1: u32 = 0u;
-    var b2: u32 = 0u;
-    if (i + 2u < params.len) {
-        b1 = byte_at(i + 1u);
-        b2 = byte_at(i + 2u);
-    }
-    var c: u32 = 0u;
-    loop {
-        if (c >= dist_limit) {
-            break;
-        }
-        let dist = dist_candidate(c);
-        if (dist <= i && i + 2u < params.len) {
-            if (b0 == byte_at(i - dist)
-                && b1 == byte_at(i + 1u - dist)
-                && b2 == byte_at(i + 2u - dist))
-            {
-                var mlen: u32 = 3u;
-                var p = i + 3u;
-                var scanned: u32 = 0u;
-
-                loop {
-                    if (p + 15u >= params.len || mlen + 16u > match_len_limit || scanned + 16u > match_scan_limit) {
-                        break;
-                    }
-
-                    var mismatch = false;
-                    let diff0 = load_u32_unaligned(p) ^ load_u32_unaligned(p - dist);
-                    if (diff0 != 0u) {
-                        let same = countTrailingZeros(diff0) >> 3u;
-                        mlen = mlen + same;
-                        p = p + same;
-                        scanned = scanned + same;
-                        mismatch = true;
-                    }
-
-                    if (!mismatch) {
-                        let diff1 = load_u32_unaligned(p + 4u) ^ load_u32_unaligned(p + 4u - dist);
-                        if (diff1 != 0u) {
-                            let same = countTrailingZeros(diff1) >> 3u;
-                            mlen = mlen + 4u + same;
-                            p = p + 4u + same;
-                            scanned = scanned + 4u + same;
-                            mismatch = true;
-                        }
-                    }
-
-                    if (!mismatch) {
-                        let diff2 = load_u32_unaligned(p + 8u) ^ load_u32_unaligned(p + 8u - dist);
-                        if (diff2 != 0u) {
-                            let same = countTrailingZeros(diff2) >> 3u;
-                            mlen = mlen + 8u + same;
-                            p = p + 8u + same;
-                            scanned = scanned + 8u + same;
-                            mismatch = true;
-                        }
-                    }
-
-                    if (!mismatch) {
-                        let diff3 = load_u32_unaligned(p + 12u) ^ load_u32_unaligned(p + 12u - dist);
-                        if (diff3 != 0u) {
-                            let same = countTrailingZeros(diff3) >> 3u;
-                            mlen = mlen + 12u + same;
-                            p = p + 12u + same;
-                            scanned = scanned + 12u + same;
-                            mismatch = true;
-                        }
-                    }
-
-                    if (mismatch) {
-                        break;
-                    }
-
-                    mlen = mlen + 16u;
-                    p = p + 16u;
-                    scanned = scanned + 16u;
-                }
-
-                loop {
-                    if (p + 3u >= params.len || mlen + 4u > match_len_limit || scanned + 4u > match_scan_limit) {
-                        break;
-                    }
-                    let left4 = load_u32_unaligned(p);
-                    let right4 = load_u32_unaligned(p - dist);
-                    if (left4 == right4) {
-                        mlen = mlen + 4u;
-                        p = p + 4u;
-                        scanned = scanned + 4u;
-                    } else {
-                        let diff = left4 ^ right4;
-                        let same_bytes = countTrailingZeros(diff) >> 3u;
-                        mlen = mlen + same_bytes;
-                        p = p + same_bytes;
-                        scanned = scanned + same_bytes;
-                        break;
-                    }
-                }
-
-                loop {
-                    if (p >= params.len || mlen >= match_len_limit || scanned >= match_scan_limit) {
-                        break;
-                    }
-                    if (byte_at(p) != byte_at(p - dist)) {
-                        break;
-                    }
-                    mlen = mlen + 1u;
-                    p = p + 1u;
-                    scanned = scanned + 1u;
-                }
-                if (mlen > best_len || (mlen == best_len && (best_dist == 0u || dist < best_dist))) {
-                    best_len = mlen;
-                    best_dist = dist;
-                }
-            }
-        }
-        c = c + 1u;
-    }
-
-    if (best_len >= 3u && best_dist > 0u) {
-        token_len[i] = best_len;
-        token_dist[i] = best_dist;
-    } else {
-        token_len[i] = 0u;
-        token_dist[i] = 0u;
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/tokenize.wgsl"))),
         });
 
         let tokenize_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -937,476 +701,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let phase1_fused_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-phase1-fused-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    mode: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> input_words: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> token_flags: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> token_kind: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read_write> token_len: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read_write> token_dist: array<u32>;
-
-@group(0) @binding(5)
-var<storage, read_write> token_lit: array<u32>;
-
-@group(0) @binding(6)
-var<storage, read_write> litlen_freq: array<atomic<u32>>;
-
-@group(0) @binding(7)
-var<storage, read_write> dist_freq: array<atomic<u32>>;
-
-@group(0) @binding(8)
-var<uniform> params: Params;
-
-const PHASE1_WG_SIZE: u32 = 128u;
-const LITLEN_SYMBOLS: u32 = 286u;
-const DIST_SYMBOLS: u32 = 30u;
-
-var<workgroup> local_litlen_freq: array<u32, 286>;
-var<workgroup> local_dist_freq: array<u32, 30>;
-
-fn mode_max_match_scan(mode: u32) -> u32 {
-    switch (mode) {
-        case 1u: { return 128u; } // Balanced
-        case 2u: { return 192u; } // Ratio
-        default: { return 64u; }  // Speed
-    }
-}
-
-fn mode_max_match_len(mode: u32) -> u32 {
-    switch (mode) {
-        case 1u: { return 128u; } // Balanced
-        case 2u: { return 258u; } // Ratio
-        default: { return 64u; }  // Speed
-    }
-}
-
-fn mode_dist_candidate_count(mode: u32) -> u32 {
-    switch (mode) {
-        case 1u: { return 28u; } // Balanced
-        case 2u: { return 32u; } // Ratio
-        default: { return 20u; } // Speed
-    }
-}
-
-fn mode_lazy_delta(mode: u32) -> u32 {
-    switch (mode) {
-        case 1u: { return 1u; } // Balanced
-        case 2u: { return 2u; } // Ratio
-        default: { return 0u; } // Speed
-    }
-}
-
-fn byte_at(index: u32) -> u32 {
-    let word = input_words[index >> 2u];
-    let shift = (index & 3u) * 8u;
-    return (word >> shift) & 0xFFu;
-}
-
-fn load_u32_unaligned(index: u32) -> u32 {
-    let word_index = index >> 2u;
-    let byte_offset = index & 3u;
-    if (byte_offset == 0u) {
-        return input_words[word_index];
-    }
-    let low = input_words[word_index] >> (byte_offset * 8u);
-    let high_shift = (4u - byte_offset) * 8u;
-    let high = input_words[word_index + 1u] << high_shift;
-    return low | high;
-}
-
-fn dist_candidate(slot: u32) -> u32 {
-    switch (slot) {
-        case 0u: { return 1u; }
-        case 1u: { return 2u; }
-        case 2u: { return 3u; }
-        case 3u: { return 4u; }
-        case 4u: { return 5u; }
-        case 5u: { return 6u; }
-        case 6u: { return 8u; }
-        case 7u: { return 10u; }
-        case 8u: { return 12u; }
-        case 9u: { return 16u; }
-        case 10u: { return 24u; }
-        case 11u: { return 32u; }
-        case 12u: { return 48u; }
-        case 13u: { return 64u; }
-        case 14u: { return 96u; }
-        case 15u: { return 128u; }
-        case 16u: { return 192u; }
-        case 17u: { return 256u; }
-        case 18u: { return 384u; }
-        case 19u: { return 512u; }
-        case 20u: { return 768u; }
-        case 21u: { return 1024u; }
-        case 22u: { return 1536u; }
-        case 23u: { return 2048u; }
-        case 24u: { return 3072u; }
-        case 25u: { return 4096u; }
-        case 26u: { return 6144u; }
-        case 27u: { return 8192u; }
-        case 28u: { return 12288u; }
-        case 29u: { return 16384u; }
-        case 30u: { return 24576u; }
-        default: { return 32768u; }
-    }
-}
-
-fn litlen_symbol_for_len(mlen_in: u32) -> u32 {
-    let mlen = min(max(mlen_in, 3u), 258u);
-    if (mlen <= 10u) {
-        return 254u + mlen;
-    }
-    if (mlen == 258u) {
-        return 285u;
-    }
-
-    var symbol: u32 = 265u;
-    var base: u32 = 11u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 5u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 4u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mlen >= base && mlen <= maxv) {
-                return symbol;
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return 285u;
-}
-
-fn dist_symbol_for_dist(mdist_in: u32) -> u32 {
-    let mdist = max(mdist_in, 1u);
-    if (mdist <= 1u) {
-        return 0u;
-    }
-    if (mdist <= 4u) {
-        return mdist - 1u;
-    }
-
-    var symbol: u32 = 4u;
-    var base: u32 = 5u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 13u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 2u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mdist >= base && mdist <= maxv) {
-                return symbol;
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return 29u;
-}
-
-@compute @workgroup_size(128)
-fn main(
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_workgroups) num_wg: vec3<u32>,
-) {
-    var s: u32 = lid;
-    loop {
-        if (s >= LITLEN_SYMBOLS) {
-            break;
-        }
-        local_litlen_freq[s] = 0u;
-        s = s + PHASE1_WG_SIZE;
-    }
-    s = lid;
-    loop {
-        if (s >= DIST_SYMBOLS) {
-            break;
-        }
-        local_dist_freq[s] = 0u;
-        s = s + PHASE1_WG_SIZE;
-    }
-    workgroupBarrier();
-
-    let segment_size = max(params.block_size, 1u);
-    let seg_id = wid.x + (wid.y * max(1u, num_wg.x));
-    let seg_start = seg_id * segment_size;
-    if (seg_start >= params.len) {
-        return;
-    }
-    let seg_end = min(seg_start + segment_size, params.len);
-
-    let match_scan_limit = mode_max_match_scan(params.mode);
-    let match_len_limit = mode_max_match_len(params.mode);
-    let dist_limit = mode_dist_candidate_count(params.mode);
-
-    var i = seg_start + lid;
-    loop {
-        if (i >= seg_end) {
-            break;
-        }
-
-        let lit = byte_at(i);
-        token_lit[i] = lit;
-        token_flags[i] = 0u;
-        token_kind[i] = 0u;
-
-        var best_dist: u32 = 0u;
-        var best_len: u32 = 0u;
-        let b0 = lit;
-        var b1: u32 = 0u;
-        var b2: u32 = 0u;
-        if (i + 2u < params.len) {
-            b1 = byte_at(i + 1u);
-            b2 = byte_at(i + 2u);
-        }
-
-        var c: u32 = 0u;
-        loop {
-            if (c >= dist_limit) {
-                break;
-            }
-            let dist = dist_candidate(c);
-            if (dist <= i && i + 2u < params.len) {
-                if (b0 == byte_at(i - dist)
-                    && b1 == byte_at(i + 1u - dist)
-                    && b2 == byte_at(i + 2u - dist))
-                {
-                    var mlen: u32 = 3u;
-                    var p = i + 3u;
-                    var scanned: u32 = 0u;
-
-                    loop {
-                        if (p + 15u >= params.len || mlen + 16u > match_len_limit || scanned + 16u > match_scan_limit) {
-                            break;
-                        }
-
-                        var mismatch = false;
-                        let diff0 = load_u32_unaligned(p) ^ load_u32_unaligned(p - dist);
-                        if (diff0 != 0u) {
-                            let same = countTrailingZeros(diff0) >> 3u;
-                            mlen = mlen + same;
-                            p = p + same;
-                            scanned = scanned + same;
-                            mismatch = true;
-                        }
-
-                        if (!mismatch) {
-                            let diff1 = load_u32_unaligned(p + 4u) ^ load_u32_unaligned(p + 4u - dist);
-                            if (diff1 != 0u) {
-                                let same = countTrailingZeros(diff1) >> 3u;
-                                mlen = mlen + 4u + same;
-                                p = p + 4u + same;
-                                scanned = scanned + 4u + same;
-                                mismatch = true;
-                            }
-                        }
-
-                        if (!mismatch) {
-                            let diff2 = load_u32_unaligned(p + 8u) ^ load_u32_unaligned(p + 8u - dist);
-                            if (diff2 != 0u) {
-                                let same = countTrailingZeros(diff2) >> 3u;
-                                mlen = mlen + 8u + same;
-                                p = p + 8u + same;
-                                scanned = scanned + 8u + same;
-                                mismatch = true;
-                            }
-                        }
-
-                        if (!mismatch) {
-                            let diff3 = load_u32_unaligned(p + 12u) ^ load_u32_unaligned(p + 12u - dist);
-                            if (diff3 != 0u) {
-                                let same = countTrailingZeros(diff3) >> 3u;
-                                mlen = mlen + 12u + same;
-                                p = p + 12u + same;
-                                scanned = scanned + 12u + same;
-                                mismatch = true;
-                            }
-                        }
-
-                        if (mismatch) {
-                            break;
-                        }
-
-                        mlen = mlen + 16u;
-                        p = p + 16u;
-                        scanned = scanned + 16u;
-                    }
-
-                    loop {
-                        if (p + 3u >= params.len || mlen + 4u > match_len_limit || scanned + 4u > match_scan_limit) {
-                            break;
-                        }
-                        let left4 = load_u32_unaligned(p);
-                        let right4 = load_u32_unaligned(p - dist);
-                        if (left4 == right4) {
-                            mlen = mlen + 4u;
-                            p = p + 4u;
-                            scanned = scanned + 4u;
-                        } else {
-                            let diff = left4 ^ right4;
-                            let same_bytes = countTrailingZeros(diff) >> 3u;
-                            mlen = mlen + same_bytes;
-                            p = p + same_bytes;
-                            scanned = scanned + same_bytes;
-                            break;
-                        }
-                    }
-
-                    loop {
-                        if (p >= params.len || mlen >= match_len_limit || scanned >= match_scan_limit) {
-                            break;
-                        }
-                        if (byte_at(p) != byte_at(p - dist)) {
-                            break;
-                        }
-                        mlen = mlen + 1u;
-                        p = p + 1u;
-                        scanned = scanned + 1u;
-                    }
-
-                    if (mlen > best_len || (mlen == best_len && (best_dist == 0u || dist < best_dist))) {
-                        best_len = mlen;
-                        best_dist = dist;
-                    }
-                }
-            }
-            c = c + 1u;
-        }
-
-        if (best_len >= 3u && best_dist > 0u) {
-            token_len[i] = best_len;
-            token_dist[i] = best_dist;
-        } else {
-            token_len[i] = 0u;
-            token_dist[i] = 0u;
-        }
-
-        i = i + PHASE1_WG_SIZE;
-    }
-
-    workgroupBarrier();
-
-    if (lid == 0u) {
-        let lazy_delta = mode_lazy_delta(params.mode);
-        var pos = seg_start;
-        loop {
-            if (pos >= seg_end) {
-                break;
-            }
-
-            if (token_len[pos] >= 3u && token_dist[pos] > 0u) {
-                let mlen = min(token_len[pos], seg_end - pos);
-                // Segment tail can clamp to 1-2 bytes; those must stay literals.
-                var take_match = (mlen >= 3u);
-                if (take_match && lazy_delta > 0u && (pos + 1u) < seg_end && token_len[pos + 1u] >= 3u && token_dist[pos + 1u] > 0u) {
-                    let next_len = min(token_len[pos + 1u], seg_end - (pos + 1u));
-                    if (next_len >= mlen + lazy_delta) {
-                        take_match = false;
-                    }
-                }
-
-                if (take_match) {
-                    token_flags[pos] = 1u;
-                    token_kind[pos] = 1u;
-                    token_len[pos] = mlen;
-                    let len_symbol = litlen_symbol_for_len(mlen);
-                    let dist_symbol = dist_symbol_for_dist(token_dist[pos]);
-                    local_litlen_freq[len_symbol] = local_litlen_freq[len_symbol] + 1u;
-                    local_dist_freq[dist_symbol] = local_dist_freq[dist_symbol] + 1u;
-
-                    var j: u32 = 1u;
-                    loop {
-                        if (j >= mlen || (pos + j) >= seg_end) {
-                            break;
-                        }
-                        token_flags[pos + j] = 0u;
-                        token_kind[pos + j] = 0u;
-                        token_len[pos + j] = 0u;
-                        token_dist[pos + j] = 0u;
-                        j = j + 1u;
-                    }
-                    pos = pos + mlen;
-                } else {
-                    token_flags[pos] = 1u;
-                    token_kind[pos] = 0u;
-                    token_len[pos] = 0u;
-                    token_dist[pos] = 0u;
-                    let lit = min(token_lit[pos], 255u);
-                    local_litlen_freq[lit] = local_litlen_freq[lit] + 1u;
-                    pos = pos + 1u;
-                }
-            } else {
-                token_flags[pos] = 1u;
-                token_kind[pos] = 0u;
-                token_len[pos] = 0u;
-                token_dist[pos] = 0u;
-                let lit = min(token_lit[pos], 255u);
-                local_litlen_freq[lit] = local_litlen_freq[lit] + 1u;
-                pos = pos + 1u;
-            }
-        }
-    }
-
-    workgroupBarrier();
-
-    s = lid;
-    loop {
-        if (s >= LITLEN_SYMBOLS) {
-            break;
-        }
-        let value = local_litlen_freq[s];
-        if (value > 0u) {
-            atomicAdd(&litlen_freq[s], value);
-        }
-        s = s + PHASE1_WG_SIZE;
-    }
-
-    s = lid;
-    loop {
-        if (s >= DIST_SYMBOLS) {
-            break;
-        }
-        let value = local_dist_freq[s];
-        if (value > 0u) {
-            atomicAdd(&dist_freq[s], value);
-        }
-        s = s + PHASE1_WG_SIZE;
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/phase1_fused.wgsl"))),
         });
 
         let phase1_fused_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1425,100 +720,7 @@ fn main(
 
         let token_finalize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-token-finalize-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    mode: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(1)
-var<storage, read_write> token_flags: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> token_kind: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read_write> token_len: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read_write> token_dist: array<u32>;
-
-@group(0) @binding(6)
-var<uniform> params: Params;
-
-fn mode_lazy_delta(mode: u32) -> u32 {
-    switch (mode) {
-        case 1u: { return 1u; } // Balanced
-        case 2u: { return 2u; } // Ratio
-        default: { return 0u; } // Speed
-    }
-}
-
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let segment_size = max(params.block_size, 1u);
-    let seg_start = id.x * segment_size;
-    if (seg_start >= params.len) {
-        return;
-    }
-    let seg_end = min(seg_start + segment_size, params.len);
-
-    var i: u32 = seg_start;
-    let lazy_delta = mode_lazy_delta(params.mode);
-    loop {
-        if (i >= seg_end) {
-            break;
-        }
-
-        if (token_len[i] >= 3u && token_dist[i] > 0u) {
-            let mlen = min(token_len[i], seg_end - i);
-            // Segment tail can clamp to 1-2 bytes; those must stay literals.
-            var take_match = (mlen >= 3u);
-            if (take_match && lazy_delta > 0u && (i + 1u) < seg_end && token_len[i + 1u] >= 3u && token_dist[i + 1u] > 0u) {
-                let next_len = min(token_len[i + 1u], seg_end - (i + 1u));
-                if (next_len >= mlen + lazy_delta) {
-                    take_match = false;
-                }
-            }
-
-            if (take_match) {
-                token_flags[i] = 1u;
-                token_kind[i] = 1u;
-                token_len[i] = mlen;
-
-                var j: u32 = 1u;
-                loop {
-                    if (j >= mlen || (i + j) >= seg_end) {
-                        break;
-                    }
-                    token_flags[i + j] = 0u;
-                    token_kind[i + j] = 0u;
-                    token_len[i + j] = 0u;
-                    token_dist[i + j] = 0u;
-                    j = j + 1u;
-                }
-                i = i + mlen;
-            } else {
-                token_flags[i] = 1u;
-                token_kind[i] = 0u;
-                token_len[i] = 0u;
-                token_dist[i] = 0u;
-                i = i + 1u;
-            }
-        } else {
-            token_flags[i] = 1u;
-            token_kind[i] = 0u;
-            token_len[i] = 0u;
-            token_dist[i] = 0u;
-            i = i + 1u;
-        }
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/token_finalize.wgsl"))),
         });
 
         let token_finalize_pipeline =
@@ -1618,186 +820,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let freq_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-freq-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    mode: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> token_flags: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> token_kind: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> token_match_len: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read> token_match_dist: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read> token_lit: array<u32>;
-
-@group(0) @binding(5)
-var<storage, read_write> litlen_freq: array<atomic<u32>>;
-
-@group(0) @binding(6)
-var<storage, read_write> dist_freq: array<atomic<u32>>;
-
-@group(0) @binding(7)
-var<uniform> params: Params;
-
-fn litlen_symbol_for_len(mlen_in: u32) -> u32 {
-    let mlen = min(max(mlen_in, 3u), 258u);
-    if (mlen <= 10u) {
-        return 254u + mlen;
-    }
-    if (mlen == 258u) {
-        return 285u;
-    }
-
-    var symbol: u32 = 265u;
-    var base: u32 = 11u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 5u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 4u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mlen >= base && mlen <= maxv) {
-                return symbol;
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return 285u;
-}
-
-fn dist_symbol_for_dist(mdist_in: u32) -> u32 {
-    let mdist = max(mdist_in, 1u);
-    if (mdist <= 1u) {
-        return 0u;
-    }
-    if (mdist <= 4u) {
-        return mdist - 1u;
-    }
-
-    var symbol: u32 = 4u;
-    var base: u32 = 5u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 13u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 2u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mdist >= base && mdist <= maxv) {
-                return symbol;
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return 29u;
-}
-
-const LITLEN_SYMBOLS: u32 = 286u;
-const DIST_SYMBOLS: u32 = 30u;
-const FREQ_WORKGROUP_SIZE: u32 = 128u;
-
-var<workgroup> local_litlen_freq: array<atomic<u32>, 286>;
-var<workgroup> local_dist_freq: array<atomic<u32>, 30>;
-
-@compute @workgroup_size(128)
-fn main(
-    @builtin(global_invocation_id) id: vec3<u32>,
-    @builtin(local_invocation_index) lid: u32,
-    @builtin(num_workgroups) num_wg: vec3<u32>,
-) {
-    var s: u32 = lid;
-    loop {
-        if (s >= LITLEN_SYMBOLS) {
-            break;
-        }
-        atomicStore(&local_litlen_freq[s], 0u);
-        s = s + FREQ_WORKGROUP_SIZE;
-    }
-
-    s = lid;
-    loop {
-        if (s >= DIST_SYMBOLS) {
-            break;
-        }
-        atomicStore(&local_dist_freq[s], 0u);
-        s = s + FREQ_WORKGROUP_SIZE;
-    }
-    workgroupBarrier();
-
-    let thread_count = max(1u, num_wg.x * num_wg.y * FREQ_WORKGROUP_SIZE);
-    var idx = id.x + (id.y * 8388480u);
-    loop {
-        if (idx >= params.len) {
-            break;
-        }
-        if (token_flags[idx] != 0u) {
-            if (token_kind[idx] == 0u) {
-                let lit = min(token_lit[idx], 255u);
-                atomicAdd(&local_litlen_freq[lit], 1u);
-            } else {
-                let len_symbol = litlen_symbol_for_len(token_match_len[idx]);
-                let dist_symbol = dist_symbol_for_dist(token_match_dist[idx]);
-                atomicAdd(&local_litlen_freq[len_symbol], 1u);
-                atomicAdd(&local_dist_freq[dist_symbol], 1u);
-            }
-        }
-        idx = idx + thread_count;
-    }
-    workgroupBarrier();
-
-    s = lid;
-    loop {
-        if (s >= LITLEN_SYMBOLS) {
-            break;
-        }
-        let value = atomicLoad(&local_litlen_freq[s]);
-        if (value > 0u) {
-            atomicAdd(&litlen_freq[s], value);
-        }
-        s = s + FREQ_WORKGROUP_SIZE;
-    }
-
-    s = lid;
-    loop {
-        if (s >= DIST_SYMBOLS) {
-            break;
-        }
-        let value = atomicLoad(&local_dist_freq[s]);
-        if (value > 0u) {
-            atomicAdd(&dist_freq[s], value);
-        }
-        s = s + FREQ_WORKGROUP_SIZE;
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/freq.wgsl"))),
         });
 
         let freq_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1912,194 +935,7 @@ fn main(
 
         let dyn_map_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-dyn-map-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    mode: u32,
-    header_bits: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> token_flags: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> token_match_len: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> token_match_dist: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read> token_lit: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read> dyn_table: array<u32>;
-
-@group(0) @binding(5)
-var<storage, read_write> out_codes: array<u32>;
-
-@group(0) @binding(6)
-var<storage, read_write> out_overflow: array<u32>;
-
-@group(0) @binding(7)
-var<storage, read_write> out_bitlens: array<u32>;
-
-@group(0) @binding(8)
-var<uniform> params: Params;
-
-fn litlen_code(sym: u32) -> u32 {
-    return dyn_table[sym];
-}
-
-fn litlen_bits(sym: u32) -> u32 {
-    return dyn_table[286u + sym];
-}
-
-fn dist_code(sym: u32) -> u32 {
-    return dyn_table[572u + sym];
-}
-
-fn dist_bits(sym: u32) -> u32 {
-    return dyn_table[602u + sym];
-}
-
-fn litlen_symbol_for_len(mlen_in: u32) -> vec3<u32> {
-    let mlen = min(max(mlen_in, 3u), 258u);
-    if (mlen <= 10u) {
-        return vec3<u32>(254u + mlen, 0u, 0u);
-    }
-    if (mlen == 258u) {
-        return vec3<u32>(285u, 0u, 0u);
-    }
-
-    var symbol: u32 = 265u;
-    var base: u32 = 11u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 5u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 4u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mlen >= base && mlen <= maxv) {
-                return vec3<u32>(symbol, mlen - base, extra);
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return vec3<u32>(285u, 0u, 0u);
-}
-
-fn dist_symbol_for_dist(mdist_in: u32) -> vec3<u32> {
-    let mdist = max(mdist_in, 1u);
-    if (mdist <= 1u) {
-        return vec3<u32>(0u, 0u, 0u);
-    }
-    if (mdist <= 4u) {
-        return vec3<u32>(mdist - 1u, 0u, 0u);
-    }
-
-    var symbol: u32 = 4u;
-    var base: u32 = 5u;
-    var extra: u32 = 1u;
-    loop {
-        if (extra > 13u) {
-            break;
-        }
-        var j: u32 = 0u;
-        loop {
-            if (j >= 2u) {
-                break;
-            }
-            let maxv = base + ((1u << extra) - 1u);
-            if (mdist >= base && mdist <= maxv) {
-                return vec3<u32>(symbol, mdist - base, extra);
-            }
-            base = maxv + 1u;
-            symbol = symbol + 1u;
-            j = j + 1u;
-        }
-        extra = extra + 1u;
-    }
-    return vec3<u32>(29u, 0u, 0u);
-}
-
-fn append_bits(
-    value: u32,
-    bits: u32,
-    code_lo: ptr<function, u32>,
-    code_hi: ptr<function, u32>,
-    bitlen: ptr<function, u32>,
-) {
-    if (bits == 0u) {
-        return;
-    }
-    let cur = *bitlen;
-    if (cur < 32u) {
-        if (cur + bits <= 32u) {
-            *code_lo = *code_lo | (value << cur);
-        } else {
-            let low_bits = 32u - cur;
-            *code_lo = *code_lo | (value << cur);
-            *code_hi = *code_hi | (value >> low_bits);
-        }
-    } else {
-        let hi_shift = cur - 32u;
-        *code_hi = *code_hi | (value << hi_shift);
-    }
-    *bitlen = cur + bits;
-}
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len || token_flags[idx] == 0u) {
-        return;
-    }
-
-    var code_lo: u32 = 0u;
-    var code_hi: u32 = 0u;
-    var bits: u32 = 0u;
-
-    if (token_match_len[idx] < 3u || token_match_dist[idx] == 0u) {
-        let sym = min(token_lit[idx], 255u);
-        append_bits(litlen_code(sym), litlen_bits(sym), &code_lo, &code_hi, &bits);
-    } else {
-        let len_info = litlen_symbol_for_len(token_match_len[idx]);
-        let len_sym = len_info.x;
-        let len_extra_val = len_info.y;
-        let len_extra_bits = len_info.z;
-        append_bits(
-            litlen_code(len_sym),
-            litlen_bits(len_sym),
-            &code_lo,
-            &code_hi,
-            &bits,
-        );
-        append_bits(len_extra_val, len_extra_bits, &code_lo, &code_hi, &bits);
-
-        let dist_info = dist_symbol_for_dist(token_match_dist[idx]);
-        let dist_sym = dist_info.x;
-        let dist_extra_val = dist_info.y;
-        let dist_extra_bits = dist_info.z;
-        append_bits(dist_code(dist_sym), dist_bits(dist_sym), &code_lo, &code_hi, &bits);
-        append_bits(dist_extra_val, dist_extra_bits, &code_lo, &code_hi, &bits);
-    }
-
-    out_codes[idx] = code_lo;
-    out_overflow[idx] = code_hi;
-    out_bitlens[idx] = bits;
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/dyn_map.wgsl"))),
         });
 
         let dyn_map_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2154,41 +990,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let dyn_finalize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-dyn-finalize-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-@group(0) @binding(0)
-var<storage, read_write> out_words: array<atomic<u32>>;
-
-@group(0) @binding(1)
-var<storage, read_write> total_bits: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> dyn_meta: array<u32>;
-
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (id.x != 0u) {
-        return;
-    }
-
-    let header_bits = dyn_meta[0];
-    let eob_code = dyn_meta[1];
-    let eob_bits = dyn_meta[2];
-
-    let token_bits = total_bits[0];
-    let bit_offset = header_bits + token_bits;
-    let word_index = bit_offset >> 5u;
-    let shift = bit_offset & 31u;
-
-    atomicOr(&out_words[word_index], eob_code << shift);
-    if (shift + eob_bits > 32u) {
-        atomicOr(&out_words[word_index + 1u], eob_code >> (32u - shift));
-    }
-
-    total_bits[0] = bit_offset + eob_bits;
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/dyn_finalize.wgsl"))),
         });
 
         let dyn_finalize_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2304,204 +1106,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let litlen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-litlen-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> token_flags: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> token_kind: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> token_match_len: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read> token_match_dist: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read> token_lit: array<u32>;
-
-@group(0) @binding(5)
-var<storage, read> token_prefix: array<u32>;
-
-@group(0) @binding(6)
-var<storage, read_write> codes: array<u32>;
-
-@group(0) @binding(7)
-var<storage, read_write> bitlens: array<u32>;
-
-@group(0) @binding(8)
-var<uniform> params: Params;
-
-fn reverse_bits_u32(value: u32, bit_len: u32) -> u32 {
-    var out: u32 = 0u;
-    var i: u32 = 0u;
-    loop {
-        if (i >= bit_len) {
-            break;
-        }
-        out = (out << 1u) | ((value >> i) & 1u);
-        i = i + 1u;
-    }
-    return out;
-}
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    if (token_flags[idx] == 0u) {
-        return;
-    }
-
-    let token_index = token_prefix[idx];
-    let kind = token_kind[idx];
-
-    if (kind == 0u) {
-        let lit = token_lit[idx];
-        var code: u32 = 0u;
-        var bits: u32 = 0u;
-        if (lit <= 143u) {
-            code = 0x30u + lit;
-            bits = 8u;
-        } else {
-            code = 0x190u + (lit - 144u);
-            bits = 9u;
-        }
-
-        codes[token_index] = reverse_bits_u32(code, bits);
-        bitlens[token_index] = bits;
-    } else {
-        let mlen = token_match_len[idx];
-        let mdist = token_match_dist[idx];
-
-        var len_symbol: u32 = 257u;
-        var len_extra_bits: u32 = 0u;
-        var len_extra_value: u32 = 0u;
-
-        if (mlen <= 10u) {
-            len_symbol = 254u + mlen;
-        } else if (mlen == 258u) {
-            len_symbol = 285u;
-        } else {
-            var symbol: u32 = 265u;
-            var base: u32 = 11u;
-            var extra: u32 = 1u;
-            var found: bool = false;
-
-            loop {
-                if (extra > 5u || found) {
-                    break;
-                }
-
-                var j: u32 = 0u;
-                loop {
-                    if (j >= 4u) {
-                        break;
-                    }
-                    let maxv = base + ((1u << extra) - 1u);
-                    if (mlen >= base && mlen <= maxv) {
-                        len_symbol = symbol;
-                        len_extra_bits = extra;
-                        len_extra_value = mlen - base;
-                        found = true;
-                        break;
-                    }
-                    base = maxv + 1u;
-                    symbol = symbol + 1u;
-                    j = j + 1u;
-                }
-
-                extra = extra + 1u;
-            }
-        }
-
-        var len_code: u32 = 0u;
-        var len_bits: u32 = 0u;
-        if (len_symbol <= 279u) {
-            len_code = len_symbol - 256u;
-            len_bits = 7u;
-        } else {
-            len_code = 0xC0u + (len_symbol - 280u);
-            len_bits = 8u;
-        }
-
-        var out_code: u32 = 0u;
-        var out_bits: u32 = 0u;
-
-        out_code = out_code | (reverse_bits_u32(len_code, len_bits) << out_bits);
-        out_bits = out_bits + len_bits;
-
-        if (len_extra_bits > 0u) {
-            out_code = out_code | (len_extra_value << out_bits);
-            out_bits = out_bits + len_extra_bits;
-        }
-
-        var dist_symbol: u32 = 0u;
-        var dist_extra_bits: u32 = 0u;
-        var dist_extra_value: u32 = 0u;
-
-        if (mdist <= 1u) {
-            dist_symbol = 0u;
-        } else if (mdist <= 4u) {
-            dist_symbol = mdist - 1u;
-        } else {
-            var symbol: u32 = 4u;
-            var base: u32 = 5u;
-            var extra: u32 = 1u;
-            var found: bool = false;
-
-            loop {
-                if (extra > 13u || found) {
-                    break;
-                }
-
-                var j: u32 = 0u;
-                loop {
-                    if (j >= 2u) {
-                        break;
-                    }
-                    let maxv = base + ((1u << extra) - 1u);
-                    if (mdist >= base && mdist <= maxv) {
-                        dist_symbol = symbol;
-                        dist_extra_bits = extra;
-                        dist_extra_value = mdist - base;
-                        found = true;
-                        break;
-                    }
-                    base = maxv + 1u;
-                    symbol = symbol + 1u;
-                    j = j + 1u;
-                }
-
-                extra = extra + 1u;
-            }
-        }
-
-        let dist_code = reverse_bits_u32(dist_symbol, 5u);
-        out_code = out_code | (dist_code << out_bits);
-        out_bits = out_bits + 5u;
-        if (dist_extra_bits > 0u) {
-            out_code = out_code | (dist_extra_value << out_bits);
-            out_bits = out_bits + dist_extra_bits;
-        }
-
-        codes[token_index] = out_code;
-        bitlens[token_index] = out_bits;
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/litlen.wgsl"))),
         });
 
         let litlen_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2586,72 +1191,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let bitpack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-bitpack-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> codes: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> codes_hi: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> bitlens: array<u32>;
-
-@group(0) @binding(3)
-var<storage, read> bit_offsets: array<u32>;
-
-@group(0) @binding(4)
-var<storage, read_write> out_words: array<atomic<u32>>;
-
-@group(0) @binding(5)
-var<uniform> params: Params;
-
-@compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 8388480u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    let bits = bitlens[idx];
-    if (bits == 0u) {
-        return;
-    }
-
-    let code = codes[idx];
-    let code_hi = codes_hi[idx];
-    let bit_offset = bit_offsets[idx] + params._pad1;
-    let word_index = bit_offset >> 5u;
-    let shift = bit_offset & 31u;
-
-    atomicOr(&out_words[word_index], code << shift);
-    // Avoid implementation-defined shift-by-32 when shift == 0 and bits > 32.
-    // The high part for bits > 32 is handled by the code_hi path below.
-    if (shift > 0u && shift + bits > 32u) {
-        atomicOr(&out_words[word_index + 1u], code >> (32u - shift));
-    }
-
-    if (bits > 32u) {
-        let hi_bits = bits - 32u;
-        let hi_offset = bit_offset + 32u;
-        let hi_word_index = hi_offset >> 5u;
-        let hi_shift = hi_offset & 31u;
-
-        atomicOr(&out_words[hi_word_index], code_hi << hi_shift);
-        if (hi_shift + hi_bits > 32u) {
-            atomicOr(&out_words[hi_word_index + 1u], code_hi >> (32u - hi_shift));
-        }
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/bitpack.wgsl"))),
         });
 
         let bitpack_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2717,67 +1257,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
         let scan_blocks_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-scan-blocks-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read> input_data: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read_write> prefix_data: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read_write> block_sums: array<u32>;
-
-@group(0) @binding(3)
-var<uniform> params: Params;
-
-var<workgroup> scratch: array<u32, 256>;
-
-@compute @workgroup_size(256)
-fn main(
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) wg_id: vec3<u32>,
-) {
-    let lid = local_id.x;
-    let gid = wg_id.x + (wg_id.y * 65535u);
-    let idx = gid * 256u + lid;
-    let value = select(0u, input_data[idx], idx < params.len);
-
-    scratch[lid] = value;
-    workgroupBarrier();
-
-    var offset: u32 = 1u;
-    loop {
-        if (offset >= 256u) {
-            break;
-        }
-        var addend: u32 = 0u;
-        if (lid >= offset) {
-            addend = scratch[lid - offset];
-        }
-        workgroupBarrier();
-        scratch[lid] = scratch[lid] + addend;
-        workgroupBarrier();
-        offset = offset << 1u;
-    }
-
-    if (idx < params.len) {
-        prefix_data[idx] = scratch[lid] - value;
-    }
-
-    if (lid == 255u && (gid * 256u) < params.len) {
-        block_sums[gid] = scratch[255u];
-    }
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/scan_blocks.wgsl"))),
         });
 
         let scan_blocks_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2832,36 +1312,7 @@ fn main(
 
         let scan_add_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cozip-scan-add-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
-                r#"
-struct Params {
-    len: u32,
-    block_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0)
-var<storage, read_write> prefix_data: array<u32>;
-
-@group(0) @binding(1)
-var<storage, read> block_offsets: array<u32>;
-
-@group(0) @binding(2)
-var<uniform> params: Params;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x + (id.y * 16776960u);
-    if (idx >= params.len) {
-        return;
-    }
-
-    let block_idx = idx / 256u;
-    prefix_data[idx] = prefix_data[idx] + block_offsets[block_idx];
-}
-"#,
-            )),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/scan_add.wgsl"))),
         });
 
         let scan_add_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2912,6 +1363,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             scan_add_pipeline,
             deflate_slots: Mutex::new(Vec::new()),
             deflate_header_buffer,
+            dump_bad_chunk_seq: AtomicUsize::new(0),
         })
     }
 
@@ -3672,11 +2124,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     fn deflate_fixed_literals_batch(
         &self,
         chunks: &[&[u8]],
-        mode: CompressionMode,
-        compression_level: u32,
+        options: &HybridOptions,
     ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+        let mode = options.compression_mode;
+        let compression_level = options.compression_level;
         if mode == CompressionMode::Ratio {
-            return self.deflate_dynamic_hybrid_batch(chunks, mode, compression_level);
+            return self.deflate_dynamic_hybrid_batch(chunks, options);
         }
         if chunks.is_empty() {
             return Ok(Vec::new());
@@ -4014,9 +2467,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     fn deflate_dynamic_hybrid_batch(
         &self,
         chunks: &[&[u8]],
-        mode: CompressionMode,
-        compression_level: u32,
+        options: &HybridOptions,
     ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+        let mode = options.compression_mode;
+        let compression_level = options.compression_level;
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -4732,7 +3186,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 compressed.extend_from_slice(&mapped[..total_bytes]);
                 drop(mapped);
                 slots[chunk_index].readback.unmap();
-                if mode == CompressionMode::Ratio && gpu_dynamic_self_check_enabled() {
+                if mode == CompressionMode::Ratio && options.gpu_dynamic_self_check {
                     if let Err(issue) = gpu_chunk_roundtrip_diagnose(chunks[chunk_index], &compressed)
                     {
                         let raw_hash = fnv1a64(chunks[chunk_index]);
@@ -4794,6 +3248,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                         };
                         compressed = deflate_compress_cpu(chunks[chunk_index], compression_level)?;
                         dump_gpu_dynamic_bad_chunk(
+                            options,
+                            &self.dump_bad_chunk_seq,
                             timing.call_id,
                             chunk_index,
                             chunks[chunk_index],
@@ -5035,48 +3491,6 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<std::sync::MutexGuard<'a, T>, Cozi
         .map_err(|_| CozipDeflateError::Internal("mutex poisoned"))
 }
 
-static GPU_CONTEXT: OnceLock<Mutex<Option<Arc<GpuAssist>>>> = OnceLock::new();
-
-fn shared_gpu_context(prefer_gpu: bool) -> Option<Arc<GpuAssist>> {
-    if !prefer_gpu {
-        return None;
-    }
-
-    let timing_enabled = timing_profile_enabled();
-    let holder = GPU_CONTEXT.get_or_init(|| Mutex::new(None));
-    let mut guard = holder.lock().ok()?;
-
-    if let Some(existing) = guard.as_ref() {
-        return Some(existing.clone());
-    }
-
-    let init_start = if timing_enabled {
-        Some(Instant::now())
-    } else {
-        None
-    };
-    let created = GpuAssist::new().ok().map(Arc::new);
-    if let Some(start) = init_start {
-        eprintln!(
-            "[cozip][timing] gpu_context_init_ms={:.3} gpu_available={}",
-            elapsed_ms(start),
-            created.is_some()
-        );
-    }
-    *guard = created.clone();
-    created
-}
-
-fn gpu_context_cached_available() -> bool {
-    let Some(holder) = GPU_CONTEXT.get() else {
-        return false;
-    };
-    let Ok(guard) = holder.lock() else {
-        return false;
-    };
-    guard.is_some()
-}
-
 pub fn deflate_compress_cpu(input: &[u8], level: u32) -> Result<Vec<u8>, CozipDeflateError> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), Compression::new(level.clamp(0, 9)));
@@ -5093,6 +3507,15 @@ pub fn deflate_decompress_cpu(input: &[u8]) -> Result<Vec<u8>, CozipDeflateError
 pub fn compress_hybrid(
     input: &[u8],
     options: &HybridOptions,
+) -> Result<CompressedFrame, CozipDeflateError> {
+    let cozip = CoZip::init(options.clone())?;
+    cozip.compress(input)
+}
+
+fn compress_hybrid_with_context(
+    input: &[u8],
+    options: &HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
 ) -> Result<CompressedFrame, CozipDeflateError> {
     maybe_warn_deep_profile_enabled();
     validate_options(options)?;
@@ -5112,10 +3535,11 @@ pub fn compress_hybrid(
     }
 
     let gpu_requested = options.prefer_gpu && options.gpu_fraction > 0.0;
-    let tasks = build_chunk_tasks(input, options, gpu_requested)?;
-    let has_gpu_tasks = gpu_requested && tasks.iter().any(|task| task.preferred_gpu);
+    let gpu_available = gpu_context.is_some();
+    let tasks = build_chunk_tasks(input, options, gpu_requested && gpu_available)?;
+    let has_gpu_tasks = gpu_available && gpu_requested && tasks.iter().any(|task| task.preferred_gpu);
     if has_gpu_tasks {
-        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options);
+        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options, gpu_context);
     }
 
     let chunk_count = tasks.len();
@@ -5166,6 +3590,15 @@ pub fn decompress_hybrid(
     frame: &[u8],
     options: &HybridOptions,
 ) -> Result<DecompressedFrame, CozipDeflateError> {
+    let cozip = CoZip::init(options.clone())?;
+    cozip.decompress(frame)
+}
+
+fn decompress_hybrid_with_context(
+    frame: &[u8],
+    options: &HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
+) -> Result<DecompressedFrame, CozipDeflateError> {
     validate_options(options)?;
 
     let (original_len, descriptors) = parse_frame(frame)?;
@@ -5183,10 +3616,10 @@ pub fn decompress_hybrid(
         });
     }
 
-    let gpu_context = if options.gpu_fraction <= 0.0 {
-        None
+    let gpu_context = if options.gpu_fraction > 0.0 {
+        gpu_context
     } else {
-        shared_gpu_context(options.prefer_gpu)
+        None
     };
 
     let stats = summarize_descriptors(&descriptors, gpu_context.is_some());
@@ -5278,6 +3711,18 @@ fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {
         ));
     }
 
+    if options.gpu_validation_sample_every == 0 {
+        return Err(CozipDeflateError::InvalidOptions(
+            "gpu_validation_sample_every must be greater than 0",
+        ));
+    }
+
+    if options.gpu_dump_bad_chunk_limit == 0 {
+        return Err(CozipDeflateError::InvalidOptions(
+            "gpu_dump_bad_chunk_limit must be greater than 0",
+        ));
+    }
+
     Ok(())
 }
 
@@ -5297,83 +3742,20 @@ fn gpu_reservation_timeout_ms(mode: CompressionMode) -> u64 {
     }
 }
 
-fn gpu_cold_start_reserved_chunks() -> usize {
-    static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        let default = GPU_COLD_START_RESERVED_CHUNKS;
-        let Ok(raw) = std::env::var("COZIP_GPU_COLD_RESERVED_CHUNKS") else {
-            return default;
-        };
-        let Ok(parsed) = raw.trim().parse::<usize>() else {
-            return default;
-        };
-        parsed.clamp(0, GPU_RATIO_RESERVED_TARGET_CHUNKS)
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuValidationMode {
-    Always,
-    Sample,
-    Off,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct GpuValidationConfig {
-    mode: GpuValidationMode,
-    sample_every: usize,
-}
-
-fn gpu_validation_config() -> GpuValidationConfig {
-    static VALUE: OnceLock<GpuValidationConfig> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        let mode = match std::env::var("COZIP_GPU_VALIDATION_MODE")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("always") => GpuValidationMode::Always,
-            Some("off") => GpuValidationMode::Off,
-            Some("sample") => GpuValidationMode::Sample,
-            _ => GpuValidationMode::Always,
-        };
-
-        let sample_every = std::env::var("COZIP_GPU_VALIDATION_SAMPLE_EVERY")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-            .max(1);
-
-        GpuValidationConfig { mode, sample_every }
-    })
-}
-
-fn gpu_dynamic_self_check_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let Ok(raw) = std::env::var("COZIP_GPU_DYNAMIC_SELF_CHECK") else {
-            return true;
-        };
-        let v = raw.trim().to_ascii_lowercase();
-        !matches!(v.as_str(), "0" | "false" | "no" | "off")
-    })
-}
-
-fn should_validate_gpu_chunk(mode: CompressionMode, chunk_index: usize) -> bool {
-    if mode == CompressionMode::Speed {
+fn should_validate_gpu_chunk(options: &HybridOptions, chunk_index: usize) -> bool {
+    if options.compression_mode == CompressionMode::Speed {
         return false;
     }
-    if mode == CompressionMode::Ratio && gpu_dynamic_self_check_enabled() {
+    if options.compression_mode == CompressionMode::Ratio && options.gpu_dynamic_self_check {
         // Ratio mode uses dynamic GPU path; that path performs its own per-chunk
         // roundtrip guard and CPU fallback before returning compressed bytes.
         return false;
     }
 
-    let config = gpu_validation_config();
-    match config.mode {
+    match options.gpu_validation_mode {
         GpuValidationMode::Always => true,
         GpuValidationMode::Off => false,
-        GpuValidationMode::Sample => chunk_index % config.sample_every == 0,
+        GpuValidationMode::Sample => chunk_index % options.gpu_validation_sample_every == 0,
     }
 }
 
@@ -5428,37 +3810,13 @@ fn gpu_chunk_roundtrip_matches(raw: &[u8], compressed: &[u8]) -> bool {
     gpu_chunk_roundtrip_diagnose(raw, compressed).is_ok()
 }
 
-fn gpu_dynamic_dump_bad_chunk_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let Ok(raw) = std::env::var("COZIP_GPU_DUMP_BAD_CHUNK") else {
-            return false;
-        };
-        let v = raw.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
-fn gpu_dynamic_dump_bad_chunk_limit() -> usize {
-    static LIMIT: OnceLock<usize> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::env::var("COZIP_GPU_DUMP_BAD_CHUNK_LIMIT")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-            .max(1)
-    })
-}
-
-fn gpu_dynamic_dump_bad_chunk_dir() -> String {
-    static DIR: OnceLock<String> = OnceLock::new();
-    DIR.get_or_init(|| {
-        std::env::var("COZIP_GPU_DUMP_BAD_CHUNK_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "/tmp/cozip_gpu_bad_chunks".to_string())
-    })
-    .clone()
+fn gpu_dynamic_dump_bad_chunk_dir(options: &HybridOptions) -> String {
+    options
+        .gpu_dump_bad_chunk_dir
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/tmp/cozip_gpu_bad_chunks")
+        .to_string()
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
@@ -5473,6 +3831,8 @@ fn fnv1a64(data: &[u8]) -> u64 {
 }
 
 fn dump_gpu_dynamic_bad_chunk(
+    options: &HybridOptions,
+    dump_seq: &AtomicUsize,
     call_id: u64,
     chunk_index: usize,
     raw: &[u8],
@@ -5480,15 +3840,14 @@ fn dump_gpu_dynamic_bad_chunk(
     cpu_fallback: &[u8],
     issue: &GpuRoundtripIssue,
 ) {
-    if !gpu_dynamic_dump_bad_chunk_enabled() {
+    if !options.gpu_dump_bad_chunk {
         return;
     }
-    static DUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
-    let seq = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    if seq >= gpu_dynamic_dump_bad_chunk_limit() {
+    let seq = dump_seq.fetch_add(1, Ordering::Relaxed);
+    if seq >= options.gpu_dump_bad_chunk_limit.max(1) {
         return;
     }
-    let dir = gpu_dynamic_dump_bad_chunk_dir();
+    let dir = gpu_dynamic_dump_bad_chunk_dir(options);
     let dir_path = std::path::Path::new(&dir);
     if std::fs::create_dir_all(dir_path).is_err() {
         return;
@@ -5591,24 +3950,14 @@ fn compress_hybrid_adaptive_scheduler(
     original_len: usize,
     tasks: Vec<ChunkTask>,
     options: &HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
 ) -> Result<CompressedFrame, CozipDeflateError> {
-    let timing_enabled = timing_profile_enabled();
-    let scheduler_start = if timing_enabled {
-        Some(Instant::now())
-    } else {
-        None
-    };
     let chunk_count = tasks.len();
     let start = Arc::new(Instant::now());
     let now_ms = monotonic_ms(&start);
-    let gpu_cached_ready = gpu_context_cached_available();
-    let cold_start_reserved_chunks = gpu_cold_start_reserved_chunks();
+    let gpu_available = gpu_context.is_some();
     let initial_reserved_budget = if options.compression_mode == CompressionMode::Ratio {
-        if gpu_cached_ready {
-            GPU_RATIO_RESERVED_TARGET_CHUNKS
-        } else {
-            cold_start_reserved_chunks
-        }
+        GPU_RATIO_RESERVED_TARGET_CHUNKS
     } else {
         usize::MAX
     };
@@ -5644,18 +3993,16 @@ fn compress_hybrid_adaptive_scheduler(
     let validation_fallback_chunks = Arc::new(AtomicUsize::new(0));
     let perf_counters = Arc::new(SchedulerPerfCounters::default());
     let timeline = Arc::new(SchedulerTimeline::default());
-    let gpu_init_state = Arc::new(AtomicU8::new(GPU_INIT_STATE_INITIALIZING));
     let wake = Arc::new((Mutex::new(()), Condvar::new()));
-    let cpu_workers = cpu_worker_count(true);
+    let cpu_workers = cpu_worker_count(gpu_available);
     log_scheduler_detail(
         &start,
         &format!(
-            "start chunks={} cpu_workers={} gpu_fraction={:.2} gpu_cached_ready={} cold_reserved_cfg={} initial_reserved={}",
+            "start chunks={} cpu_workers={} gpu_fraction={:.2} gpu_available={} initial_reserved={}",
             chunk_count,
             cpu_workers,
             options.gpu_fraction,
-            gpu_cached_ready,
-            cold_start_reserved_chunks,
+            gpu_available,
             initial_reserved_count
         ),
     );
@@ -5689,7 +4036,7 @@ fn compress_hybrid_adaptive_scheduler(
         }));
     }
 
-    {
+    if let Some(gpu) = gpu_context {
         let tasks_ref = Arc::clone(&scheduled_tasks);
         let results_ref = Arc::clone(&results);
         let err_ref = Arc::clone(&error);
@@ -5698,21 +4045,20 @@ fn compress_hybrid_adaptive_scheduler(
         let opts = options.clone();
         let validation_fallback_ref = Arc::clone(&validation_fallback_chunks);
         let perf_ref = Arc::clone(&perf_counters);
-        let gpu_state_ref = Arc::clone(&gpu_init_state);
         let start_ref = Arc::clone(&start);
         let timeline_ref = Arc::clone(&timeline);
 
         handles.push(std::thread::spawn(move || {
-            compress_gpu_worker_adaptive_lazy_init(
+            compress_gpu_worker_adaptive(
                 tasks_ref,
                 results_ref,
                 err_ref,
                 rem_ref,
                 wake_ref,
                 &opts,
+                gpu,
                 validation_fallback_ref,
                 perf_ref,
-                gpu_state_ref,
                 start_ref,
                 timeline_ref,
             )
@@ -5728,8 +4074,6 @@ fn compress_hybrid_adaptive_scheduler(
         let start_ref = Arc::clone(&start);
         let demoted_ref = Arc::clone(&demoted_reserved_gpu);
         let opts = options.clone();
-        let gpu_state_ref = Arc::clone(&gpu_init_state);
-        let timeline_ref = Arc::clone(&timeline);
 
         handles.push(std::thread::spawn(move || {
             compress_scheduler_watchdog(
@@ -5742,8 +4086,6 @@ fn compress_hybrid_adaptive_scheduler(
                 start_ref,
                 &opts,
                 demoted_ref,
-                gpu_state_ref,
-                timeline_ref,
             )
         }));
     }
@@ -5763,45 +4105,8 @@ fn compress_hybrid_adaptive_scheduler(
     }
     chunks.sort_by_key(|chunk| chunk.index);
 
-    let gpu_available = gpu_init_state.load(Ordering::Acquire) == GPU_INIT_STATE_READY;
     let stats = summarize_encoded_chunks(&chunks, gpu_available);
     let frame = encode_frame(original_len, &chunks)?;
-
-    if let Some(start) = scheduler_start {
-        let cpu_work_ns = perf_counters.cpu_work_ns.load(Ordering::Acquire);
-        let gpu_work_ns = perf_counters.gpu_work_ns.load(Ordering::Acquire);
-        let cpu_bytes = perf_counters.cpu_bytes.load(Ordering::Acquire);
-        let gpu_bytes = perf_counters.gpu_bytes.load(Ordering::Acquire);
-        let cpu_mib_s = if cpu_work_ns == 0 {
-            0.0
-        } else {
-            (cpu_bytes as f64 / (1024.0 * 1024.0)) / (cpu_work_ns as f64 / 1_000_000_000.0)
-        };
-        let gpu_mib_s = if gpu_work_ns == 0 {
-            0.0
-        } else {
-            (gpu_bytes as f64 / (1024.0 * 1024.0)) / (gpu_work_ns as f64 / 1_000_000_000.0)
-        };
-        eprintln!(
-            "[cozip][timing][scheduler] mode={:?} chunk_size_kib={} gpu_fraction={:.2} chunks={} cpu_chunks={} gpu_chunks={} demoted_reserved_gpu={} validation_fallback_chunks={} cpu_work_chunks={} gpu_work_chunks={} gpu_batches={} cpu_work_mib_s={:.2} gpu_work_mib_s={:.2} in_mib={:.2} out_mib={:.2} elapsed_ms={:.3}",
-            options.compression_mode,
-            options.chunk_size / 1024,
-            options.gpu_fraction,
-            stats.chunk_count,
-            stats.cpu_chunks,
-            stats.gpu_chunks,
-            demoted_reserved_gpu.load(Ordering::Acquire),
-            validation_fallback_chunks.load(Ordering::Acquire),
-            perf_counters.cpu_chunks.load(Ordering::Acquire),
-            perf_counters.gpu_chunks.load(Ordering::Acquire),
-            perf_counters.gpu_batches.load(Ordering::Acquire),
-            cpu_mib_s,
-            gpu_mib_s,
-            original_len as f64 / (1024.0 * 1024.0),
-            frame.len() as f64 / (1024.0 * 1024.0),
-            elapsed_ms(start),
-        );
-    }
 
     Ok(CompressedFrame { bytes: frame, stats })
 }
@@ -5877,51 +4182,6 @@ fn compress_cpu_worker_adaptive(
     }
 }
 
-fn compress_gpu_worker_adaptive_lazy_init(
-    tasks: Arc<Vec<ScheduledCompressTask>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    remaining: Arc<AtomicUsize>,
-    wake: Arc<(Mutex<()>, Condvar)>,
-    options: &HybridOptions,
-    validation_fallback_chunks: Arc<AtomicUsize>,
-    perf_counters: Arc<SchedulerPerfCounters>,
-    gpu_init_state: Arc<AtomicU8>,
-    start: Arc<Instant>,
-    timeline: Arc<SchedulerTimeline>,
-) {
-    if mark_once(&timeline.gpu_init_start_logged) {
-        log_scheduler_detail(&start, "gpu_init_start");
-    }
-    let Some(gpu) = shared_gpu_context(options.prefer_gpu) else {
-        gpu_init_state.store(GPU_INIT_STATE_UNAVAILABLE, Ordering::Release);
-        if mark_once(&timeline.gpu_init_failed_logged) {
-            log_scheduler_detail(&start, "gpu_init_unavailable");
-        }
-        wake.1.notify_all();
-        return;
-    };
-    gpu_init_state.store(GPU_INIT_STATE_READY, Ordering::Release);
-    if mark_once(&timeline.gpu_init_done_logged) {
-        log_scheduler_detail(&start, "gpu_init_ready");
-    }
-    wake.1.notify_all();
-
-    compress_gpu_worker_adaptive(
-        tasks,
-        results,
-        error,
-        remaining,
-        wake,
-        options,
-        gpu,
-        validation_fallback_chunks,
-        perf_counters,
-        start,
-        timeline,
-    );
-}
-
 fn compress_gpu_worker_adaptive(
     tasks: Arc<Vec<ScheduledCompressTask>>,
     results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
@@ -5959,11 +4219,7 @@ fn compress_gpu_worker_adaptive(
         let gpu_batch_bytes: usize = batch.iter().map(|idx| tasks[*idx].raw.len()).sum();
         let gpu_batch_start = Instant::now();
         let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
-        let compressed_batch = gpu.deflate_fixed_literals_batch(
-            &task_data,
-            options.compression_mode,
-            options.compression_level,
-        );
+        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options);
         let gpu_batch_elapsed_ns = duration_ns_u64(gpu_batch_start.elapsed());
         perf_counters.gpu_batches.fetch_add(1, Ordering::AcqRel);
         perf_counters
@@ -5987,7 +4243,7 @@ fn compress_gpu_worker_adaptive(
                             return;
                         }
                     };
-                    let encoded = if should_validate_gpu_chunk(options.compression_mode, task.index)
+                    let encoded = if should_validate_gpu_chunk(options, task.index)
                         && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
                     {
                         validation_fallback_chunks.fetch_add(1, Ordering::AcqRel);
@@ -6069,8 +4325,6 @@ fn compress_scheduler_watchdog(
     start: Arc<Instant>,
     options: &HybridOptions,
     demoted_reserved_gpu: Arc<AtomicUsize>,
-    gpu_init_state: Arc<AtomicU8>,
-    timeline: Arc<SchedulerTimeline>,
 ) {
     let reservation_timeout_ms = gpu_reservation_timeout_ms(options.compression_mode);
     loop {
@@ -6078,11 +4332,8 @@ fn compress_scheduler_watchdog(
             break;
         }
 
-        let gpu_state = gpu_init_state.load(Ordering::Acquire);
         let idle_cpu = cpu_workers.saturating_sub(active_cpu.load(Ordering::Acquire));
-        let demote_budget = if gpu_state == GPU_INIT_STATE_UNAVAILABLE {
-            usize::MAX
-        } else if options.compression_mode == CompressionMode::Ratio {
+        let demote_budget = if options.compression_mode == CompressionMode::Ratio {
             let reserved_count = tasks
                 .iter()
                 .filter(|task| {
@@ -6105,9 +4356,7 @@ fn compress_scheduler_watchdog(
                 }
                 if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8 {
                     let reserved_at = task.reserved_at_ms.load(Ordering::Acquire);
-                    let demote_now = gpu_state == GPU_INIT_STATE_UNAVAILABLE
-                        || gpu_state == GPU_INIT_STATE_INITIALIZING
-                        || now_ms.saturating_sub(reserved_at) >= reservation_timeout_ms;
+                    let demote_now = now_ms.saturating_sub(reserved_at) >= reservation_timeout_ms;
                     if demote_now
                         && task
                             .state
@@ -6124,12 +4373,6 @@ fn compress_scheduler_watchdog(
                 }
             }
             if demoted > 0 {
-                if gpu_state == GPU_INIT_STATE_INITIALIZING && mark_once(&timeline.init_demote_logged) {
-                    log_scheduler_detail(
-                        &start,
-                        &format!("demote_during_init count={}", demoted),
-                    );
-                }
                 demoted_reserved_gpu.fetch_add(demoted, Ordering::AcqRel);
                 wake.1.notify_all();
             }
@@ -6491,11 +4734,7 @@ fn compress_chunk_gpu_batch(
     }
 
     let task_data: Vec<&[u8]> = tasks.iter().map(|task| task.raw.as_slice()).collect();
-    let compressed_batch = gpu.deflate_fixed_literals_batch(
-        &task_data,
-        options.compression_mode,
-        options.compression_level,
-    )?;
+    let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options)?;
 
     if compressed_batch.len() != tasks.len() {
         return Err(CozipDeflateError::Internal(
@@ -6506,7 +4745,7 @@ fn compress_chunk_gpu_batch(
     let mut out = Vec::with_capacity(tasks.len());
     for (task, compressed) in tasks.iter().zip(compressed_batch.into_iter()) {
         let raw_len = u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
-        let member = if should_validate_gpu_chunk(options.compression_mode, task.index)
+        let member = if should_validate_gpu_chunk(options, task.index)
             && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
         {
             let cpu_compressed = deflate_compress_cpu(&task.raw, options.compression_level)?;

@@ -1,6 +1,6 @@
 # Optimization Candidates (Latest)
 
-Updated: 2026-02-25
+Updated: 2026-02-26
 
 This file is the current optimization candidate list. If a previous list exists elsewhere, this file should be treated as the overwritten latest version.
 
@@ -44,7 +44,14 @@ Legend: `~~strikethrough~~` = Completed, `Open` = not started.
 - Status: **Completed**
 - Notes: fixed `bitpack` path edge condition to avoid implementation-dependent shift behavior; intermittent `length_mismatch` fallback warnings stopped in follow-up runs.
 
+2. ~~Identify primary cause of `gpu_chunks` bias/variance in ratio benchmark.~~
+- Status: **Completed (Root cause identified)**
+- Notes: major variance comes from `gpu_context_init_ms` jitter (same command observed around ~2.6s vs ~0.2s), which changes how many preferred chunks CPU consumes before GPU becomes ready.
+- Notes: this is mainly outside scheduler logic (`wgpu`/driver/pipeline-cache cold/warm effects), while scheduler only amplifies visibility.
+- Notes: decompression is relatively stable because initialization impact is mostly paid before/around compress scheduling in each iteration.
+
 ## Notes
 
 - The delay after `[cozip][timing][scheduler]` is expected in `bench_1gb`: benchmark then measures decompression in the same iteration.
 - `decode_descriptor_gpu` currently performs CPU decode path internally.
+- `bench.sh` is process-restart based, so cold/warm initialization effects are reintroduced every run.

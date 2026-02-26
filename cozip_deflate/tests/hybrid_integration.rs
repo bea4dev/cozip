@@ -150,6 +150,7 @@ fn compare_cpu_only_vs_cpu_gpu_with_nocapture() {
         prefer_gpu: false,
         gpu_fraction: 0.0,
         gpu_min_chunk_size: 64 * 1024,
+        ..HybridOptions::default()
     };
 
     let cpu_gpu = HybridOptions {
@@ -160,6 +161,7 @@ fn compare_cpu_only_vs_cpu_gpu_with_nocapture() {
         prefer_gpu: true,
         gpu_fraction: 0.5,
         gpu_min_chunk_size: 64 * 1024,
+        ..HybridOptions::default()
     };
 
     let (cpu_cmp, cpu_dec, cpu_comp_t, cpu_decomp_t) = timed_roundtrip(&input, &cpu_only);
@@ -216,6 +218,7 @@ fn hybrid_uses_both_cpu_and_gpu_when_gpu_is_available() {
         prefer_gpu: true,
         gpu_fraction: 0.5,
         gpu_min_chunk_size: 64 * 1024,
+        ..HybridOptions::default()
     };
 
     let (compressed, _decompressed, _ct, _dt) = timed_roundtrip(&input, &options);

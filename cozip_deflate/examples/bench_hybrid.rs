@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{CompressionMode, HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
+use cozip_deflate::{CoZip, CompressionMode, HybridOptions, HybridStats};
 
 #[derive(Debug, Clone)]
 struct BenchAgg {
@@ -89,17 +89,18 @@ fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
     out
 }
 
-fn run_case(input: &[u8], options: &HybridOptions, iters: usize) -> BenchAgg {
+fn run_case(input: &[u8], cozip: &CoZip, iters: usize) -> BenchAgg {
     let mut agg = BenchAgg::default();
 
     for _ in 0..iters {
         let start_c = Instant::now();
-        let compressed = compress_hybrid(input, options).expect("compress_hybrid should succeed");
+        let compressed = cozip.compress(input).expect("compress should succeed");
         let elapsed_c = start_c.elapsed();
 
         let start_d = Instant::now();
-        let decompressed = decompress_hybrid(&compressed.bytes, options)
-            .expect("decompress_hybrid should succeed");
+        let decompressed = cozip
+            .decompress(&compressed.bytes)
+            .expect("decompress should succeed");
         let elapsed_d = start_d.elapsed();
 
         assert_eq!(decompressed.bytes, input);
@@ -135,6 +136,7 @@ fn main() {
             prefer_gpu: false,
             gpu_fraction: 0.0,
             gpu_min_chunk_size: 64 * 1024,
+            ..HybridOptions::default()
         };
 
         let cpu_gpu = HybridOptions {
@@ -145,13 +147,17 @@ fn main() {
             prefer_gpu: true,
             gpu_fraction: 0.5,
             gpu_min_chunk_size: 64 * 1024,
+            ..HybridOptions::default()
         };
 
-        let _ = run_case(&input, &cpu_only, 1);
-        let _ = run_case(&input, &cpu_gpu, 1);
+        let cpu_only_cozip = CoZip::init(cpu_only).expect("cpu-only init should succeed");
+        let cpu_gpu_cozip = CoZip::init(cpu_gpu).expect("cpu+gpu init should succeed");
 
-        let cpu = run_case(&input, &cpu_only, iters);
-        let hybrid = run_case(&input, &cpu_gpu, iters);
+        let _ = run_case(&input, &cpu_only_cozip, 1);
+        let _ = run_case(&input, &cpu_gpu_cozip, 1);
+
+        let cpu = run_case(&input, &cpu_only_cozip, iters);
+        let hybrid = run_case(&input, &cpu_gpu_cozip, iters);
 
         println!();
         println!("size_bytes={} ({:.1} MiB)", size, mib);

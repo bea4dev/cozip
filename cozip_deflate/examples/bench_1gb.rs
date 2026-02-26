@@ -1,7 +1,7 @@
 use std::env;
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{CompressionMode, HybridOptions, HybridStats, compress_hybrid, decompress_hybrid};
+use cozip_deflate::{CoZip, CompressionMode, HybridOptions, HybridStats};
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -189,16 +189,17 @@ fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
     out
 }
 
-fn run_case(input: &[u8], options: &HybridOptions, iters: usize) -> BenchAgg {
+fn run_case(input: &[u8], cozip: &CoZip, iters: usize) -> BenchAgg {
     let mut agg = BenchAgg::default();
     for _ in 0..iters {
         let t0 = Instant::now();
-        let compressed = compress_hybrid(input, options).expect("compress_hybrid should succeed");
+        let compressed = cozip.compress(input).expect("compress should succeed");
         let compress_elapsed = t0.elapsed();
 
         let t1 = Instant::now();
-        let decompressed = decompress_hybrid(&compressed.bytes, options)
-            .expect("decompress_hybrid should succeed");
+        let decompressed = cozip
+            .decompress(&compressed.bytes)
+            .expect("decompress should succeed");
         let decompress_elapsed = t1.elapsed();
 
         assert_eq!(decompressed.bytes, input);
@@ -241,6 +242,7 @@ fn main() {
         prefer_gpu: false,
         gpu_fraction: 0.0,
         gpu_min_chunk_size: 64 * 1024,
+        ..HybridOptions::default()
     };
 
     let cpu_gpu = HybridOptions {
@@ -251,6 +253,7 @@ fn main() {
         prefer_gpu: true,
         gpu_fraction: cfg.gpu_fraction,
         gpu_min_chunk_size: 64 * 1024,
+        ..HybridOptions::default()
     };
 
     println!("cozip_deflate 1GB-class benchmark");
@@ -260,13 +263,16 @@ fn main() {
     );
     println!("gpu_fraction={:.2}", cfg.gpu_fraction);
 
+    let cpu_only_cozip = CoZip::init(cpu_only).expect("cpu-only init should succeed");
+    let cpu_gpu_cozip = CoZip::init(cpu_gpu).expect("cpu+gpu init should succeed");
+
     if cfg.warmups > 0 {
-        let _ = run_case(&input, &cpu_only, cfg.warmups);
-        let _ = run_case(&input, &cpu_gpu, cfg.warmups);
+        let _ = run_case(&input, &cpu_only_cozip, cfg.warmups);
+        let _ = run_case(&input, &cpu_gpu_cozip, cfg.warmups);
     }
 
-    let cpu = run_case(&input, &cpu_only, cfg.iters);
-    let hybrid = run_case(&input, &cpu_gpu, cfg.iters);
+    let cpu = run_case(&input, &cpu_only_cozip, cfg.iters);
+    let hybrid = run_case(&input, &cpu_gpu_cozip, cfg.iters);
 
     let comp_speedup = if hybrid.avg_compress_ms(cfg.iters) > 0.0 {
         cpu.avg_compress_ms(cfg.iters) / hybrid.avg_compress_ms(cfg.iters)
