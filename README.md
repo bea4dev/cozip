@@ -5,7 +5,7 @@ A set of Rust libraries and compression/decompression software tools.
 - `cozip_deflate`: custom frame format (`CZDF`) with CPU/GPU-assisted **compression** and CPU **decompression**.
 - `cozip_zip`: minimal ZIP single-entry helper built on top of `cozip_deflate` CPU deflate/inflate.
 
-Japanese version: [README.ja.md](./README.ja.md)
+日本語: [README.ja.md](./README.ja.md)
 
 ## Workspace Layout
 
