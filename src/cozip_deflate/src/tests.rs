@@ -167,3 +167,33 @@ fn stream_frame_input_size_must_be_positive() {
 
     assert!(matches!(err, CozipDeflateError::InvalidOptions(_)));
 }
+
+#[test]
+fn raw_deflate_hybrid_stream_is_zip_compatible() {
+    let input = patterned_data((1024 * 1024) + 321);
+    let mut reader = std::io::Cursor::new(input.clone());
+    let mut compressed = Vec::new();
+
+    let stats = deflate_compress_stream_hybrid_zip_compatible(&mut reader, &mut compressed, 6)
+        .expect("hybrid stream compress should succeed");
+    let restored =
+        deflate_decompress_on_cpu(&compressed).expect("raw deflate stream should be decodable");
+
+    assert_eq!(restored, input);
+    assert_eq!(usize::try_from(stats.input_bytes).ok(), Some(input.len()));
+}
+
+#[test]
+fn raw_deflate_hybrid_stream_handles_empty_input() {
+    let input = Vec::<u8>::new();
+    let mut reader = std::io::Cursor::new(input.clone());
+    let mut compressed = Vec::new();
+
+    let stats = deflate_compress_stream_hybrid_zip_compatible(&mut reader, &mut compressed, 6)
+        .expect("empty hybrid stream compress should succeed");
+    let restored =
+        deflate_decompress_on_cpu(&compressed).expect("raw deflate stream should decode");
+
+    assert!(restored.is_empty());
+    assert_eq!(stats.input_bytes, 0);
+}

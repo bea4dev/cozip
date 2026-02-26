@@ -54,6 +54,13 @@ struct GpuDynamicTiming {
 static GPU_TIMING_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
 static DEEP_DYNAMIC_PROBE_TAKEN: AtomicU8 = AtomicU8::new(0);
 
+#[derive(Debug, Clone)]
+pub(super) struct GpuCompressedChunk {
+    pub(super) compressed: Vec<u8>,
+    pub(super) end_bit: Option<usize>,
+    pub(super) used_gpu: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct GpuAssist {
     device: wgpu::Device,
@@ -1766,12 +1773,38 @@ impl GpuAssist {
         &self,
         chunks: &[&[u8]],
         options: &HybridOptions,
-    ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+    ) -> Result<Vec<GpuCompressedChunk>, CozipDeflateError> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let slot_limit = options.gpu_slot_count.max(1);
+        let mode = options.compression_mode;
+        {
+            let mut slots = lock(&self.deflate_slots)?;
+            if slots.len() > slot_limit {
+                slots.truncate(slot_limit);
+            }
+        }
+        let mut out = Vec::with_capacity(chunks.len());
+        for batch in chunks.chunks(slot_limit) {
+            let mut encoded = if mode == CompressionMode::Ratio {
+                self.deflate_dynamic_hybrid_batch_impl(batch, options)?
+            } else {
+                self.deflate_fixed_literals_batch_impl(batch, options)?
+            };
+            out.append(&mut encoded);
+        }
+        Ok(out)
+    }
+
+    fn deflate_fixed_literals_batch_impl(
+        &self,
+        chunks: &[&[u8]],
+        options: &HybridOptions,
+    ) -> Result<Vec<GpuCompressedChunk>, CozipDeflateError> {
         let mode = options.compression_mode;
         let compression_level = options.compression_level;
-        if mode == CompressionMode::Ratio {
-            return self.deflate_dynamic_hybrid_batch(chunks, options);
-        }
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
@@ -1794,12 +1827,24 @@ impl GpuAssist {
             cpu_fallback_ms: 0.0,
         };
 
-        let mut results = vec![Vec::new(); chunks.len()];
+        let mut results = vec![
+            GpuCompressedChunk {
+                compressed: Vec::new(),
+                end_bit: None,
+                used_gpu: false,
+            };
+            chunks.len()
+        ];
+        let submit_group = options.gpu_pipelined_submit_chunks.max(1);
         let mut slots = lock(&self.deflate_slots)?;
         let mut work_indices = Vec::with_capacity(chunks.len());
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
-                results[chunk_index] = vec![0x03, 0x00];
+                results[chunk_index] = GpuCompressedChunk {
+                    compressed: vec![0x03, 0x00],
+                    end_bit: Some(10),
+                    used_gpu: true,
+                };
                 continue;
             }
             work_indices.push(chunk_index);
@@ -1810,7 +1855,7 @@ impl GpuAssist {
             }
         }
 
-        for chunk_group in work_indices.chunks(GPU_PIPELINED_SUBMIT_CHUNKS.max(1)) {
+        for chunk_group in work_indices.chunks(submit_group) {
             timing.groups += 1;
             timing.chunks += chunk_group.len();
             let encode_start = if timing_enabled {
@@ -1951,7 +1996,7 @@ impl GpuAssist {
             timing.bits_readback_bytes += 4 * bit_receivers.len();
             self.device.poll(wgpu::Maintain::Wait);
 
-            let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
+            let mut payload_jobs: Vec<(usize, usize, usize, u64)> = Vec::new();
             let mut cpu_fallback = Vec::new();
             for (chunk_index, rx) in bit_receivers {
                 match rx.recv() {
@@ -1978,7 +2023,7 @@ impl GpuAssist {
 
                 let copy_words = total_bytes.div_ceil(std::mem::size_of::<u32>());
                 let copy_size = bytes_len::<u32>(copy_words)?;
-                payload_jobs.push((chunk_index, total_bytes, copy_size));
+                payload_jobs.push((chunk_index, total_bits, total_bytes, copy_size));
             }
             if let Some(start) = bits_readback_start {
                 timing.bits_readback_ms += elapsed_ms(start);
@@ -1989,7 +2034,7 @@ impl GpuAssist {
                 timing.payload_readback_bytes +=
                     payload_jobs
                         .iter()
-                        .try_fold(0usize, |acc, (_, _, copy_size)| {
+                        .try_fold(0usize, |acc, (_, _, _, copy_size)| {
                             let copy_size = usize::try_from(*copy_size)
                                 .map_err(|_| CozipDeflateError::DataTooLarge)?;
                             acc.checked_add(copy_size)
@@ -2005,7 +2050,7 @@ impl GpuAssist {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("cozip-deflate-payload-readback-encoder"),
                         });
-                for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                for (chunk_index, _total_bits, _total_bytes, copy_size) in &payload_jobs {
                     let slot = &slots[*chunk_index];
                     payload_encoder.copy_buffer_to_buffer(
                         &slot.output_words_buffer,
@@ -2026,7 +2071,7 @@ impl GpuAssist {
                     None
                 };
                 let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
-                for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+                for (chunk_index, _total_bits, _total_bytes, copy_size) in &payload_jobs {
                     let (tx, rx) = std::sync::mpsc::channel();
                     slots[*chunk_index].readback.slice(0..*copy_size).map_async(
                         wgpu::MapMode::Read,
@@ -2038,7 +2083,7 @@ impl GpuAssist {
                 }
                 self.device.poll(wgpu::Maintain::Wait);
 
-                for ((chunk_index, total_bytes, copy_size), rx) in
+                for ((chunk_index, total_bits, total_bytes, copy_size), rx) in
                     payload_jobs.into_iter().zip(payload_receivers.into_iter())
                 {
                     match rx.recv() {
@@ -2060,7 +2105,11 @@ impl GpuAssist {
                         .output_bytes
                         .checked_add(total_bytes)
                         .ok_or(CozipDeflateError::DataTooLarge)?;
-                    results[chunk_index] = compressed;
+                    results[chunk_index] = GpuCompressedChunk {
+                        compressed,
+                        end_bit: Some(total_bits),
+                        used_gpu: true,
+                    };
                 }
                 if let Some(start) = payload_readback_start {
                     timing.payload_readback_ms += elapsed_ms(start);
@@ -2074,11 +2123,14 @@ impl GpuAssist {
                 None
             };
             for chunk_index in cpu_fallback {
-                results[chunk_index] =
-                    deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+                results[chunk_index] = GpuCompressedChunk {
+                    compressed: deflate_compress_cpu(chunks[chunk_index], compression_level)?,
+                    end_bit: None,
+                    used_gpu: false,
+                };
                 timing.output_bytes = timing
                     .output_bytes
-                    .checked_add(results[chunk_index].len())
+                    .checked_add(results[chunk_index].compressed.len())
                     .ok_or(CozipDeflateError::DataTooLarge)?;
             }
             if let Some(start) = fallback_start {
@@ -2110,11 +2162,11 @@ impl GpuAssist {
         Ok(results)
     }
 
-    fn deflate_dynamic_hybrid_batch(
+    fn deflate_dynamic_hybrid_batch_impl(
         &self,
         chunks: &[&[u8]],
         options: &HybridOptions,
-    ) -> Result<Vec<Vec<u8>>, CozipDeflateError> {
+    ) -> Result<Vec<GpuCompressedChunk>, CozipDeflateError> {
         let mode = options.compression_mode;
         let compression_level = options.compression_level;
         if chunks.is_empty() {
@@ -2183,7 +2235,15 @@ impl GpuAssist {
             receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
         }
 
-        let mut results = vec![Vec::new(); chunks.len()];
+        let mut results = vec![
+            GpuCompressedChunk {
+                compressed: Vec::new(),
+                end_bit: None,
+                used_gpu: false,
+            };
+            chunks.len()
+        ];
+        let submit_group = options.gpu_pipelined_submit_chunks.max(1);
         let mut slots = lock(&self.deflate_slots)?;
         let litlen_freq_size = bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?;
         let dist_freq_size = bytes_len::<u32>(DIST_SYMBOL_COUNT)?;
@@ -2327,7 +2387,11 @@ impl GpuAssist {
 
         for (chunk_index, data) in chunks.iter().enumerate() {
             if data.is_empty() {
-                results[chunk_index] = vec![0x03, 0x00];
+                results[chunk_index] = GpuCompressedChunk {
+                    compressed: vec![0x03, 0x00],
+                    end_bit: Some(10),
+                    used_gpu: true,
+                };
                 continue;
             }
             timing.chunks += 1;
@@ -2421,7 +2485,7 @@ impl GpuAssist {
             ));
             freq_submit_chunk_count += 1;
 
-            if freq_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+            if freq_submit_chunk_count >= submit_group {
                 let freq_submit_start = if timing_enabled {
                     Some(Instant::now())
                 } else {
@@ -2679,7 +2743,7 @@ impl GpuAssist {
             staged_pack.push((item.chunk_index, item.slot_index));
             pack_submit_chunk_count += 1;
 
-            if pack_submit_chunk_count >= GPU_PIPELINED_SUBMIT_CHUNKS {
+            if pack_submit_chunk_count >= submit_group {
                 let pack_submit_start = if timing_enabled {
                     Some(Instant::now())
                 } else {
@@ -2739,7 +2803,7 @@ impl GpuAssist {
             }
         }
 
-        let mut payload_jobs: Vec<(usize, usize, u64)> = Vec::new();
+        let mut payload_jobs: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut cpu_fallback = Vec::new();
         let pack_bits_readback_start = if timing_enabled {
             Some(Instant::now())
@@ -2776,7 +2840,7 @@ impl GpuAssist {
 
             let copy_words = total_bytes.div_ceil(std::mem::size_of::<u32>());
             let copy_size = bytes_len::<u32>(copy_words)?;
-            payload_jobs.push((pending.chunk_index, total_bytes, copy_size));
+            payload_jobs.push((pending.chunk_index, total_bits, total_bytes, copy_size));
         }
         if let Some(start) = pack_bits_readback_start {
             timing.pack_bits_readback_ms += elapsed_ms(start);
@@ -2787,7 +2851,7 @@ impl GpuAssist {
             timing.payload_readback_bytes +=
                 payload_jobs
                     .iter()
-                    .try_fold(0usize, |acc, (_, _, copy_size)| {
+                    .try_fold(0usize, |acc, (_, _, _, copy_size)| {
                         let copy_size = usize::try_from(*copy_size)
                             .map_err(|_| CozipDeflateError::DataTooLarge)?;
                         acc.checked_add(copy_size)
@@ -2803,7 +2867,7 @@ impl GpuAssist {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("cozip-deflate-dynamic-payload-readback-encoder"),
                     });
-            for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+            for (chunk_index, _total_bits, _total_bytes, copy_size) in &payload_jobs {
                 let slot = &slots[*chunk_index];
                 payload_encoder.copy_buffer_to_buffer(
                     &slot.output_words_buffer,
@@ -2824,7 +2888,7 @@ impl GpuAssist {
                 None
             };
             let mut payload_receivers = Vec::with_capacity(payload_jobs.len());
-            for (chunk_index, _total_bytes, copy_size) in &payload_jobs {
+            for (chunk_index, _total_bits, _total_bytes, copy_size) in &payload_jobs {
                 let (tx, rx) = std::sync::mpsc::channel();
                 slots[*chunk_index].readback.slice(0..*copy_size).map_async(
                     wgpu::MapMode::Read,
@@ -2836,7 +2900,7 @@ impl GpuAssist {
             }
             self.device.poll(wgpu::Maintain::Wait);
 
-            for ((chunk_index, total_bytes, copy_size), rx) in
+            for ((chunk_index, total_bits, total_bytes, copy_size), rx) in
                 payload_jobs.into_iter().zip(payload_receivers.into_iter())
             {
                 match rx.recv() {
@@ -2934,7 +2998,11 @@ impl GpuAssist {
                     .output_bytes
                     .checked_add(compressed.len())
                     .ok_or(CozipDeflateError::DataTooLarge)?;
-                results[chunk_index] = compressed;
+                results[chunk_index] = GpuCompressedChunk {
+                    compressed,
+                    end_bit: Some(total_bits),
+                    used_gpu: true,
+                };
             }
             if let Some(start) = payload_readback_start {
                 timing.payload_readback_ms += elapsed_ms(start);
@@ -2948,10 +3016,14 @@ impl GpuAssist {
             None
         };
         for chunk_index in cpu_fallback {
-            results[chunk_index] = deflate_compress_cpu(chunks[chunk_index], compression_level)?;
+            results[chunk_index] = GpuCompressedChunk {
+                compressed: deflate_compress_cpu(chunks[chunk_index], compression_level)?,
+                end_bit: None,
+                used_gpu: false,
+            };
             timing.output_bytes = timing
                 .output_bytes
-                .checked_add(results[chunk_index].len())
+                .checked_add(results[chunk_index].compressed.len())
                 .ok_or(CozipDeflateError::DataTooLarge)?;
         }
         if let Some(start) = cpu_fallback_start {

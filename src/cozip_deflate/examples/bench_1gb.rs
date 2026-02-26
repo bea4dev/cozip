@@ -1,7 +1,11 @@
 use std::env;
+use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use cozip_deflate::{CoZipDeflate, CompressionMode, HybridOptions, HybridStats};
+use cozip_deflate::{
+    CoZipDeflate, CompressionMode, DeflateCpuStreamStats, HybridOptions,
+    deflate_decompress_stream_on_cpu,
+};
 
 #[derive(Debug, Clone)]
 struct BenchConfig {
@@ -10,6 +14,7 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     gpu_subchunk_kib: usize,
+    gpu_slots: usize,
     gpu_fraction: f32,
     mode: CompressionMode,
 }
@@ -22,6 +27,7 @@ impl Default for BenchConfig {
             warmups: 0,
             chunk_mib: 4,
             gpu_subchunk_kib: 256,
+            gpu_slots: 4,
             gpu_fraction: 1.0,
             mode: CompressionMode::Speed,
         }
@@ -68,6 +74,11 @@ impl BenchConfig {
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-subchunk-kib".to_string())?;
                 }
+                "--gpu-slots" => {
+                    cfg.gpu_slots = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --gpu-slots".to_string())?;
+                }
                 "--gpu-fraction" => {
                     cfg.gpu_fraction = value
                         .parse::<f32>()
@@ -91,7 +102,12 @@ impl BenchConfig {
             }
         }
 
-        if cfg.size_mib == 0 || cfg.iters == 0 || cfg.chunk_mib == 0 || cfg.gpu_subchunk_kib == 0 {
+        if cfg.size_mib == 0
+            || cfg.iters == 0
+            || cfg.chunk_mib == 0
+            || cfg.gpu_subchunk_kib == 0
+            || cfg.gpu_slots == 0
+        {
             return Err("size/iters/chunk/subchunk must be > 0".to_string());
         }
         if !(0.0..=1.0).contains(&cfg.gpu_fraction) {
@@ -109,6 +125,7 @@ fn help_text() -> String {
   --warmups <N>            warmup iterations (default: 0)
   --chunk-mib <N>          host chunk size in MiB (default: 4)
   --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)
+  --gpu-slots <N>          gpu slot/batch/submit count (default: 4)
   --gpu-fraction <R>       gpu scheduling target ratio 0.0..=1.0 (default: 1.0)
   --mode <M>               speed|balanced|ratio (default: speed)"#;
     text.to_string()
@@ -120,8 +137,8 @@ struct BenchAgg {
     decompress_total: Duration,
     compressed_total: usize,
     input_total: usize,
-    last_compress_stats: HybridStats,
-    last_decompress_stats: HybridStats,
+    last_compress_stats: DeflateCpuStreamStats,
+    last_decompress_stats: DeflateCpuStreamStats,
 }
 
 impl BenchAgg {
@@ -131,8 +148,8 @@ impl BenchAgg {
         compressed_len: usize,
         compress_elapsed: Duration,
         decompress_elapsed: Duration,
-        compress_stats: HybridStats,
-        decompress_stats: HybridStats,
+        compress_stats: DeflateCpuStreamStats,
+        decompress_stats: DeflateCpuStreamStats,
     ) {
         self.compress_total += compress_elapsed;
         self.decompress_total += decompress_elapsed;
@@ -195,25 +212,31 @@ fn build_mixed_dataset(bytes: usize) -> Vec<u8> {
 fn run_case(input: &[u8], cozip: &CoZipDeflate, iters: usize) -> BenchAgg {
     let mut agg = BenchAgg::default();
     for _ in 0..iters {
+        let mut src = Cursor::new(input);
+        let mut compressed = Vec::new();
         let t0 = Instant::now();
-        let compressed = cozip.compress(input).expect("compress should succeed");
+        let compress_stats = cozip
+            .deflate_compress_stream_zip_compatible(&mut src, &mut compressed)
+            .expect("compress should succeed");
         let compress_elapsed = t0.elapsed();
 
+        let mut compressed_reader = Cursor::new(&compressed);
+        let mut restored = Vec::with_capacity(input.len());
         let t1 = Instant::now();
-        let decompressed = cozip
-            .decompress_on_cpu(&compressed.bytes)
-            .expect("decompress should succeed");
+        let decompress_stats =
+            deflate_decompress_stream_on_cpu(&mut compressed_reader, &mut restored)
+                .expect("decompress should succeed");
         let decompress_elapsed = t1.elapsed();
 
-        assert_eq!(decompressed.bytes, input);
+        assert_eq!(restored, input);
 
         agg.add(
             input.len(),
-            compressed.bytes.len(),
+            compressed.len(),
             compress_elapsed,
             decompress_elapsed,
-            compressed.stats,
-            decompressed.stats,
+            compress_stats,
+            decompress_stats,
         );
     }
     agg
@@ -241,6 +264,9 @@ fn main() {
     let cpu_only = HybridOptions {
         chunk_size,
         gpu_subchunk_size,
+        gpu_slot_count: cfg.gpu_slots,
+        gpu_batch_chunks: cfg.gpu_slots,
+        gpu_pipelined_submit_chunks: cfg.gpu_slots,
         compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: false,
@@ -252,6 +278,9 @@ fn main() {
     let cpu_gpu = HybridOptions {
         chunk_size,
         gpu_subchunk_size,
+        gpu_slot_count: cfg.gpu_slots,
+        gpu_batch_chunks: cfg.gpu_slots,
+        gpu_pipelined_submit_chunks: cfg.gpu_slots,
         compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: true,
@@ -260,12 +289,15 @@ fn main() {
         ..HybridOptions::default()
     };
 
-    println!("cozip_deflate 1GB-class benchmark");
+    println!("cozip_deflate ZIP-compatible raw-deflate benchmark");
     println!(
         "size_mib={} iters={} warmups={} chunk_mib={} gpu_subchunk_kib={} mode={:?}",
         cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib, cfg.mode
     );
-    println!("gpu_fraction={:.2}", cfg.gpu_fraction);
+    println!(
+        "gpu_fraction={:.2} gpu_slots={}",
+        cfg.gpu_fraction, cfg.gpu_slots
+    );
 
     let cpu_only_cozip = CoZipDeflate::init(cpu_only).expect("cpu-only init should succeed");
     let cpu_gpu_cozip = CoZipDeflate::init(cpu_gpu).expect("cpu+gpu init should succeed");
@@ -285,7 +317,7 @@ fn main() {
     };
 
     println!(
-        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_worker_chunks={} gpu_worker_chunks={} cpu_steal_chunks={} gpu_batches={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         cpu.avg_compress_ms(cfg.iters),
         cpu.avg_decompress_ms(cfg.iters),
         cpu.compress_mib_s(),
@@ -295,13 +327,23 @@ fn main() {
         cpu.last_compress_stats.cpu_chunks,
         cpu.last_compress_stats.gpu_chunks,
         cpu.last_compress_stats.gpu_available,
+        cpu.last_compress_stats.compress_stage_ms,
+        cpu.last_compress_stats.layout_parse_ms,
+        cpu.last_compress_stats.write_stage_ms,
+        cpu.last_compress_stats.cpu_worker_busy_ms,
+        cpu.last_compress_stats.gpu_worker_busy_ms,
+        cpu.last_compress_stats.cpu_worker_chunks,
+        cpu.last_compress_stats.gpu_worker_chunks,
+        cpu.last_compress_stats.cpu_steal_chunks,
+        cpu.last_compress_stats.gpu_batch_count,
+        cpu.last_compress_stats.gpu_runtime_disabled,
         cpu.last_decompress_stats.chunk_count,
         cpu.last_decompress_stats.cpu_chunks,
         cpu.last_decompress_stats.gpu_chunks,
         cpu.last_decompress_stats.gpu_available,
     );
     println!(
-        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_worker_chunks={} gpu_worker_chunks={} cpu_steal_chunks={} gpu_batches={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         hybrid.avg_compress_ms(cfg.iters),
         hybrid.avg_decompress_ms(cfg.iters),
         hybrid.compress_mib_s(),
@@ -311,6 +353,16 @@ fn main() {
         hybrid.last_compress_stats.cpu_chunks,
         hybrid.last_compress_stats.gpu_chunks,
         hybrid.last_compress_stats.gpu_available,
+        hybrid.last_compress_stats.compress_stage_ms,
+        hybrid.last_compress_stats.layout_parse_ms,
+        hybrid.last_compress_stats.write_stage_ms,
+        hybrid.last_compress_stats.cpu_worker_busy_ms,
+        hybrid.last_compress_stats.gpu_worker_busy_ms,
+        hybrid.last_compress_stats.cpu_worker_chunks,
+        hybrid.last_compress_stats.gpu_worker_chunks,
+        hybrid.last_compress_stats.cpu_steal_chunks,
+        hybrid.last_compress_stats.gpu_batch_count,
+        hybrid.last_compress_stats.gpu_runtime_disabled,
         hybrid.last_decompress_stats.chunk_count,
         hybrid.last_decompress_stats.cpu_chunks,
         hybrid.last_decompress_stats.gpu_chunks,

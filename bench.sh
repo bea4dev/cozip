@@ -11,6 +11,7 @@ ITERS=1
 WARMUPS=0
 CHUNK_MIB=4
 GPU_SUBCHUNK_KIB=512
+GPU_SLOTS=4
 GPU_FRACTION=1.0
 MODES="ratio"
 BUILD=1
@@ -28,6 +29,7 @@ Options:
   --warmups <N>            Warmup iterations per process (default: 0)
   --chunk-mib <N>          Chunk size in MiB (default: 4)
   --gpu-subchunk-kib <N>   GPU subchunk size in KiB (default: 512)
+  --gpu-slots <N>          GPU slot/batch/submit count (default: 4)
   --gpu-fraction <R>       GPU fraction 0.0..1.0 (default: 1.0)
   --mode <M>               speed|balanced|ratio or comma list (default: ratio)
   --no-build               Skip cargo build
@@ -110,6 +112,10 @@ while [[ $# -gt 0 ]]; do
       GPU_SUBCHUNK_KIB="$2"
       shift 2
       ;;
+    --gpu-slots)
+      GPU_SLOTS="$2"
+      shift 2
+      ;;
     --gpu-fraction)
       GPU_FRACTION="$2"
       shift 2
@@ -170,7 +176,7 @@ for mode in "${MODE_LIST[@]}"; do
     echo "# cozip bench log"
     echo "timestamp=${TS}"
     echo "mode=${mode}"
-    echo "size_mib=${SIZE_MIB} runs=${RUNS} iters=${ITERS} warmups=${WARMUPS} chunk_mib=${CHUNK_MIB} gpu_subchunk_kib=${GPU_SUBCHUNK_KIB} gpu_fraction=${GPU_FRACTION}"
+    echo "size_mib=${SIZE_MIB} runs=${RUNS} iters=${ITERS} warmups=${WARMUPS} chunk_mib=${CHUNK_MIB} gpu_subchunk_kib=${GPU_SUBCHUNK_KIB} gpu_slots=${GPU_SLOTS} gpu_fraction=${GPU_FRACTION}"
     echo
   } | tee "${LOG_FILE}"
 
@@ -183,6 +189,7 @@ for mode in "${MODE_LIST[@]}"; do
       --warmups "${WARMUPS}" \
       --chunk-mib "${CHUNK_MIB}" \
       --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
+      --gpu-slots "${GPU_SLOTS}" \
       --mode "${mode}" \
       --gpu-fraction "${GPU_FRACTION}" \
       2>&1 | tee -a "${LOG_FILE}"
@@ -194,6 +201,7 @@ for mode in "${MODE_LIST[@]}"; do
       --warmups "${WARMUPS}" \
       --chunk-mib "${CHUNK_MIB}" \
       --gpu-subchunk-kib "${GPU_SUBCHUNK_KIB}" \
+      --gpu-slots "${GPU_SLOTS}" \
       --mode "${mode}" \
       --gpu-fraction "${GPU_FRACTION}" \
       2>&1 | tee -a "${LOG_FILE}"
