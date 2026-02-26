@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use flate2::Compression;
 use thiserror::Error;
@@ -16,45 +16,16 @@ const CHUNK_META_LEN_V2: usize = 10;
 const CHUNK_META_LEN_V1: usize = 9;
 const TRANSFORM_LANES: usize = 2;
 
-const LEN_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
-    163, 195, 227, 258,
-];
-const LEN_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-];
-const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-];
-const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
-    13,
-];
-const MIN_MATCH: usize = 3;
-const MAX_MATCH: usize = 258;
-const MAX_DISTANCE: usize = 32_768;
-const HASH_SIZE: usize = 1 << 15;
-const HASH_MASK: usize = HASH_SIZE - 1;
-const MAX_HASH_CANDIDATES: usize = 32;
-const MAX_RUN_HINTS: usize = 8;
 const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
 const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUNT * 2);
 const GPU_BATCH_CHUNKS: usize = 16;
 const GPU_PIPELINED_SUBMIT_CHUNKS: usize = 4;
-const GPU_DEFLATE_SLOT_POOL: usize = GPU_BATCH_CHUNKS;
-const GPU_RATIO_RESERVED_TARGET_CHUNKS: usize = GPU_BATCH_CHUNKS * 16;
-const GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS: usize = GPU_BATCH_CHUNKS * 4;
 const GPU_FREQ_MAX_WORKGROUPS: u32 = 4096;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
 const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
-const GPU_RESERVATION_TIMEOUT_MS_SPEED: u64 = 3;
-const GPU_RESERVATION_TIMEOUT_MS_BALANCED: u64 = 12;
-const GPU_RESERVATION_TIMEOUT_MS_RATIO: u64 = 64;
-const SCHEDULER_WAIT_MS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct HybridOptions {
@@ -343,48 +314,6 @@ struct ChunkTask {
     raw: Vec<u8>,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompressTaskState {
-    Pending = 0,
-    ReservedGpu = 1,
-    RunningGpu = 2,
-    RunningCpu = 3,
-    Done = 4,
-    DemotedCpu = 5,
-}
-
-#[derive(Debug)]
-struct ScheduledCompressTask {
-    index: usize,
-    preferred_gpu: bool,
-    raw: Vec<u8>,
-    state: AtomicU8,
-    reserved_at_ms: AtomicU64,
-}
-
-#[derive(Debug, Default)]
-struct SchedulerPerfCounters {
-    cpu_chunks: AtomicUsize,
-    cpu_bytes: AtomicU64,
-    cpu_work_ns: AtomicU64,
-    gpu_batches: AtomicUsize,
-    gpu_chunks: AtomicUsize,
-    gpu_bytes: AtomicU64,
-    gpu_work_ns: AtomicU64,
-}
-
-#[derive(Debug, Default)]
-struct SchedulerTimeline {
-    first_cpu_task_logged: AtomicU8,
-    first_gpu_batch_logged: AtomicU8,
-}
-
-fn mark_once(flag: &AtomicU8) -> bool {
-    flag.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
 #[derive(Debug, Clone)]
 struct ChunkMember {
     index: usize,
@@ -444,12 +373,7 @@ struct DeflateSlot {
     len_capacity: usize,
     output_storage_size: u64,
     input_buffer: wgpu::Buffer,
-    codes_buffer: wgpu::Buffer,
     token_flags_buffer: wgpu::Buffer,
-    token_kind_buffer: wgpu::Buffer,
-    token_len_buffer: wgpu::Buffer,
-    token_dist_buffer: wgpu::Buffer,
-    token_lit_buffer: wgpu::Buffer,
     litlen_freq_buffer: wgpu::Buffer,
     dist_freq_buffer: wgpu::Buffer,
     dyn_table_buffer: wgpu::Buffer,
@@ -1921,12 +1845,7 @@ impl GpuAssist {
             len_capacity,
             output_storage_size,
             input_buffer,
-            codes_buffer,
             token_flags_buffer,
-            token_kind_buffer,
-            token_len_buffer,
-            token_dist_buffer,
-            token_lit_buffer,
             litlen_freq_buffer,
             dist_freq_buffer,
             dyn_table_buffer,
@@ -3408,83 +3327,6 @@ fn bytes_len<T>(items: usize) -> Result<u64, CozipDeflateError> {
     u64::try_from(bytes).map_err(|_| CozipDeflateError::DataTooLarge)
 }
 
-fn collect_deflate_readback(
-    slot: &DeflateSlot,
-    output_storage_size: u64,
-) -> Result<Vec<u8>, CozipDeflateError> {
-    let mapped = slot.readback.slice(..).get_mapped_range();
-    if mapped.len() < 4 {
-        return Err(CozipDeflateError::Internal("gpu readback too small"));
-    }
-
-    let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
-    let literal_bits = total_words.first().copied().unwrap_or(0) as usize;
-    let total_bits = literal_bits
-        .checked_add(10)
-        .ok_or(CozipDeflateError::DataTooLarge)?;
-    let total_bytes = total_bits.div_ceil(8);
-
-    let output_storage_size =
-        usize::try_from(output_storage_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
-    if total_bytes > output_storage_size {
-        return Err(CozipDeflateError::Internal(
-            "gpu compressed output exceeded allocated readback",
-        ));
-    }
-
-    let payload_start = 4usize;
-    let payload_end = payload_start
-        .checked_add(output_storage_size)
-        .ok_or(CozipDeflateError::DataTooLarge)?;
-    if payload_end > mapped.len() {
-        return Err(CozipDeflateError::Internal("gpu readback payload out of range"));
-    }
-
-    let payload = &mapped[payload_start..payload_end];
-    let mut compressed = Vec::with_capacity(total_bytes);
-    compressed.extend_from_slice(&payload[..total_bytes]);
-    drop(mapped);
-    slot.readback.unmap();
-    Ok(compressed)
-}
-
-fn collect_deflate_readback_dynamic(
-    slot: &DeflateSlot,
-    output_storage_size: u64,
-) -> Result<Vec<u8>, CozipDeflateError> {
-    let mapped = slot.readback.slice(..).get_mapped_range();
-    if mapped.len() < 4 {
-        return Err(CozipDeflateError::Internal("gpu readback too small"));
-    }
-
-    let total_words: &[u32] = bytemuck::cast_slice(&mapped[..4]);
-    let total_bits = total_words.first().copied().unwrap_or(0) as usize;
-    let total_bytes = total_bits.div_ceil(8);
-
-    let output_storage_size =
-        usize::try_from(output_storage_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
-    if total_bytes > output_storage_size {
-        return Err(CozipDeflateError::Internal(
-            "gpu compressed output exceeded allocated readback",
-        ));
-    }
-
-    let payload_start = 4usize;
-    let payload_end = payload_start
-        .checked_add(output_storage_size)
-        .ok_or(CozipDeflateError::DataTooLarge)?;
-    if payload_end > mapped.len() {
-        return Err(CozipDeflateError::Internal("gpu readback payload out of range"));
-    }
-
-    let payload = &mapped[payload_start..payload_end];
-    let mut compressed = Vec::with_capacity(total_bytes);
-    compressed.extend_from_slice(&payload[..total_bytes]);
-    drop(mapped);
-    slot.readback.unmap();
-    Ok(compressed)
-}
-
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<std::sync::MutexGuard<'a, T>, CozipDeflateError> {
     mutex
         .lock()
@@ -3539,7 +3381,7 @@ fn compress_hybrid_with_context(
     let tasks = build_chunk_tasks(input, options, gpu_requested && gpu_available)?;
     let has_gpu_tasks = gpu_available && gpu_requested && tasks.iter().any(|task| task.preferred_gpu);
     if has_gpu_tasks {
-        return compress_hybrid_adaptive_scheduler(input.len(), tasks, options, gpu_context);
+        return compress_hybrid_work_stealing_scheduler(input.len(), tasks, options, gpu_context);
     }
 
     let chunk_count = tasks.len();
@@ -3584,6 +3426,62 @@ fn compress_hybrid_with_context(
         bytes: frame,
         stats,
     })
+}
+
+fn compress_hybrid_work_stealing_scheduler(
+    original_len: usize,
+    tasks: Vec<ChunkTask>,
+    options: &HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
+) -> Result<CompressedFrame, CozipDeflateError> {
+    let chunk_count = tasks.len();
+    let gpu_available = gpu_context.is_some();
+    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
+    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
+
+    let cpu_workers = cpu_worker_count(gpu_available);
+    let mut handles = Vec::new();
+
+    for _ in 0..cpu_workers {
+        let queue_ref = Arc::clone(&queue);
+        let result_ref = Arc::clone(&results);
+        let err_ref = Arc::clone(&error);
+        let opts = options.clone();
+        handles.push(std::thread::spawn(move || {
+            compress_cpu_worker(queue_ref, result_ref, err_ref, &opts, gpu_available)
+        }));
+    }
+
+    if let Some(gpu) = gpu_context {
+        let queue_ref = Arc::clone(&queue);
+        let result_ref = Arc::clone(&results);
+        let err_ref = Arc::clone(&error);
+        let opts = options.clone();
+        handles.push(std::thread::spawn(move || {
+            compress_gpu_worker(queue_ref, result_ref, err_ref, &opts, gpu)
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(err) = lock(&error)?.take() {
+        return Err(err);
+    }
+
+    let mut chunks = Vec::new();
+    for item in lock(&results)?.drain(..) {
+        let member = item.ok_or(CozipDeflateError::Internal("missing compressed chunk"))?;
+        chunks.push(member);
+    }
+    chunks.sort_by_key(|chunk| chunk.index);
+
+    let stats = summarize_encoded_chunks(&chunks, gpu_available);
+    let frame = encode_frame(original_len, &chunks)?;
+
+    Ok(CompressedFrame { bytes: frame, stats })
 }
 
 pub fn decompress_hybrid(
@@ -3731,14 +3629,6 @@ fn compression_mode_id(mode: CompressionMode) -> u32 {
         CompressionMode::Speed => 0,
         CompressionMode::Balanced => 1,
         CompressionMode::Ratio => 2,
-    }
-}
-
-fn gpu_reservation_timeout_ms(mode: CompressionMode) -> u64 {
-    match mode {
-        CompressionMode::Speed => GPU_RESERVATION_TIMEOUT_MS_SPEED,
-        CompressionMode::Balanced => GPU_RESERVATION_TIMEOUT_MS_BALANCED,
-        CompressionMode::Ratio => GPU_RESERVATION_TIMEOUT_MS_RATIO,
     }
 }
 
@@ -3944,586 +3834,6 @@ fn build_chunk_tasks(
     }
 
     Ok(tasks)
-}
-
-fn compress_hybrid_adaptive_scheduler(
-    original_len: usize,
-    tasks: Vec<ChunkTask>,
-    options: &HybridOptions,
-    gpu_context: Option<Arc<GpuAssist>>,
-) -> Result<CompressedFrame, CozipDeflateError> {
-    let chunk_count = tasks.len();
-    let start = Arc::new(Instant::now());
-    let now_ms = monotonic_ms(&start);
-    let gpu_available = gpu_context.is_some();
-    let initial_reserved_budget = if options.compression_mode == CompressionMode::Ratio {
-        GPU_RATIO_RESERVED_TARGET_CHUNKS
-    } else {
-        usize::MAX
-    };
-    let mut initial_reserved_count = 0usize;
-    let mut scheduled = Vec::with_capacity(chunk_count);
-    for task in tasks {
-        let reserve_gpu = task.preferred_gpu
-            && task.raw.len() >= options.gpu_min_chunk_size
-            && initial_reserved_count < initial_reserved_budget;
-        if reserve_gpu {
-            initial_reserved_count += 1;
-        }
-        let state = if reserve_gpu {
-            CompressTaskState::ReservedGpu
-        } else {
-            CompressTaskState::Pending
-        };
-        scheduled.push(ScheduledCompressTask {
-            index: task.index,
-            preferred_gpu: task.preferred_gpu,
-            raw: task.raw,
-            state: AtomicU8::new(state as u8),
-            reserved_at_ms: AtomicU64::new(now_ms),
-        });
-    }
-    let scheduled_tasks = Arc::new(scheduled);
-
-    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
-    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
-    let remaining = Arc::new(AtomicUsize::new(chunk_count));
-    let active_cpu = Arc::new(AtomicUsize::new(0));
-    let demoted_reserved_gpu = Arc::new(AtomicUsize::new(0));
-    let validation_fallback_chunks = Arc::new(AtomicUsize::new(0));
-    let perf_counters = Arc::new(SchedulerPerfCounters::default());
-    let timeline = Arc::new(SchedulerTimeline::default());
-    let wake = Arc::new((Mutex::new(()), Condvar::new()));
-    let cpu_workers = cpu_worker_count(gpu_available);
-    log_scheduler_detail(
-        &start,
-        &format!(
-            "start chunks={} cpu_workers={} gpu_fraction={:.2} gpu_available={} initial_reserved={}",
-            chunk_count,
-            cpu_workers,
-            options.gpu_fraction,
-            gpu_available,
-            initial_reserved_count
-        ),
-    );
-
-    let mut handles = Vec::new();
-    for _ in 0..cpu_workers {
-        let tasks_ref = Arc::clone(&scheduled_tasks);
-        let results_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let rem_ref = Arc::clone(&remaining);
-        let active_ref = Arc::clone(&active_cpu);
-        let wake_ref = Arc::clone(&wake);
-        let perf_ref = Arc::clone(&perf_counters);
-        let start_ref = Arc::clone(&start);
-        let timeline_ref = Arc::clone(&timeline);
-        let opts = options.clone();
-
-        handles.push(std::thread::spawn(move || {
-            compress_cpu_worker_adaptive(
-                tasks_ref,
-                results_ref,
-                err_ref,
-                rem_ref,
-                active_ref,
-                wake_ref,
-                perf_ref,
-                start_ref,
-                timeline_ref,
-                &opts,
-            )
-        }));
-    }
-
-    if let Some(gpu) = gpu_context {
-        let tasks_ref = Arc::clone(&scheduled_tasks);
-        let results_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let rem_ref = Arc::clone(&remaining);
-        let wake_ref = Arc::clone(&wake);
-        let opts = options.clone();
-        let validation_fallback_ref = Arc::clone(&validation_fallback_chunks);
-        let perf_ref = Arc::clone(&perf_counters);
-        let start_ref = Arc::clone(&start);
-        let timeline_ref = Arc::clone(&timeline);
-
-        handles.push(std::thread::spawn(move || {
-            compress_gpu_worker_adaptive(
-                tasks_ref,
-                results_ref,
-                err_ref,
-                rem_ref,
-                wake_ref,
-                &opts,
-                gpu,
-                validation_fallback_ref,
-                perf_ref,
-                start_ref,
-                timeline_ref,
-            )
-        }));
-    }
-
-    {
-        let tasks_ref = Arc::clone(&scheduled_tasks);
-        let err_ref = Arc::clone(&error);
-        let rem_ref = Arc::clone(&remaining);
-        let active_ref = Arc::clone(&active_cpu);
-        let wake_ref = Arc::clone(&wake);
-        let start_ref = Arc::clone(&start);
-        let demoted_ref = Arc::clone(&demoted_reserved_gpu);
-        let opts = options.clone();
-
-        handles.push(std::thread::spawn(move || {
-            compress_scheduler_watchdog(
-                tasks_ref,
-                err_ref,
-                rem_ref,
-                active_ref,
-                wake_ref,
-                cpu_workers,
-                start_ref,
-                &opts,
-                demoted_ref,
-            )
-        }));
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    if let Some(err) = lock(&error)?.take() {
-        return Err(err);
-    }
-
-    let mut chunks = Vec::new();
-    for item in lock(&results)?.drain(..) {
-        let member = item.ok_or(CozipDeflateError::Internal("missing compressed chunk"))?;
-        chunks.push(member);
-    }
-    chunks.sort_by_key(|chunk| chunk.index);
-
-    let stats = summarize_encoded_chunks(&chunks, gpu_available);
-    let frame = encode_frame(original_len, &chunks)?;
-
-    Ok(CompressedFrame { bytes: frame, stats })
-}
-
-fn compress_cpu_worker_adaptive(
-    tasks: Arc<Vec<ScheduledCompressTask>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    remaining: Arc<AtomicUsize>,
-    active_cpu: Arc<AtomicUsize>,
-    wake: Arc<(Mutex<()>, Condvar)>,
-    perf_counters: Arc<SchedulerPerfCounters>,
-    start: Arc<Instant>,
-    timeline: Arc<SchedulerTimeline>,
-    options: &HybridOptions,
-) {
-    loop {
-        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
-            break;
-        }
-
-        let Some(task_index) = claim_cpu_task(&tasks, options.gpu_min_chunk_size) else {
-            wait_for_scheduler(&wake);
-            continue;
-        };
-        if mark_once(&timeline.first_cpu_task_logged) {
-            log_scheduler_detail(&start, &format!("cpu_first_task chunk={}", tasks[task_index].index));
-        }
-
-        active_cpu.fetch_add(1, Ordering::AcqRel);
-        let task = &tasks[task_index];
-        let raw_len = match u32::try_from(task.raw.len()) {
-            Ok(value) => value,
-            Err(_) => {
-                set_error(&error, CozipDeflateError::DataTooLarge);
-                return;
-            }
-        };
-        let cpu_start = Instant::now();
-        let compressed = deflate_compress_cpu(&task.raw, options.compression_level).map(|compressed| {
-            ChunkMember {
-                index: task.index,
-                backend: ChunkBackend::Cpu,
-                transform: ChunkTransform::None,
-                codec: ChunkCodec::DeflateCpu,
-                raw_len,
-                compressed,
-            }
-        });
-        let cpu_elapsed_ns = duration_ns_u64(cpu_start.elapsed());
-        active_cpu.fetch_sub(1, Ordering::AcqRel);
-
-        match compressed {
-            Ok(encoded) => {
-                perf_counters.cpu_chunks.fetch_add(1, Ordering::AcqRel);
-                perf_counters
-                    .cpu_bytes
-                    .fetch_add(task.raw.len() as u64, Ordering::AcqRel);
-                perf_counters
-                    .cpu_work_ns
-                    .fetch_add(cpu_elapsed_ns, Ordering::AcqRel);
-                if let Err(err) = store_encoded_result(&results, encoded) {
-                    set_error(&error, err);
-                    break;
-                }
-                finish_scheduled_task(task, &remaining, &wake);
-            }
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
-        }
-    }
-}
-
-fn compress_gpu_worker_adaptive(
-    tasks: Arc<Vec<ScheduledCompressTask>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    remaining: Arc<AtomicUsize>,
-    wake: Arc<(Mutex<()>, Condvar)>,
-    options: &HybridOptions,
-    gpu: Arc<GpuAssist>,
-    validation_fallback_chunks: Arc<AtomicUsize>,
-    perf_counters: Arc<SchedulerPerfCounters>,
-    start: Arc<Instant>,
-    timeline: Arc<SchedulerTimeline>,
-) {
-    loop {
-        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
-            break;
-        }
-
-        let batch = claim_gpu_batch_tasks(&tasks, options.gpu_min_chunk_size, GPU_BATCH_CHUNKS);
-        if batch.is_empty() {
-            wait_for_scheduler(&wake);
-            continue;
-        }
-        if mark_once(&timeline.first_gpu_batch_logged) {
-            log_scheduler_detail(
-                &start,
-                &format!(
-                    "gpu_first_batch chunks={} first_chunk={}",
-                    batch.len(),
-                    tasks[batch[0]].index
-                ),
-            );
-        }
-
-        let gpu_batch_bytes: usize = batch.iter().map(|idx| tasks[*idx].raw.len()).sum();
-        let gpu_batch_start = Instant::now();
-        let task_data: Vec<&[u8]> = batch.iter().map(|idx| tasks[*idx].raw.as_slice()).collect();
-        let compressed_batch = gpu.deflate_fixed_literals_batch(&task_data, options);
-        let gpu_batch_elapsed_ns = duration_ns_u64(gpu_batch_start.elapsed());
-        perf_counters.gpu_batches.fetch_add(1, Ordering::AcqRel);
-        perf_counters
-            .gpu_work_ns
-            .fetch_add(gpu_batch_elapsed_ns, Ordering::AcqRel);
-        perf_counters
-            .gpu_bytes
-            .fetch_add(gpu_batch_bytes as u64, Ordering::AcqRel);
-
-        match compressed_batch {
-            Ok(compressed_items) if compressed_items.len() == batch.len() => {
-                perf_counters
-                    .gpu_chunks
-                    .fetch_add(batch.len(), Ordering::AcqRel);
-                for (task_index, compressed) in batch.iter().copied().zip(compressed_items.into_iter()) {
-                    let task = &tasks[task_index];
-                    let raw_len = match u32::try_from(task.raw.len()) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            set_error(&error, CozipDeflateError::DataTooLarge);
-                            return;
-                        }
-                    };
-                    let encoded = if should_validate_gpu_chunk(options, task.index)
-                        && !gpu_chunk_roundtrip_matches(&task.raw, &compressed)
-                    {
-                        validation_fallback_chunks.fetch_add(1, Ordering::AcqRel);
-                        match deflate_compress_cpu(&task.raw, options.compression_level) {
-                            Ok(cpu_compressed) => ChunkMember {
-                                index: task.index,
-                                backend: ChunkBackend::Cpu,
-                                transform: ChunkTransform::None,
-                                codec: ChunkCodec::DeflateCpu,
-                                raw_len,
-                                compressed: cpu_compressed,
-                            },
-                            Err(err) => {
-                                set_error(&error, err);
-                                return;
-                            }
-                        }
-                    } else {
-                        ChunkMember {
-                            index: task.index,
-                            backend: ChunkBackend::GpuAssisted,
-                            transform: ChunkTransform::None,
-                            codec: ChunkCodec::DeflateGpuFast,
-                            raw_len,
-                            compressed,
-                        }
-                    };
-                    if let Err(err) = store_encoded_result(&results, encoded) {
-                        set_error(&error, err);
-                        return;
-                    }
-                    finish_scheduled_task(task, &remaining, &wake);
-                }
-            }
-            _ => {
-                for task_index in batch {
-                    let task = &tasks[task_index];
-                    let raw_len = match u32::try_from(task.raw.len()) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            set_error(&error, CozipDeflateError::DataTooLarge);
-                            return;
-                        }
-                    };
-                    match deflate_compress_cpu(&task.raw, options.compression_level) {
-                        Ok(compressed) => {
-                            let encoded = ChunkMember {
-                                index: task.index,
-                                backend: ChunkBackend::Cpu,
-                                transform: ChunkTransform::None,
-                                codec: ChunkCodec::DeflateCpu,
-                                raw_len,
-                                compressed,
-                            };
-                            if let Err(err) = store_encoded_result(&results, encoded) {
-                                set_error(&error, err);
-                                return;
-                            }
-                            finish_scheduled_task(task, &remaining, &wake);
-                        }
-                        Err(err) => {
-                            set_error(&error, err);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn compress_scheduler_watchdog(
-    tasks: Arc<Vec<ScheduledCompressTask>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    remaining: Arc<AtomicUsize>,
-    active_cpu: Arc<AtomicUsize>,
-    wake: Arc<(Mutex<()>, Condvar)>,
-    cpu_workers: usize,
-    start: Arc<Instant>,
-    options: &HybridOptions,
-    demoted_reserved_gpu: Arc<AtomicUsize>,
-) {
-    let reservation_timeout_ms = gpu_reservation_timeout_ms(options.compression_mode);
-    loop {
-        if has_error(&error) || remaining.load(Ordering::Acquire) == 0 {
-            break;
-        }
-
-        let idle_cpu = cpu_workers.saturating_sub(active_cpu.load(Ordering::Acquire));
-        let demote_budget = if options.compression_mode == CompressionMode::Ratio {
-            let reserved_count = tasks
-                .iter()
-                .filter(|task| {
-                    task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8
-                })
-                .count();
-            let backlog_excess = reserved_count.saturating_sub(GPU_RATIO_RESERVED_TARGET_CHUNKS);
-            // In Ratio mode, demote only when GPU reservation backlog is excessive.
-            backlog_excess.min(GPU_RATIO_FORCE_DEMOTE_STEP_CHUNKS)
-        } else {
-            idle_cpu
-        };
-
-        if demote_budget > 0 {
-            let now_ms = monotonic_ms(&start);
-            let mut demoted = 0usize;
-            for task in tasks.iter() {
-                if demoted >= demote_budget {
-                    break;
-                }
-                if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8 {
-                    let reserved_at = task.reserved_at_ms.load(Ordering::Acquire);
-                    let demote_now = now_ms.saturating_sub(reserved_at) >= reservation_timeout_ms;
-                    if demote_now
-                        && task
-                            .state
-                            .compare_exchange(
-                                CompressTaskState::ReservedGpu as u8,
-                                CompressTaskState::DemotedCpu as u8,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                    {
-                        demoted += 1;
-                    }
-                }
-            }
-            if demoted > 0 {
-                demoted_reserved_gpu.fetch_add(demoted, Ordering::AcqRel);
-                wake.1.notify_all();
-            }
-        }
-
-        wait_for_scheduler(&wake);
-    }
-}
-
-fn monotonic_ms(start: &Instant) -> u64 {
-    let elapsed = start.elapsed().as_millis();
-    elapsed.min(u128::from(u64::MAX)) as u64
-}
-
-fn duration_ns_u64(duration: Duration) -> u64 {
-    let nanos = duration.as_nanos();
-    nanos.min(u128::from(u64::MAX)) as u64
-}
-
-fn log_scheduler_detail(start: &Instant, message: &str) {
-    if !(timing_profile_enabled() && timing_profile_detail_enabled()) {
-        return;
-    }
-    eprintln!(
-        "[cozip][timing][scheduler-detail] t_ms={} {}",
-        monotonic_ms(start),
-        message
-    );
-}
-
-fn claim_cpu_task(tasks: &[ScheduledCompressTask], gpu_min_chunk_size: usize) -> Option<usize> {
-    for (index, task) in tasks.iter().enumerate() {
-        if task.state.load(Ordering::Acquire) == CompressTaskState::DemotedCpu as u8
-            && task
-                .state
-                .compare_exchange(
-                    CompressTaskState::DemotedCpu as u8,
-                    CompressTaskState::RunningCpu as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            return Some(index);
-        }
-    }
-
-    for (index, task) in tasks.iter().enumerate() {
-        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
-            && (!task.preferred_gpu || task.raw.len() < gpu_min_chunk_size)
-            && task
-                .state
-                .compare_exchange(
-                    CompressTaskState::Pending as u8,
-                    CompressTaskState::RunningCpu as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            return Some(index);
-        }
-    }
-
-    for (index, task) in tasks.iter().enumerate() {
-        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
-            && task
-                .state
-                .compare_exchange(
-                    CompressTaskState::Pending as u8,
-                    CompressTaskState::RunningCpu as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            return Some(index);
-        }
-    }
-
-    None
-}
-
-fn claim_gpu_batch_tasks(
-    tasks: &[ScheduledCompressTask],
-    gpu_min_chunk_size: usize,
-    max_batch_chunks: usize,
-) -> Vec<usize> {
-    let mut batch = Vec::with_capacity(max_batch_chunks.max(1));
-    let batch_limit = max_batch_chunks.max(1);
-
-    for (index, task) in tasks.iter().enumerate() {
-        if batch.len() >= batch_limit {
-            break;
-        }
-        if task.state.load(Ordering::Acquire) == CompressTaskState::ReservedGpu as u8
-            && task
-                .state
-                .compare_exchange(
-                    CompressTaskState::ReservedGpu as u8,
-                    CompressTaskState::RunningGpu as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            batch.push(index);
-        }
-    }
-
-    for (index, task) in tasks.iter().enumerate() {
-        if batch.len() >= batch_limit {
-            break;
-        }
-        if task.raw.len() < gpu_min_chunk_size {
-            continue;
-        }
-        if task.state.load(Ordering::Acquire) == CompressTaskState::Pending as u8
-            && task
-                .state
-                .compare_exchange(
-                    CompressTaskState::Pending as u8,
-                    CompressTaskState::RunningGpu as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-        {
-            batch.push(index);
-        }
-    }
-
-    batch
-}
-
-fn finish_scheduled_task(
-    task: &ScheduledCompressTask,
-    remaining: &AtomicUsize,
-    wake: &(Mutex<()>, Condvar),
-) {
-    task.state.store(CompressTaskState::Done as u8, Ordering::Release);
-    remaining.fetch_sub(1, Ordering::AcqRel);
-    wake.1.notify_all();
-}
-
-fn wait_for_scheduler(wake: &(Mutex<()>, Condvar)) {
-    if let Ok(guard) = wake.0.lock() {
-        let _ = wake
-            .1
-            .wait_timeout(guard, Duration::from_millis(SCHEDULER_WAIT_MS));
-    }
 }
 
 fn summarize_encoded_chunks(chunks: &[ChunkMember], gpu_available: bool) -> HybridStats {
@@ -4880,7 +4190,8 @@ fn pop_cpu_task(
         {
             return queue.remove(pos);
         }
-        return None;
+        // Work stealing: if CPU-friendly work is exhausted, steal from GPU-preferred tasks.
+        return queue.pop_front();
     }
     queue.pop_front()
 }
@@ -5049,12 +4360,6 @@ fn even_odd_transform_cpu(data: &[u8], block_size: usize, inverse: bool) -> Vec<
     out
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DeflateToken {
-    Literal(u8),
-    Match { len: usize, dist: usize },
-}
-
 struct BitWriter {
     out: Vec<u8>,
     bitbuf: u64,
@@ -5096,146 +4401,6 @@ impl BitWriter {
     }
 }
 
-fn hash4(data: &[u8], pos: usize) -> usize {
-    if pos + 3 >= data.len() {
-        return 0;
-    }
-    let a = data[pos] as usize;
-    let b = data[pos + 1] as usize;
-    let c = data[pos + 2] as usize;
-    let d = data[pos + 3] as usize;
-    ((a << 11) ^ (b << 7) ^ (c << 3) ^ d) & HASH_MASK
-}
-
-fn match_len(data: &[u8], left: usize, right: usize, max_len: usize) -> usize {
-    let mut len = 0;
-    while len < max_len
-        && right + len < data.len()
-        && left + len < data.len()
-        && data[left + len] == data[right + len]
-    {
-        len += 1;
-    }
-    len
-}
-
-fn push_hash_candidate(table: &mut [Vec<usize>], data: &[u8], pos: usize) {
-    if pos + MIN_MATCH >= data.len() {
-        return;
-    }
-    let slot = hash4(data, pos);
-    let bucket = &mut table[slot];
-    bucket.push(pos);
-    if bucket.len() > MAX_HASH_CANDIDATES {
-        let drop_count = bucket.len() - MAX_HASH_CANDIDATES;
-        bucket.drain(0..drop_count);
-    }
-}
-
-fn build_tokens_from_run_starts(data: &[u8], run_starts: &[usize]) -> Vec<DeflateToken> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-
-    let mut starts = run_starts.to_vec();
-    starts.sort_unstable();
-    starts.dedup();
-    starts.retain(|value| *value < data.len());
-    if starts.first().copied() != Some(0) {
-        starts.insert(0, 0);
-    }
-
-    let mut run_by_byte = vec![Vec::<usize>::new(); 256];
-    for &pos in &starts {
-        run_by_byte[data[pos] as usize].push(pos);
-    }
-
-    let mut table: Vec<Vec<usize>> = vec![Vec::new(); HASH_SIZE];
-    let mut tokens = Vec::new();
-    let mut i = 0;
-
-    while i < data.len() {
-        let mut best_len = 0usize;
-        let mut best_dist = 0usize;
-        let max_len = (data.len() - i).min(MAX_MATCH);
-
-        if max_len >= MIN_MATCH {
-            let slot = hash4(data, i);
-            let bucket = &table[slot];
-
-            for &candidate in bucket.iter().rev() {
-                if candidate >= i {
-                    continue;
-                }
-                let dist = i - candidate;
-                if dist > MAX_DISTANCE {
-                    continue;
-                }
-
-                let len = match_len(data, candidate, i, max_len);
-                if len >= MIN_MATCH && len > best_len {
-                    best_len = len;
-                    best_dist = dist;
-                    if len == max_len {
-                        break;
-                    }
-                }
-            }
-
-            let hints = &run_by_byte[data[i] as usize];
-            if !hints.is_empty() {
-                let mut take = 0usize;
-                let mut idx = hints.partition_point(|&value| value < i);
-                while idx > 0 && take < MAX_RUN_HINTS {
-                    idx -= 1;
-                    let candidate = hints[idx];
-                    let dist = i - candidate;
-                    if dist == 0 || dist > MAX_DISTANCE {
-                        continue;
-                    }
-                    let len = match_len(data, candidate, i, max_len);
-                    if len >= MIN_MATCH && len > best_len {
-                        best_len = len;
-                        best_dist = dist;
-                        if len == max_len {
-                            break;
-                        }
-                    }
-                    take += 1;
-                }
-            }
-        }
-
-        if best_len >= MIN_MATCH {
-            tokens.push(DeflateToken::Match {
-                len: best_len,
-                dist: best_dist,
-            });
-
-            for offset in 0..best_len {
-                push_hash_candidate(&mut table, data, i + offset);
-            }
-            i += best_len;
-        } else {
-            tokens.push(DeflateToken::Literal(data[i]));
-            push_hash_candidate(&mut table, data, i);
-            i += 1;
-        }
-    }
-
-    tokens
-}
-
-fn fixed_litlen_code(symbol: u16) -> Result<(u16, u8), CozipDeflateError> {
-    match symbol {
-        0..=143 => Ok((0x30 + symbol, 8)),
-        144..=255 => Ok((0x190 + (symbol - 144), 9)),
-        256..=279 => Ok((symbol - 256, 7)),
-        280..=287 => Ok((0xC0 + (symbol - 280), 8)),
-        _ => Err(CozipDeflateError::Internal("invalid literal/length symbol")),
-    }
-}
-
 fn reverse_bits(value: u16, bit_len: u8) -> u16 {
     let mut out = 0_u16;
     let mut i = 0;
@@ -5244,99 +4409,6 @@ fn reverse_bits(value: u16, bit_len: u8) -> u16 {
         i += 1;
     }
     out
-}
-
-fn write_fixed_litlen_symbol(writer: &mut BitWriter, symbol: u16) -> Result<(), CozipDeflateError> {
-    let (code, bits) = fixed_litlen_code(symbol)?;
-    let rev = reverse_bits(code, bits);
-    writer.write_bits(rev as u32, bits);
-    Ok(())
-}
-
-fn length_symbol_extra(len: usize) -> Result<(u16, u32, u8), CozipDeflateError> {
-    if !(MIN_MATCH..=MAX_MATCH).contains(&len) {
-        return Err(CozipDeflateError::Internal("length out of deflate range"));
-    }
-
-    for index in 0..LEN_BASE.len() {
-        let base = LEN_BASE[index] as usize;
-        let extra = LEN_EXTRA[index];
-        let max = if extra == 0 {
-            base
-        } else {
-            base + ((1_usize << extra) - 1)
-        };
-
-        if (base..=max).contains(&len) {
-            let symbol = 257 + index as u16;
-            let extra_value = len - base;
-            return Ok((symbol, extra_value as u32, extra));
-        }
-    }
-
-    Err(CozipDeflateError::Internal("length symbol not found"))
-}
-
-fn distance_symbol_extra(dist: usize) -> Result<(u16, u32, u8), CozipDeflateError> {
-    if !(1..=MAX_DISTANCE).contains(&dist) {
-        return Err(CozipDeflateError::Internal("distance out of deflate range"));
-    }
-
-    for index in 0..DIST_BASE.len() {
-        let base = DIST_BASE[index] as usize;
-        let extra = DIST_EXTRA[index];
-        let max = if extra == 0 {
-            base
-        } else {
-            base + ((1_usize << extra) - 1)
-        };
-
-        if (base..=max).contains(&dist) {
-            let extra_value = dist - base;
-            return Ok((index as u16, extra_value as u32, extra));
-        }
-    }
-
-    Err(CozipDeflateError::Internal("distance symbol not found"))
-}
-
-fn write_length_distance(
-    writer: &mut BitWriter,
-    len: usize,
-    dist: usize,
-) -> Result<(), CozipDeflateError> {
-    let (len_symbol, len_extra_value, len_extra_bits) = length_symbol_extra(len)?;
-
-    write_fixed_litlen_symbol(writer, len_symbol)?;
-    if len_extra_bits > 0 {
-        writer.write_bits(len_extra_value, len_extra_bits);
-    }
-
-    let (dist_symbol, dist_extra_value, dist_extra_bits) = distance_symbol_extra(dist)?;
-
-    let dist_code = reverse_bits(dist_symbol, 5);
-    writer.write_bits(dist_code as u32, 5);
-    if dist_extra_bits > 0 {
-        writer.write_bits(dist_extra_value, dist_extra_bits);
-    }
-
-    Ok(())
-}
-
-fn encode_deflate_fixed_from_tokens(tokens: &[DeflateToken]) -> Result<Vec<u8>, CozipDeflateError> {
-    let mut writer = BitWriter::new();
-    writer.write_bits(1, 1);
-    writer.write_bits(0b01, 2);
-
-    for token in tokens {
-        match token {
-            DeflateToken::Literal(byte) => write_fixed_litlen_symbol(&mut writer, *byte as u16)?,
-            DeflateToken::Match { len, dist } => write_length_distance(&mut writer, *len, *dist)?,
-        }
-    }
-
-    write_fixed_litlen_symbol(&mut writer, 256)?;
-    Ok(writer.finish())
 }
 
 fn build_huffman_code_lengths(freq: &[u32], max_bits: u8) -> Option<Vec<u8>> {
@@ -5633,162 +4705,6 @@ fn build_dynamic_huffman_plan(
     })
 }
 
-fn encode_deflate_dynamic_from_tokens(
-    tokens: &[DeflateToken],
-    litlen_freq_in: &[u32],
-    dist_freq_in: &[u32],
-) -> Result<Vec<u8>, CozipDeflateError> {
-    const MAX_BITS: u8 = 15;
-    const CODELEN_MAX_BITS: u8 = 7;
-    const CODELEN_ORDER: [usize; 19] = [
-        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-    ];
-
-    if litlen_freq_in.len() != LITLEN_SYMBOL_COUNT || dist_freq_in.len() != DIST_SYMBOL_COUNT {
-        return Err(CozipDeflateError::Internal("invalid frequency table size"));
-    }
-
-    let mut litlen_freq = litlen_freq_in.to_vec();
-    let mut dist_freq = dist_freq_in.to_vec();
-    litlen_freq[256] = litlen_freq[256].saturating_add(1);
-    if dist_freq.iter().all(|value| *value == 0) {
-        dist_freq[0] = 1;
-    }
-
-    let litlen_lengths = build_huffman_code_lengths(&litlen_freq, MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build litlen huffman lengths"))?;
-    let dist_lengths = build_huffman_code_lengths(&dist_freq, MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build dist huffman lengths"))?;
-
-    let hlit_count = litlen_lengths
-        .iter()
-        .rposition(|len| *len != 0)
-        .map(|index| (index + 1).max(257))
-        .unwrap_or(257);
-    let hdist_count = dist_lengths
-        .iter()
-        .rposition(|len| *len != 0)
-        .map(|index| (index + 1).max(1))
-        .unwrap_or(1);
-
-    let mut header_lengths = Vec::with_capacity(hlit_count + hdist_count);
-    header_lengths.extend_from_slice(&litlen_lengths[..hlit_count]);
-    header_lengths.extend_from_slice(&dist_lengths[..hdist_count]);
-    let cl_rle = encode_code_lengths_rle(&header_lengths);
-
-    let mut cl_freq = vec![0_u32; 19];
-    for (symbol, _) in &cl_rle {
-        cl_freq[*symbol as usize] = cl_freq[*symbol as usize].saturating_add(1);
-    }
-    if cl_freq.iter().all(|value| *value == 0) {
-        cl_freq[0] = 1;
-    }
-
-    let cl_lengths = build_huffman_code_lengths(&cl_freq, CODELEN_MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build codelen huffman lengths"))?;
-    let hclen_count = CODELEN_ORDER
-        .iter()
-        .rposition(|&sym| cl_lengths[sym] != 0)
-        .map(|index| (index + 1).max(4))
-        .unwrap_or(4);
-
-    let litlen_codes = build_canonical_codes(&litlen_lengths, MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build litlen codes"))?;
-    let dist_codes = build_canonical_codes(&dist_lengths, MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build dist codes"))?;
-    let cl_codes = build_canonical_codes(&cl_lengths, CODELEN_MAX_BITS)
-        .ok_or(CozipDeflateError::Internal("failed to build codelen codes"))?;
-
-    let mut writer = BitWriter::new();
-    writer.write_bits(1, 1);
-    writer.write_bits(0b10, 2);
-    writer.write_bits((hlit_count - 257) as u32, 5);
-    writer.write_bits((hdist_count - 1) as u32, 5);
-    writer.write_bits((hclen_count - 4) as u32, 4);
-    for &sym in CODELEN_ORDER.iter().take(hclen_count) {
-        writer.write_bits(cl_lengths[sym] as u32, 3);
-    }
-
-    for (symbol, extra) in cl_rle {
-        let (code, bits) = cl_codes[symbol as usize];
-        if bits == 0 {
-            return Err(CozipDeflateError::Internal("missing code-length code"));
-        }
-        writer.write_bits(code as u32, bits);
-        match symbol {
-            16 => writer.write_bits(extra as u32, 2),
-            17 => writer.write_bits(extra as u32, 3),
-            18 => writer.write_bits(extra as u32, 7),
-            _ => {}
-        }
-    }
-
-    for token in tokens {
-        match token {
-            DeflateToken::Literal(byte) => {
-                let (code, bits) = litlen_codes[*byte as usize];
-                if bits == 0 {
-                    return Err(CozipDeflateError::Internal("missing literal code"));
-                }
-                writer.write_bits(code as u32, bits);
-            }
-            DeflateToken::Match { len, dist } => {
-                let (len_symbol, len_extra_value, len_extra_bits) = length_symbol_extra(*len)?;
-                let (len_code, len_bits) = litlen_codes[len_symbol as usize];
-                if len_bits == 0 {
-                    return Err(CozipDeflateError::Internal("missing length code"));
-                }
-                writer.write_bits(len_code as u32, len_bits);
-                if len_extra_bits > 0 {
-                    writer.write_bits(len_extra_value, len_extra_bits);
-                }
-
-                let (dist_symbol, dist_extra_value, dist_extra_bits) = distance_symbol_extra(*dist)?;
-                let (dist_code, dist_bits) = dist_codes[dist_symbol as usize];
-                if dist_bits == 0 {
-                    return Err(CozipDeflateError::Internal("missing distance code"));
-                }
-                writer.write_bits(dist_code as u32, dist_bits);
-                if dist_extra_bits > 0 {
-                    writer.write_bits(dist_extra_value, dist_extra_bits);
-                }
-            }
-        }
-    }
-
-    let (eob_code, eob_bits) = litlen_codes[256];
-    if eob_bits == 0 {
-        return Err(CozipDeflateError::Internal("missing end-of-block code"));
-    }
-    writer.write_bits(eob_code as u32, eob_bits);
-    Ok(writer.finish())
-}
-
-fn encode_deflate_fixed_from_runs(
-    data: &[u8],
-    run_starts: &[usize],
-) -> Result<Vec<u8>, CozipDeflateError> {
-    let tokens = build_tokens_from_run_starts(data, run_starts);
-
-    let mut writer = BitWriter::new();
-    writer.write_bits(1, 1);
-    writer.write_bits(0b01, 2);
-
-    for token in tokens {
-        match token {
-            DeflateToken::Literal(byte) => {
-                write_fixed_litlen_symbol(&mut writer, byte as u16)?;
-            }
-            DeflateToken::Match { len, dist } => {
-                write_length_distance(&mut writer, len, dist)?;
-            }
-        }
-    }
-
-    write_fixed_litlen_symbol(&mut writer, 256)?;
-    Ok(writer.finish())
-}
-
 fn store_encoded_result(
     results: &Mutex<Vec<Option<ChunkMember>>>,
     encoded: ChunkMember,
@@ -6016,15 +4932,6 @@ mod tests {
         let compressed = deflate_compress_cpu(input, 6).expect("compression should succeed");
         let restored = deflate_decompress_cpu(&compressed).expect("decompression should succeed");
         assert_eq!(restored, input);
-    }
-
-    #[test]
-    fn fixed_run_encoder_roundtrip() {
-        let input = b"AAAAAAABBBBBBBBBBBCCCCCCDDDDDDDDDxxxxxx";
-        let runs = vec![0, 7, 18, 24, 33, 39];
-        let encoded = encode_deflate_fixed_from_runs(input, &runs).expect("encode should succeed");
-        let decoded = deflate_decompress_cpu(&encoded).expect("decode should succeed");
-        assert_eq!(decoded, input);
     }
 
     #[test]
