@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -9,6 +10,9 @@ use thiserror::Error;
 
 const FRAME_MAGIC: [u8; 4] = *b"CZDF";
 const FRAME_VERSION: u8 = 3;
+const STREAM_MAGIC: [u8; 4] = *b"CZDS";
+const STREAM_VERSION: u8 = 1;
+const STREAM_HEADER_LEN: usize = 8;
 const HEADER_LEN: usize = 22;
 const CHUNK_META_LEN_V3: usize = 11;
 const CHUNK_META_LEN_V2: usize = 10;
@@ -105,6 +109,26 @@ pub struct DecompressedFrame {
     pub stats: HybridStats,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StreamOptions {
+    pub frame_input_size: usize,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
+            frame_input_size: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamStats {
+    pub frames: usize,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CoZipDeflateInitStats {
     pub gpu_context_init_ms: f64,
@@ -156,6 +180,121 @@ impl CoZipDeflate {
 
     pub fn decompress(&self, frame: &[u8]) -> Result<DecompressedFrame, CozipDeflateError> {
         self.decompress_on_cpu(frame)
+    }
+
+    pub fn compress_stream<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        stream_options: StreamOptions,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        if stream_options.frame_input_size == 0 {
+            return Err(CozipDeflateError::InvalidOptions(
+                "stream frame_input_size must be greater than 0",
+            ));
+        }
+
+        writer.write_all(&stream_header_bytes())?;
+        let mut stats = StreamStats {
+            frames: 0,
+            input_bytes: 0,
+            output_bytes: STREAM_HEADER_LEN,
+        };
+
+        let mut buffer = vec![0_u8; stream_options.frame_input_size];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let compressed = self.compress(&buffer[..read])?;
+            let frame_len = u64::try_from(compressed.bytes.len())
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            writer.write_all(&frame_len.to_le_bytes())?;
+            writer.write_all(&compressed.bytes)?;
+
+            stats.frames += 1;
+            stats.input_bytes = stats.input_bytes.saturating_add(read);
+            stats.output_bytes = stats
+                .output_bytes
+                .saturating_add(std::mem::size_of::<u64>())
+                .saturating_add(compressed.bytes.len());
+        }
+
+        writer.write_all(&0_u64.to_le_bytes())?;
+        writer.flush()?;
+        stats.output_bytes = stats
+            .output_bytes
+            .saturating_add(std::mem::size_of::<u64>());
+        Ok(stats)
+    }
+
+    pub fn decompress_stream<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let mut header = [0_u8; STREAM_HEADER_LEN];
+        read_exact_frame(reader, &mut header)?;
+        validate_stream_header(&header)?;
+
+        let mut stats = StreamStats {
+            frames: 0,
+            input_bytes: STREAM_HEADER_LEN,
+            output_bytes: 0,
+        };
+        let mut len_buf = [0_u8; std::mem::size_of::<u64>()];
+
+        loop {
+            read_exact_frame(reader, &mut len_buf)?;
+            stats.input_bytes = stats
+                .input_bytes
+                .saturating_add(std::mem::size_of::<u64>());
+
+            let frame_len = u64::from_le_bytes(len_buf);
+            if frame_len == 0 {
+                break;
+            }
+
+            let frame_len_usize =
+                usize::try_from(frame_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let mut frame = vec![0_u8; frame_len_usize];
+            read_exact_frame(reader, &mut frame)?;
+            stats.input_bytes = stats.input_bytes.saturating_add(frame_len_usize);
+
+            let decompressed = self.decompress_on_cpu(&frame)?;
+            writer.write_all(&decompressed.bytes)?;
+            stats.frames += 1;
+            stats.output_bytes = stats.output_bytes.saturating_add(decompressed.bytes.len());
+        }
+
+        writer.flush()?;
+        Ok(stats)
+    }
+
+    pub fn compress_file<PIn: AsRef<Path>, POut: AsRef<Path>>(
+        &self,
+        input_path: PIn,
+        output_path: POut,
+        stream_options: StreamOptions,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let input = std::fs::File::open(input_path)?;
+        let output = std::fs::File::create(output_path)?;
+        let mut reader = std::io::BufReader::new(input);
+        let mut writer = std::io::BufWriter::new(output);
+        self.compress_stream(&mut reader, &mut writer, stream_options)
+    }
+
+    pub fn decompress_file<PIn: AsRef<Path>, POut: AsRef<Path>>(
+        &self,
+        input_path: PIn,
+        output_path: POut,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let input = std::fs::File::open(input_path)?;
+        let output = std::fs::File::create(output_path)?;
+        let mut reader = std::io::BufReader::new(input);
+        let mut writer = std::io::BufWriter::new(output);
+        self.decompress_stream(&mut reader, &mut writer)
     }
 }
 
@@ -517,6 +656,56 @@ pub fn decompress_hybrid(
     options: &HybridOptions,
 ) -> Result<DecompressedFrame, CozipDeflateError> {
     decompress_on_cpu(frame, options)
+}
+
+pub fn compress_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    options: &HybridOptions,
+    stream_options: StreamOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.compress_stream(reader, writer, stream_options)
+}
+
+pub fn decompress_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    options: &HybridOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.decompress_stream(reader, writer)
+}
+
+fn stream_header_bytes() -> [u8; STREAM_HEADER_LEN] {
+    let mut header = [0_u8; STREAM_HEADER_LEN];
+    header[0..4].copy_from_slice(&STREAM_MAGIC);
+    header[4] = STREAM_VERSION;
+    header
+}
+
+fn validate_stream_header(header: &[u8; STREAM_HEADER_LEN]) -> Result<(), CozipDeflateError> {
+    if &header[0..4] != STREAM_MAGIC.as_slice() {
+        return Err(CozipDeflateError::InvalidFrame("invalid stream magic"));
+    }
+    if header[4] != STREAM_VERSION {
+        return Err(CozipDeflateError::InvalidFrame("unsupported stream version"));
+    }
+    Ok(())
+}
+
+fn read_exact_frame<R: Read>(reader: &mut R, out: &mut [u8]) -> Result<(), CozipDeflateError> {
+    let mut offset = 0usize;
+    while offset < out.len() {
+        match reader.read(&mut out[offset..]) {
+            Ok(0) => return Err(CozipDeflateError::InvalidFrame("truncated stream")),
+            Ok(read) => {
+                offset += read;
+            }
+            Err(err) => return Err(CozipDeflateError::Io(err)),
+        }
+    }
+    Ok(())
 }
 
 fn decompress_on_cpu_with_context(

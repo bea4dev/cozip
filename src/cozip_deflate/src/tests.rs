@@ -108,3 +108,60 @@ fn decode_v2_frame_compatibility() {
     .expect("decode should succeed");
     assert_eq!(decoded.bytes, input);
 }
+
+#[test]
+fn stream_roundtrip_with_chunked_io() {
+    let options = HybridOptions {
+        prefer_gpu: false,
+        gpu_fraction: 0.0,
+        ..HybridOptions::default()
+    };
+    let cozip = CoZipDeflate::init(options).expect("init should succeed");
+    let input = patterned_data((1024 * 1024 * 3) + 123);
+
+    let mut compressed_stream = Vec::new();
+    let mut src_reader = std::io::Cursor::new(input.clone());
+    let compress_stats = cozip
+        .compress_stream(
+            &mut src_reader,
+            &mut compressed_stream,
+            StreamOptions {
+                frame_input_size: 256 * 1024,
+            },
+        )
+        .expect("stream compression should succeed");
+
+    assert!(compress_stats.frames > 1);
+
+    let mut restored = Vec::new();
+    let mut stream_reader = std::io::Cursor::new(compressed_stream);
+    let decompress_stats = cozip
+        .decompress_stream(&mut stream_reader, &mut restored)
+        .expect("stream decompression should succeed");
+
+    assert_eq!(restored, input);
+    assert_eq!(decompress_stats.frames, compress_stats.frames);
+    assert_eq!(decompress_stats.output_bytes, input.len());
+}
+
+#[test]
+fn stream_frame_input_size_must_be_positive() {
+    let options = HybridOptions {
+        prefer_gpu: false,
+        gpu_fraction: 0.0,
+        ..HybridOptions::default()
+    };
+    let cozip = CoZipDeflate::init(options).expect("init should succeed");
+    let mut input = std::io::Cursor::new(vec![1_u8, 2, 3, 4]);
+    let mut output = Vec::new();
+
+    let err = cozip
+        .compress_stream(
+            &mut input,
+            &mut output,
+            StreamOptions { frame_input_size: 0 },
+        )
+        .expect_err("frame_input_size=0 should fail");
+
+    assert!(matches!(err, CozipDeflateError::InvalidOptions(_)));
+}

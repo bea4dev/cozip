@@ -43,8 +43,28 @@ Main public helpers:
 
 - `compress_hybrid(...)`
 - `decompress_on_cpu(...)`
+- `compress_stream(...)`
+- `decompress_stream(...)`
+- `CoZipDeflate::compress_file(...)`
+- `CoZipDeflate::decompress_file(...)`
 - `deflate_compress_cpu(...)`
 - `deflate_decompress_on_cpu(...)`
+
+Streaming API for large files (bounded memory, avoids reading full file into RAM):
+
+```rust
+use cozip_deflate::{CoZipDeflate, HybridOptions, StreamOptions};
+
+let cozip = CoZipDeflate::init(HybridOptions::default())?;
+let stats = cozip.compress_file(
+    "huge-input.bin",
+    "huge-output.czds",
+    StreamOptions { frame_input_size: 64 * 1024 * 1024 },
+)?;
+let _ = cozip.decompress_file("huge-output.czds", "restored.bin")?;
+println!("frames={}", stats.frames);
+# Ok::<(), cozip_deflate::CozipDeflateError>(())
+```
 
 ## `cozip_zip` Quick Use
 
