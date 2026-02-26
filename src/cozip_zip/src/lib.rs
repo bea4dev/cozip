@@ -1,4 +1,4 @@
-use cozip_deflate::{CozipDeflateError, deflate_compress_cpu, deflate_decompress_cpu};
+use cozip_deflate::{CozipDeflateError, deflate_compress_cpu, deflate_decompress_on_cpu};
 use thiserror::Error;
 
 const LOCAL_FILE_HEADER_SIG: u32 = 0x0403_4b50;
@@ -197,7 +197,7 @@ pub fn zip_decompress_single(zip_bytes: &[u8]) -> Result<ZipEntry, CozipZipError
         .ok_or(CozipZipError::InvalidZip("compressed data out of range"))?;
 
     let data = if method == 8 {
-        deflate_decompress_cpu(compressed)?
+        deflate_decompress_on_cpu(compressed)?
     } else {
         compressed.to_vec()
     };
