@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 bytemuck = "=1.24.0"
+crc32fast = "=1.5.0"
 flate2 = "=1.1.8"
 pollster = "=0.3.0"
 thiserror.workspace = true
+tokio = { version = "=1.48.0", features = ["fs", "io-util"] }
 wgpu = "=0.19.4"

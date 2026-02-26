@@ -14,6 +14,7 @@
 - `deflate-parallel-profile.md`: 並列実行前提のDeflateプロファイル仕様案
 - `gpu-full-task-design.md`: GPUへ実圧縮/実解凍タスクを割り当てる詳細設計
 - `gpu-deflate-chunk-pipeline.md`: 独立チャンクをCPU/GPUでDeflateし連結する実装設計
+- `zip-gpu-compatibility.md`: ZIP互換を維持したGPU圧縮の制約と実装方針メモ
 - `context-log.md`: 作業ログ・決定事項・未決事項
 
 ## 運用ルール

@@ -159,7 +159,9 @@ fn stream_frame_input_size_must_be_positive() {
         .compress_stream(
             &mut input,
             &mut output,
-            StreamOptions { frame_input_size: 0 },
+            StreamOptions {
+                frame_input_size: 0,
+            },
         )
         .expect_err("frame_input_size=0 should fail");
 

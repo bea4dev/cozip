@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fs::File as StdFile;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -247,9 +248,7 @@ impl CoZipDeflate {
 
         loop {
             read_exact_frame(reader, &mut len_buf)?;
-            stats.input_bytes = stats
-                .input_bytes
-                .saturating_add(std::mem::size_of::<u64>());
+            stats.input_bytes = stats.input_bytes.saturating_add(std::mem::size_of::<u64>());
 
             let frame_len = u64::from_le_bytes(len_buf);
             if frame_len == 0 {
@@ -272,29 +271,160 @@ impl CoZipDeflate {
         Ok(stats)
     }
 
-    pub fn compress_file<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    pub fn compress_file(
+        &self,
+        input_file: StdFile,
+        output_file: StdFile,
+        stream_options: StreamOptions,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let mut reader = std::io::BufReader::new(input_file);
+        let mut writer = std::io::BufWriter::new(output_file);
+        self.compress_stream(&mut reader, &mut writer, stream_options)
+    }
+
+    pub fn decompress_file(
+        &self,
+        input_file: StdFile,
+        output_file: StdFile,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let mut reader = std::io::BufReader::new(input_file);
+        let mut writer = std::io::BufWriter::new(output_file);
+        self.decompress_stream(&mut reader, &mut writer)
+    }
+
+    pub fn compress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
         &self,
         input_path: PIn,
         output_path: POut,
         stream_options: StreamOptions,
     ) -> Result<StreamStats, CozipDeflateError> {
-        let input = std::fs::File::open(input_path)?;
-        let output = std::fs::File::create(output_path)?;
-        let mut reader = std::io::BufReader::new(input);
-        let mut writer = std::io::BufWriter::new(output);
-        self.compress_stream(&mut reader, &mut writer, stream_options)
+        let input = StdFile::open(input_path)?;
+        let output = StdFile::create(output_path)?;
+        self.compress_file(input, output, stream_options)
     }
 
-    pub fn decompress_file<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
         &self,
         input_path: PIn,
         output_path: POut,
     ) -> Result<StreamStats, CozipDeflateError> {
-        let input = std::fs::File::open(input_path)?;
-        let output = std::fs::File::create(output_path)?;
-        let mut reader = std::io::BufReader::new(input);
-        let mut writer = std::io::BufWriter::new(output);
-        self.decompress_stream(&mut reader, &mut writer)
+        let input = StdFile::open(input_path)?;
+        let output = StdFile::create(output_path)?;
+        self.decompress_file(input, output)
+    }
+
+    pub async fn compress_file_async(
+        &self,
+        mut input_file: tokio::fs::File,
+        mut output_file: tokio::fs::File,
+        stream_options: StreamOptions,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if stream_options.frame_input_size == 0 {
+            return Err(CozipDeflateError::InvalidOptions(
+                "stream frame_input_size must be greater than 0",
+            ));
+        }
+
+        output_file.write_all(&stream_header_bytes()).await?;
+        let mut stats = StreamStats {
+            frames: 0,
+            input_bytes: 0,
+            output_bytes: STREAM_HEADER_LEN,
+        };
+
+        let mut buffer = vec![0_u8; stream_options.frame_input_size];
+        loop {
+            let read = input_file.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            let compressed = self.compress(&buffer[..read])?;
+            let frame_len = u64::try_from(compressed.bytes.len())
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            output_file.write_all(&frame_len.to_le_bytes()).await?;
+            output_file.write_all(&compressed.bytes).await?;
+
+            stats.frames += 1;
+            stats.input_bytes = stats.input_bytes.saturating_add(read);
+            stats.output_bytes = stats
+                .output_bytes
+                .saturating_add(std::mem::size_of::<u64>())
+                .saturating_add(compressed.bytes.len());
+        }
+
+        output_file.write_all(&0_u64.to_le_bytes()).await?;
+        output_file.flush().await?;
+        stats.output_bytes = stats
+            .output_bytes
+            .saturating_add(std::mem::size_of::<u64>());
+        Ok(stats)
+    }
+
+    pub async fn decompress_file_async(
+        &self,
+        mut input_file: tokio::fs::File,
+        mut output_file: tokio::fs::File,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut header = [0_u8; STREAM_HEADER_LEN];
+        read_exact_frame_async(&mut input_file, &mut header).await?;
+        validate_stream_header(&header)?;
+
+        let mut stats = StreamStats {
+            frames: 0,
+            input_bytes: STREAM_HEADER_LEN,
+            output_bytes: 0,
+        };
+        let mut len_buf = [0_u8; std::mem::size_of::<u64>()];
+
+        loop {
+            read_exact_frame_async(&mut input_file, &mut len_buf).await?;
+            stats.input_bytes = stats.input_bytes.saturating_add(std::mem::size_of::<u64>());
+
+            let frame_len = u64::from_le_bytes(len_buf);
+            if frame_len == 0 {
+                break;
+            }
+
+            let frame_len_usize =
+                usize::try_from(frame_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let mut frame = vec![0_u8; frame_len_usize];
+            read_exact_frame_async(&mut input_file, &mut frame).await?;
+            stats.input_bytes = stats.input_bytes.saturating_add(frame_len_usize);
+
+            let decompressed = self.decompress_on_cpu(&frame)?;
+            output_file.write_all(&decompressed.bytes).await?;
+            stats.frames += 1;
+            stats.output_bytes = stats.output_bytes.saturating_add(decompressed.bytes.len());
+        }
+
+        output_file.flush().await?;
+        Ok(stats)
+    }
+
+    pub async fn compress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
+        &self,
+        input_path: PIn,
+        output_path: POut,
+        stream_options: StreamOptions,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let input = tokio::fs::File::open(input_path).await?;
+        let output = tokio::fs::File::create(output_path).await?;
+        self.compress_file_async(input, output, stream_options)
+            .await
+    }
+
+    pub async fn decompress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
+        &self,
+        input_path: PIn,
+        output_path: POut,
+    ) -> Result<StreamStats, CozipDeflateError> {
+        let input = tokio::fs::File::open(input_path).await?;
+        let output = tokio::fs::File::create(output_path).await?;
+        self.decompress_file_async(input, output).await
     }
 }
 
@@ -501,6 +631,143 @@ pub fn deflate_decompress_on_cpu(input: &[u8]) -> Result<Vec<u8>, CozipDeflateEr
     Ok(decoder.finish()?)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeflateCpuStreamStats {
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub input_crc32: u32,
+    pub output_crc32: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeflateStreamMode {
+    Cpu,
+    Hybrid,
+}
+
+impl Default for DeflateStreamMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
+pub fn deflate_compress_stream_on_cpu<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    const STREAM_BUF_SIZE: usize = 256 * 1024;
+
+    let mut stats = DeflateCpuStreamStats::default();
+    let mut input_crc = crc32fast::Hasher::new();
+    let mut output = HashingCountWriter::new(writer);
+    {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(&mut output, Compression::new(level.clamp(0, 9)));
+        let mut buf = vec![0_u8; STREAM_BUF_SIZE];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            encoder.write_all(&buf[..read])?;
+            input_crc.update(&buf[..read]);
+            stats.input_bytes = stats
+                .input_bytes
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        encoder.finish()?;
+    }
+
+    stats.input_crc32 = input_crc.finalize();
+    stats.output_bytes = output.written;
+    stats.output_crc32 = output.hasher.finalize();
+    Ok(stats)
+}
+
+pub fn deflate_compress_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+    mode: DeflateStreamMode,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    match mode {
+        DeflateStreamMode::Cpu => deflate_compress_stream_on_cpu(reader, writer, level),
+        DeflateStreamMode::Hybrid => {
+            // NOTE:
+            // ZIP requires a single RFC1951-compatible raw deflate bitstream.
+            // The current hybrid compressor in this crate outputs CZDF/CZDS framed data.
+            // Until a raw-deflate hybrid path is implemented, use the CPU stream path.
+            deflate_compress_stream_on_cpu(reader, writer, level)
+        }
+    }
+}
+
+pub fn deflate_decompress_stream_on_cpu<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    const STREAM_BUF_SIZE: usize = 256 * 1024;
+
+    let mut stats = DeflateCpuStreamStats::default();
+    let mut output = HashingCountWriter::new(writer);
+    {
+        let mut decoder = flate2::write::DeflateDecoder::new(&mut output);
+        let mut input_crc = crc32fast::Hasher::new();
+        let mut buf = vec![0_u8; STREAM_BUF_SIZE];
+        loop {
+            let read = reader.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            decoder.write_all(&buf[..read])?;
+            input_crc.update(&buf[..read]);
+            stats.input_bytes = stats
+                .input_bytes
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
+        decoder.finish()?;
+        stats.input_crc32 = input_crc.finalize();
+    }
+
+    stats.output_bytes = output.written;
+    stats.output_crc32 = output.hasher.finalize();
+    Ok(stats)
+}
+
+struct HashingCountWriter<'a, W: Write> {
+    inner: &'a mut W,
+    hasher: crc32fast::Hasher,
+    written: u64,
+}
+
+impl<'a, W: Write> HashingCountWriter<'a, W> {
+    fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            written: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for HashingCountWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if written > 0 {
+            self.hasher.update(&buf[..written]);
+            self.written = self
+                .written
+                .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn compress_hybrid(
     input: &[u8],
     options: &HybridOptions,
@@ -677,6 +944,88 @@ pub fn decompress_stream<R: Read, W: Write>(
     cozip.decompress_stream(reader, writer)
 }
 
+pub fn compress_file(
+    input_file: StdFile,
+    output_file: StdFile,
+    options: &HybridOptions,
+    stream_options: StreamOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.compress_file(input_file, output_file, stream_options)
+}
+
+pub fn decompress_file(
+    input_file: StdFile,
+    output_file: StdFile,
+    options: &HybridOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.decompress_file(input_file, output_file)
+}
+
+pub fn compress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    input_path: PIn,
+    output_path: POut,
+    options: &HybridOptions,
+    stream_options: StreamOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.compress_file_from_name(input_path, output_path, stream_options)
+}
+
+pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    input_path: PIn,
+    output_path: POut,
+    options: &HybridOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.decompress_file_from_name(input_path, output_path)
+}
+
+pub async fn compress_file_async(
+    input_file: tokio::fs::File,
+    output_file: tokio::fs::File,
+    options: &HybridOptions,
+    stream_options: StreamOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip
+        .compress_file_async(input_file, output_file, stream_options)
+        .await
+}
+
+pub async fn decompress_file_async(
+    input_file: tokio::fs::File,
+    output_file: tokio::fs::File,
+    options: &HybridOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip.decompress_file_async(input_file, output_file).await
+}
+
+pub async fn compress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    input_path: PIn,
+    output_path: POut,
+    options: &HybridOptions,
+    stream_options: StreamOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip
+        .compress_file_from_name_async(input_path, output_path, stream_options)
+        .await
+}
+
+pub async fn decompress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
+    input_path: PIn,
+    output_path: POut,
+    options: &HybridOptions,
+) -> Result<StreamStats, CozipDeflateError> {
+    let cozip = CoZipDeflate::init(options.clone())?;
+    cozip
+        .decompress_file_from_name_async(input_path, output_path)
+        .await
+}
+
 fn stream_header_bytes() -> [u8; STREAM_HEADER_LEN] {
     let mut header = [0_u8; STREAM_HEADER_LEN];
     header[0..4].copy_from_slice(&STREAM_MAGIC);
@@ -689,7 +1038,9 @@ fn validate_stream_header(header: &[u8; STREAM_HEADER_LEN]) -> Result<(), CozipD
         return Err(CozipDeflateError::InvalidFrame("invalid stream magic"));
     }
     if header[4] != STREAM_VERSION {
-        return Err(CozipDeflateError::InvalidFrame("unsupported stream version"));
+        return Err(CozipDeflateError::InvalidFrame(
+            "unsupported stream version",
+        ));
     }
     Ok(())
 }
@@ -698,6 +1049,25 @@ fn read_exact_frame<R: Read>(reader: &mut R, out: &mut [u8]) -> Result<(), Cozip
     let mut offset = 0usize;
     while offset < out.len() {
         match reader.read(&mut out[offset..]) {
+            Ok(0) => return Err(CozipDeflateError::InvalidFrame("truncated stream")),
+            Ok(read) => {
+                offset += read;
+            }
+            Err(err) => return Err(CozipDeflateError::Io(err)),
+        }
+    }
+    Ok(())
+}
+
+async fn read_exact_frame_async<R>(reader: &mut R, out: &mut [u8]) -> Result<(), CozipDeflateError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut offset = 0usize;
+    while offset < out.len() {
+        match reader.read(&mut out[offset..]).await {
             Ok(0) => return Err(CozipDeflateError::InvalidFrame("truncated stream")),
             Ok(read) => {
                 offset += read;

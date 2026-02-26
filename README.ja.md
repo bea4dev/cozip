@@ -3,7 +3,7 @@
 Rustライブラリ & 圧縮解凍ソフトウェア群です。
 
 - `cozip_deflate`: 独自フレーム形式（`CZDF`）。圧縮は CPU/GPU 補助、解凍は CPU 実装。
-- `cozip_zip`: `cozip_deflate` の CPU deflate/inflate を使う最小 ZIP 単一エントリ実装。
+- `cozip`: `cozip_deflate` の CPU deflate/inflate を使う、ファイル/ディレクトリ圧縮向け ZIP ラッパー（オーケストレーター）。
 
 英語版: [README.md](./README.md)
 
@@ -13,7 +13,7 @@ Rustライブラリ & 圧縮解凍ソフトウェア群です。
 cozip/
   src/
     cozip_deflate/
-    cozip_zip/
+    cozip/
   bench.sh
   docs/
 ```
@@ -47,6 +47,10 @@ assert_eq!(decompressed.bytes, input_bytes);
 - `decompress_stream(...)`
 - `CoZipDeflate::compress_file(...)`
 - `CoZipDeflate::decompress_file(...)`
+- `CoZipDeflate::compress_file_from_name(...)`
+- `CoZipDeflate::decompress_file_from_name(...)`
+- `CoZipDeflate::compress_file_async(...)`
+- `CoZipDeflate::decompress_file_async(...)`
 - `deflate_compress_cpu(...)`
 - `deflate_decompress_on_cpu(...)`
 
@@ -54,28 +58,40 @@ assert_eq!(decompressed.bytes, input_bytes);
 
 ```rust
 use cozip_deflate::{CoZipDeflate, HybridOptions, StreamOptions};
+use std::fs::File;
 
 let cozip = CoZipDeflate::init(HybridOptions::default())?;
-let stats = cozip.compress_file(
-    "huge-input.bin",
-    "huge-output.czds",
-    StreamOptions { frame_input_size: 64 * 1024 * 1024 },
-)?;
-let _ = cozip.decompress_file("huge-output.czds", "restored.bin")?;
+let input = File::open("huge-input.bin")?;
+let output = File::create("huge-output.czds")?;
+let stats = cozip.compress_file(input, output, StreamOptions { frame_input_size: 64 * 1024 * 1024 })?;
+
+let compressed = File::open("huge-output.czds")?;
+let restored = File::create("restored.bin")?;
+let _ = cozip.decompress_file(compressed, restored)?;
 println!("frames={}", stats.frames);
 # Ok::<(), cozip_deflate::CozipDeflateError>(())
 ```
 
-## `cozip_zip` の基本利用
+## `cozip` の基本利用
 
 ```rust
-use cozip_zip::{ZipOptions, zip_compress_single, zip_decompress_single};
+use cozip::{CoZip, CoZipOptions, ZipOptions};
 
-let zip = zip_compress_single("hello.txt", b"hello", &ZipOptions::default())?;
-let entry = zip_decompress_single(&zip)?;
-assert_eq!(entry.name, "hello.txt");
-assert_eq!(entry.data, b"hello");
-# Ok::<(), cozip_zip::CozipZipError>(())
+let cozip = CoZip::init(CoZipOptions::Zip {
+    options: ZipOptions::default(),
+});
+
+// 単一ファイル（パス指定）
+let _ = cozip.compress_file_from_name("input.txt", "single.zip")?;
+
+// ディレクトリ（非同期API）
+# async fn run() -> Result<(), cozip::CoZipError> {
+let _ = cozip
+    .compress_directory_async("assets/", "assets.zip")
+    .await?;
+# Ok(())
+# }
+# Ok::<(), cozip::CoZipError>(())
 ```
 
 ## ベンチマーク
