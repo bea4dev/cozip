@@ -6,7 +6,7 @@ BIN_PATH="${ROOT_DIR}/target/release/examples/bench_1gb"
 OUT_DIR="${ROOT_DIR}/bench_results"
 
 SIZE_MIB=4096
-RUNS=5
+RUNS=3
 ITERS=1
 WARMUPS=0
 CHUNK_MIB=4
@@ -14,12 +14,12 @@ GPU_SUBCHUNK_KIB=512
 TOKEN_FINALIZE_SEGMENT_SIZE=4096
 GPU_SLOTS=6
 GPU_BATCH_CHUNKS=""
-GPU_SUBMIT_CHUNKS=6
-STREAM_PIPELINE_DEPTH=2
-STREAM_BATCH_CHUNKS=32
-STREAM_MAX_INFLIGHT_CHUNKS=256
+GPU_SUBMIT_CHUNKS=3
+STREAM_PIPELINE_DEPTH=3
+STREAM_BATCH_CHUNKS=0
+STREAM_MAX_INFLIGHT_CHUNKS=0
 STREAM_MAX_INFLIGHT_MIB=0
-SCHEDULER="legacy"
+SCHEDULER="global-local"
 GPU_FRACTION=1.0
 GPU_TAIL_STOP_RATIO=1.0
 MODES="ratio"
@@ -36,7 +36,7 @@ Usage:
 
 Options:
   --size-mib <N>           Input size in MiB (default: 4096)
-  --runs <N>               Number of process-restart runs per mode (default: 5)
+  --runs <N>               Number of process-restart runs per mode (default: 3)
   --iters <N>              Iterations per process (default: 1)
   --warmups <N>            Warmup iterations per process (default: 0)
   --chunk-mib <N>          Chunk size in MiB (default: 4)
@@ -44,12 +44,12 @@ Options:
   --token-finalize-segment-size <N>  Token finalize segment size (default: 4096)
   --gpu-slots <N>          GPU slot/batch count (default: 6)
   --gpu-batch-chunks <N>   GPU dequeue batch size (default: same as --gpu-slots)
-  --gpu-submit-chunks <N>  GPU submit group size (default: 6)
-  --stream-pipeline-depth <N>  Stream prepare pipeline depth (default: 2)
-  --stream-batch-chunks <N>    Stream batch chunk count (default: 32, 0: batch off continuous)
-  --stream-max-inflight-chunks <N>  Inflight chunk cap in continuous mode (default: 256, 0: unlimited)
+  --gpu-submit-chunks <N>  GPU submit group size (default: 3)
+  --stream-pipeline-depth <N>  Stream prepare pipeline depth (default: 3)
+  --stream-batch-chunks <N>    Fixed to 0 (legacy batch mode removed)
+  --stream-max-inflight-chunks <N>  Inflight chunk cap in continuous mode (default: 0, unlimited)
   --stream-max-inflight-mib <N>  Inflight raw MiB cap in continuous mode (default: 0, disabled)
-  --scheduler <S>          Scheduler: legacy|global-local (default: legacy)
+  --scheduler <S>          Fixed to global-local
   --gpu-fraction <R>       GPU fraction 0.0..1.0 (default: 1.0)
   --gpu-tail-stop-ratio <R>  Stop new GPU dequeues when progress reaches ratio (default: 1.0; disabled)
   --mode <M>               speed|balanced|ratio or comma list (default: ratio)
@@ -61,7 +61,7 @@ Options:
   -h, --help               Show this help
 
 Example:
-  ./bench.sh --mode ratio --size-mib 4096 --runs 5
+  ./bench.sh --mode ratio --size-mib 4096 --runs 3
   ./bench.sh --mode speed,balanced,ratio --runs 3
 EOF
 }
@@ -224,6 +224,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${STREAM_BATCH_CHUNKS}" != "0" ]]; then
+  echo "--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)" >&2
+  exit 2
+fi
+
+if [[ "${SCHEDULER}" != "global-local" ]]; then
+  echo "--scheduler is fixed to global-local" >&2
+  exit 2
+fi
 
 if [[ -z "${GPU_BATCH_CHUNKS}" ]]; then
   GPU_BATCH_CHUNKS="${GPU_SLOTS}"

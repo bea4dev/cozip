@@ -34,23 +34,23 @@ struct BenchConfig {
 impl Default for BenchConfig {
     fn default() -> Self {
         Self {
-            size_mib: 1024,
+            size_mib: 4096,
             iters: 1,
             warmups: 0,
             chunk_mib: 4,
-            gpu_subchunk_kib: 256,
+            gpu_subchunk_kib: 512,
             token_finalize_segment_size: 4096,
             gpu_slots: 6,
             gpu_batch_chunks: 6,
-            gpu_submit_chunks: 6,
-            stream_pipeline_depth: 2,
-            stream_batch_chunks: 32,
-            stream_max_inflight_chunks: 256,
+            gpu_submit_chunks: 3,
+            stream_pipeline_depth: 3,
+            stream_batch_chunks: 0,
+            stream_max_inflight_chunks: 0,
             stream_max_inflight_mib: 0,
-            scheduler_policy: HybridSchedulerPolicy::Legacy,
+            scheduler_policy: HybridSchedulerPolicy::GlobalQueueLocalBuffers,
             gpu_fraction: 1.0,
             gpu_tail_stop_ratio: 1.0,
-            mode: CompressionMode::Speed,
+            mode: CompressionMode::Ratio,
             profile_timing: env_flag("COZIP_PROFILE_TIMING"),
             profile_timing_detail: env_flag("COZIP_PROFILE_TIMING_DETAIL"),
             profile_timing_deep: env_flag("COZIP_PROFILE_DEEP"),
@@ -155,6 +155,12 @@ impl BenchConfig {
                     cfg.stream_batch_chunks = value
                         .parse::<usize>()
                         .map_err(|_| "invalid --stream-batch-chunks".to_string())?;
+                    if cfg.stream_batch_chunks != 0 {
+                        return Err(
+                            "--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)"
+                                .to_string(),
+                        );
+                    }
                 }
                 "--stream-max-inflight-chunks" => {
                     cfg.stream_max_inflight_chunks = value
@@ -168,12 +174,9 @@ impl BenchConfig {
                 }
                 "--scheduler" => {
                     cfg.scheduler_policy = match value.as_str() {
-                        "legacy" => HybridSchedulerPolicy::Legacy,
                         "global-local" => HybridSchedulerPolicy::GlobalQueueLocalBuffers,
                         _ => {
-                            return Err(
-                                "invalid --scheduler (expected: legacy|global-local)".to_string()
-                            );
+                            return Err("invalid --scheduler (expected: global-local)".to_string());
                         }
                     };
                 }
@@ -225,6 +228,11 @@ impl BenchConfig {
         if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
             return Err("gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
         }
+        if cfg.stream_batch_chunks != 0 {
+            return Err(
+                "--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)".to_string(),
+            );
+        }
         if cfg.profile_timing_detail || cfg.profile_timing_deep {
             cfg.profile_timing = true;
         }
@@ -235,23 +243,23 @@ impl BenchConfig {
 
 fn help_text() -> String {
     let text = r#"usage: cargo run --release -p cozip_deflate --example bench_1gb -- [options]
-  --size-mib <N>           input size in MiB (default: 1024)
+  --size-mib <N>           input size in MiB (default: 4096)
   --iters <N>              measured iterations (default: 1)
   --warmups <N>            warmup iterations (default: 0)
   --chunk-mib <N>          host chunk size in MiB (default: 4)
-  --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)
+  --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 512)
   --token-finalize-segment-size <N> token finalize segment size (default: 4096)
   --gpu-slots <N>          gpu slot/batch count (default: 6)
   --gpu-batch-chunks <N>   gpu dequeue batch size (default: 6)
-  --gpu-submit-chunks <N>  gpu submit group size (default: 6)
-  --stream-pipeline-depth <N>  stream prepare pipeline depth (default: 2)
-  --stream-batch-chunks <N>    stream batch chunk count (default: 32, 0: batch off continuous)
-  --stream-max-inflight-chunks <N> inflight chunk cap in continuous mode (default: 256, 0: unlimited)
+  --gpu-submit-chunks <N>  gpu submit group size (default: 3)
+  --stream-pipeline-depth <N>  stream prepare pipeline depth (default: 3)
+  --stream-batch-chunks <N>    fixed to 0 (legacy batch mode removed)
+  --stream-max-inflight-chunks <N> inflight chunk cap in continuous mode (default: 0, unlimited)
   --stream-max-inflight-mib <N> inflight raw MiB cap in continuous mode (default: 0, disabled)
-  --scheduler <S>          legacy|global-local (default: legacy)
+  --scheduler <S>          global-local only
   --gpu-fraction <R>       gpu scheduling target ratio 0.0..=1.0 (default: 1.0)
   --gpu-tail-stop-ratio <R>  stop new GPU dequeues when progress reaches ratio (default: 1.0; disabled)
-  --mode <M>               speed|balanced|ratio (default: speed)
+  --mode <M>               speed|balanced|ratio (default: ratio)
   --profile-timing         enable GPU timing logs
   --profile-timing-detail  enable detailed GPU timing logs
   --profile-timing-deep    enable one-shot deep GPU timing probe"#;

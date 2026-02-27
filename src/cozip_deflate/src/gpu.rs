@@ -149,6 +149,8 @@ struct DeflateSlot {
     output_words_buffer: wgpu::Buffer,
     dyn_header_staging_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
+    litlen_freq_readback: wgpu::Buffer,
+    dist_freq_readback: wgpu::Buffer,
     readback: wgpu::Buffer,
     scan_levels: Vec<ScanScratchLevel>,
     litlen_bg: wgpu::BindGroup,
@@ -1357,6 +1359,18 @@ impl GpuAssist {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dyn-litlen-freq-rb"),
+            size: bytes_len::<u32>(LITLEN_SYMBOL_COUNT)?,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dist_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-deflate-dyn-dist-freq-rb"),
+            size: bytes_len::<u32>(DIST_SYMBOL_COUNT)?,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let readback_size = output_storage_size
             .checked_add(4)
@@ -1693,6 +1707,8 @@ impl GpuAssist {
             output_words_buffer,
             dyn_header_staging_buffer,
             params_buffer,
+            litlen_freq_readback,
+            dist_freq_readback,
             readback,
             scan_levels,
             litlen_bg,
@@ -2372,8 +2388,6 @@ impl GpuAssist {
         struct PendingDynFreqReadback {
             chunk_index: usize,
             slot_index: usize,
-            litlen_freq_readback: wgpu::Buffer,
-            dist_freq_readback: wgpu::Buffer,
             litlen_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
             dist_receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
             litlen_ready: bool,
@@ -2411,8 +2425,7 @@ impl GpuAssist {
 
         let mut freq_pending: VecDeque<PendingDynFreqReadback> = VecDeque::new();
         let mut prepared: Vec<PreparedDynamicPack> = Vec::with_capacity(chunks.len().max(1));
-        let mut staged_freq_readbacks: Vec<(usize, usize, wgpu::Buffer, wgpu::Buffer)> =
-            Vec::new();
+        let mut staged_freq_readbacks: Vec<(usize, usize)> = Vec::new();
         let mut freq_submit_chunk_count = 0usize;
         struct DynamicPlanCacheEntry {
             litlen_freq: Vec<u32>,
@@ -2428,7 +2441,8 @@ impl GpuAssist {
                 });
         let mut collect_ready_freq_any = |freq_pending: &mut VecDeque<PendingDynFreqReadback>,
                                           prepared: &mut Vec<PreparedDynamicPack>,
-                                          timing: &mut GpuDynamicTiming|
+                                          timing: &mut GpuDynamicTiming,
+                                          slots: &mut [DeflateSlot]|
          -> Result<usize, CozipDeflateError> {
             let mut collected = 0usize;
             let pending_len = freq_pending.len();
@@ -2506,8 +2520,14 @@ impl GpuAssist {
                 } else {
                     None
                 };
-                let litlen_freq_map = pending.litlen_freq_readback.slice(..).get_mapped_range();
-                let dist_freq_map = pending.dist_freq_readback.slice(..).get_mapped_range();
+                let litlen_freq_map = slots[pending.slot_index]
+                    .litlen_freq_readback
+                    .slice(..)
+                    .get_mapped_range();
+                let dist_freq_map = slots[pending.slot_index]
+                    .dist_freq_readback
+                    .slice(..)
+                    .get_mapped_range();
                 let mut litlen_freq = vec![0_u32; LITLEN_SYMBOL_COUNT];
                 let mut dist_freq = vec![0_u32; DIST_SYMBOL_COUNT];
                 let litlen_words: &[u32] = bytemuck::cast_slice(&litlen_freq_map);
@@ -2516,8 +2536,8 @@ impl GpuAssist {
                 dist_freq.copy_from_slice(&dist_words_freq[..DIST_SYMBOL_COUNT]);
                 drop(litlen_freq_map);
                 drop(dist_freq_map);
-                pending.litlen_freq_readback.unmap();
-                pending.dist_freq_readback.unmap();
+                slots[pending.slot_index].litlen_freq_readback.unmap();
+                slots[pending.slot_index].dist_freq_readback.unmap();
                 if let Some(start) = freq_map_copy_start {
                     timing.freq_map_copy_ms += elapsed_ms(start);
                 }
@@ -2625,6 +2645,11 @@ impl GpuAssist {
             } else {
                 None
             };
+            let (tokenize_x, tokenize_y) = dispatch_grid_for_items(len, 128)?;
+            let (finalize_x, finalize_y) =
+                dispatch_grid_for_items(len, options.token_finalize_segment_size)?;
+            let (freq_x, freq_y) =
+                dispatch_grid_for_items_capped(len, 128, GPU_FREQ_MAX_WORKGROUPS)?;
 
             if deep_timing_enabled
                 && DEEP_DYNAMIC_PROBE_TAKEN
@@ -2645,55 +2670,53 @@ impl GpuAssist {
             } else {
                 None
             };
-            let litlen_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-dyn-litlen-freq-rb"),
-                size: litlen_freq_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let dist_freq_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-deflate-dyn-dist-freq-rb"),
-                size: dist_freq_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
             freq_encoder.clear_buffer(&slot.litlen_freq_buffer, 0, None);
             freq_encoder.clear_buffer(&slot.dist_freq_buffer, 0, None);
 
             {
-                let (dispatch_x, dispatch_y) =
-                    dispatch_grid_for_items(len, options.token_finalize_segment_size)?;
                 let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-deflate-phase1-fused-pass"),
+                    label: Some("cozip-deflate-tokenize-pass"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.phase1_fused_pipeline);
-                pass.set_bind_group(0, &slot.phase1_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+                pass.set_pipeline(&self.tokenize_pipeline);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+                pass.dispatch_workgroups(tokenize_x, tokenize_y, 1);
+            }
+            {
+                let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-token-finalize-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.token_finalize_pipeline);
+                pass.set_bind_group(0, &slot.tokenize_bg, &[]);
+                pass.dispatch_workgroups(finalize_x, finalize_y, 1);
+            }
+            {
+                let mut pass = freq_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-deflate-freq-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.freq_pipeline);
+                pass.set_bind_group(0, &slot.freq_bg, &[]);
+                pass.dispatch_workgroups(freq_x, freq_y, 1);
             }
 
             freq_encoder.copy_buffer_to_buffer(
                 &slot.litlen_freq_buffer,
                 0,
-                &litlen_freq_readback,
+                &slot.litlen_freq_readback,
                 0,
                 litlen_freq_size,
             );
             freq_encoder.copy_buffer_to_buffer(
                 &slot.dist_freq_buffer,
                 0,
-                &dist_freq_readback,
+                &slot.dist_freq_readback,
                 0,
                 dist_freq_size,
             );
 
-            staged_freq_readbacks.push((
-                chunk_index,
-                slot_index,
-                litlen_freq_readback,
-                dist_freq_readback,
-            ));
+            staged_freq_readbacks.push((chunk_index, slot_index));
             if let Some(start) = freq_encode_start {
                 timing.freq_encode_ms += elapsed_ms(start);
             }
@@ -2717,17 +2740,17 @@ impl GpuAssist {
                 } else {
                     None
                 };
-                for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
-                    staged_freq_readbacks.drain(..)
-                {
+                for (pending_chunk_index, pending_slot_index) in staged_freq_readbacks.drain(..) {
                     let (lit_tx, lit_rx) = std::sync::mpsc::channel();
-                    lit_rb
+                    slots[pending_slot_index]
+                        .litlen_freq_readback
                         .slice(..)
                         .map_async(wgpu::MapMode::Read, move |result| {
                             let _ = lit_tx.send(result);
                         });
                     let (dist_tx, dist_rx) = std::sync::mpsc::channel();
-                    dist_rb
+                    slots[pending_slot_index]
+                        .dist_freq_readback
                         .slice(..)
                         .map_async(wgpu::MapMode::Read, move |result| {
                             let _ = dist_tx.send(result);
@@ -2735,8 +2758,6 @@ impl GpuAssist {
                     freq_pending.push_back(PendingDynFreqReadback {
                         chunk_index: pending_chunk_index,
                         slot_index: pending_slot_index,
-                        litlen_freq_readback: lit_rb,
-                        dist_freq_readback: dist_rb,
                         litlen_receiver: lit_rx,
                         dist_receiver: dist_rx,
                         litlen_ready: false,
@@ -2750,17 +2771,22 @@ impl GpuAssist {
                     timing.freq_pending_sum_chunks += pending;
                     timing.freq_pending_max_chunks = timing.freq_pending_max_chunks.max(pending);
                 }
-                let freq_poll_spin_start = if timing_enabled {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                self.device.poll(wgpu::Maintain::Poll);
-                if let Some(start) = freq_poll_spin_start {
-                    timing.freq_poll_spin_ms += elapsed_ms(start);
-                }
                 if !freq_pending.is_empty() {
-                    let _ = collect_ready_freq_any(&mut freq_pending, &mut prepared, &mut timing)?;
+                    let freq_poll_spin_start = if timing_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    self.device.poll(wgpu::Maintain::Poll);
+                    if let Some(start) = freq_poll_spin_start {
+                        timing.freq_poll_spin_ms += elapsed_ms(start);
+                    }
+                    let _ = collect_ready_freq_any(
+                        &mut freq_pending,
+                        &mut prepared,
+                        &mut timing,
+                        &mut slots,
+                    )?;
                 }
                 freq_encoder =
                     self.device
@@ -2786,17 +2812,17 @@ impl GpuAssist {
             } else {
                 None
             };
-            for (pending_chunk_index, pending_slot_index, lit_rb, dist_rb) in
-                staged_freq_readbacks.drain(..)
-            {
+            for (pending_chunk_index, pending_slot_index) in staged_freq_readbacks.drain(..) {
                 let (lit_tx, lit_rx) = std::sync::mpsc::channel();
-                lit_rb
+                slots[pending_slot_index]
+                    .litlen_freq_readback
                     .slice(..)
                     .map_async(wgpu::MapMode::Read, move |result| {
                         let _ = lit_tx.send(result);
                     });
                 let (dist_tx, dist_rx) = std::sync::mpsc::channel();
-                dist_rb
+                slots[pending_slot_index]
+                    .dist_freq_readback
                     .slice(..)
                     .map_async(wgpu::MapMode::Read, move |result| {
                         let _ = dist_tx.send(result);
@@ -2804,8 +2830,6 @@ impl GpuAssist {
                 freq_pending.push_back(PendingDynFreqReadback {
                     chunk_index: pending_chunk_index,
                     slot_index: pending_slot_index,
-                    litlen_freq_readback: lit_rb,
-                    dist_freq_readback: dist_rb,
                     litlen_receiver: lit_rx,
                     dist_receiver: dist_rx,
                     litlen_ready: false,
@@ -2819,45 +2843,22 @@ impl GpuAssist {
                 timing.freq_pending_sum_chunks += pending;
                 timing.freq_pending_max_chunks = timing.freq_pending_max_chunks.max(pending);
             }
-        }
-
-        if prepared.capacity() < prepared.len() + freq_pending.len() {
-            prepared.reserve(freq_pending.len());
-        }
-        while !freq_pending.is_empty() {
-            let freq_poll_spin_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            self.device.poll(wgpu::Maintain::Poll);
-            if let Some(start) = freq_poll_spin_start {
-                timing.freq_poll_spin_ms += elapsed_ms(start);
-            }
-            let collected = collect_ready_freq_any(&mut freq_pending, &mut prepared, &mut timing)?;
-            if collected == 0 {
-                let pending_before_wait = freq_pending.len();
-                let freq_poll_wait_start = if timing_enabled {
+            if !freq_pending.is_empty() {
+                let freq_poll_spin_start = if timing_enabled {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                self.device.poll(wgpu::Maintain::Wait);
-                if let Some(start) = freq_poll_wait_start {
-                    let wait_ms = elapsed_ms(start);
-                    timing.freq_poll_wait_ms += wait_ms;
-                    timing.freq_wait_calls += 1;
-                    timing.freq_wait_max_ms = timing.freq_wait_max_ms.max(wait_ms);
-                    timing.freq_wait_pending_sum += pending_before_wait;
+                self.device.poll(wgpu::Maintain::Poll);
+                if let Some(start) = freq_poll_spin_start {
+                    timing.freq_poll_spin_ms += elapsed_ms(start);
                 }
-                let collected_after_wait =
-                    collect_ready_freq_any(&mut freq_pending, &mut prepared, &mut timing)?;
-                timing.freq_wait_collected_sum += collected_after_wait;
-                if collected_after_wait == 0 {
-                    return Err(CozipDeflateError::Internal(
-                        "freq pending stalled after gpu wait",
-                    ));
-                }
+                let _ = collect_ready_freq_any(
+                    &mut freq_pending,
+                    &mut prepared,
+                    &mut timing,
+                    &mut slots,
+                )?;
             }
         }
 
@@ -2868,7 +2869,8 @@ impl GpuAssist {
         let mut collect_ready_pack_any = |pack_pending: &mut VecDeque<
             PendingDynPackBitsReadback,
         >,
-                                          timing: &mut GpuDynamicTiming|
+                                          timing: &mut GpuDynamicTiming,
+                                          slots: &mut [DeflateSlot]|
          -> Result<usize, CozipDeflateError> {
             let mut collected = 0usize;
             let pending_len = pack_pending.len();
@@ -3044,216 +3046,290 @@ impl GpuAssist {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("cozip-deflate-dynamic-pack-batch-encoder"),
                 });
+        if prepared.capacity() < prepared.len() + freq_pending.len() {
+            prepared.reserve(freq_pending.len());
+        }
+        let mut prepared_cursor = 0usize;
 
-        for item in prepared {
-            let slot = &slots[item.slot_index];
-            let plan = &item.plan;
-            let pack_encode_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let pack_upload_start = if timing_enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            self.queue.write_buffer(
-                &slot.dyn_table_buffer,
-                0,
-                bytemuck::cast_slice(&plan.dyn_table),
-            );
-            let meta = [
-                plan.header_bits,
-                u32::from(plan.eob_code),
-                u32::from(plan.eob_bits),
-                0,
-            ];
-            self.queue
-                .write_buffer(&slot.dyn_meta_buffer, 0, bytemuck::cast_slice(&meta));
-            let params = [
-                item.len_u32,
-                u32::try_from(options.token_finalize_segment_size)
-                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                compression_mode_id(mode),
-                plan.header_bits,
-            ];
-            self.queue
-                .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
-
-            let header_copy_size = plan.header_copy_size;
-            let header_copy_size_usize =
-                usize::try_from(header_copy_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
-            if header_copy_size > slot.output_storage_size {
-                return Err(CozipDeflateError::DataTooLarge);
-            }
-            let use_slot_header_staging = header_copy_size_usize <= DYN_HEADER_STAGING_BYTES;
-            let temp_header_staging = if use_slot_header_staging {
-                None
-            } else {
-                Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("cozip-deflate-dyn-header"),
-                    size: header_copy_size,
-                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }))
-            };
-            if let Some(buffer) = &temp_header_staging {
-                self.queue
-                    .write_buffer(buffer, 0, &plan.header_bytes_padded);
-            } else {
+        while !freq_pending.is_empty() || prepared_cursor < prepared.len() {
+            while prepared_cursor < prepared.len() {
+                let item = &prepared[prepared_cursor];
+                let slot = &slots[item.slot_index];
+                let plan = &item.plan;
+                let pack_encode_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let pack_upload_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 self.queue.write_buffer(
-                    &slot.dyn_header_staging_buffer,
+                    &slot.dyn_table_buffer,
                     0,
-                    &plan.header_bytes_padded,
+                    bytemuck::cast_slice(&plan.dyn_table),
                 );
-            }
-            if let Some(start) = pack_upload_start {
-                timing.pack_upload_ms += elapsed_ms(start);
-            }
+                let meta = [
+                    plan.header_bits,
+                    u32::from(plan.eob_code),
+                    u32::from(plan.eob_bits),
+                    0,
+                ];
+                self.queue
+                    .write_buffer(&slot.dyn_meta_buffer, 0, bytemuck::cast_slice(&meta));
+                let params = [
+                    item.len_u32,
+                    u32::try_from(options.token_finalize_segment_size)
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                    compression_mode_id(mode),
+                    plan.header_bits,
+                ];
+                self.queue
+                    .write_buffer(&slot.params_buffer, 0, bytemuck::cast_slice(&params));
 
-            pack_encoder.clear_buffer(&slot.token_total_buffer, 0, None);
-            pack_encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
-            pack_encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
-            pack_encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
-            pack_encoder.clear_buffer(&slot.output_words_buffer, 0, None);
-            let header_copy_src = if let Some(buffer) = &temp_header_staging {
-                buffer
-            } else {
-                &slot.dyn_header_staging_buffer
-            };
-            pack_encoder.copy_buffer_to_buffer(
-                header_copy_src,
-                0,
-                &slot.output_words_buffer,
-                0,
-                header_copy_size,
-            );
-
-            self.dispatch_parallel_prefix_scan(
-                &mut pack_encoder,
-                slot,
-                &slot.token_flags_buffer,
-                &slot.token_prefix_buffer,
-                &slot.token_total_buffer,
-                item.len_u32 as usize,
-                "token-prefix-dynamic",
-            )?;
-
-            {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(item.len_u32 as usize, 128)?;
-                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-deflate-dyn-map-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.dyn_map_pipeline);
-                pass.set_bind_group(0, &slot.dyn_map_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-            }
-
-            self.dispatch_parallel_prefix_scan(
-                &mut pack_encoder,
-                slot,
-                &slot.bitlens_buffer,
-                &slot.bit_offsets_buffer,
-                &slot.total_bits_buffer,
-                item.len_u32 as usize,
-                "bitlen-prefix-dynamic",
-            )?;
-
-            {
-                let (dispatch_x, dispatch_y) = dispatch_grid_for_items(item.len_u32 as usize, 128)?;
-                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-deflate-bitpack-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.bitpack_pipeline);
-                pass.set_bind_group(0, &slot.bitpack_bg, &[]);
-                pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-            }
-
-            {
-                let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("cozip-deflate-dyn-finalize-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.dyn_finalize_pipeline);
-                pass.set_bind_group(0, &slot.dyn_finalize_bg, &[]);
-                pass.dispatch_workgroups(1, 1, 1);
-            }
-
-            // Pack result payload and total_bits are copied in the same submission to reduce
-            // command submit round-trips in the dynamic path.
-            pack_encoder.copy_buffer_to_buffer(
-                &slot.output_words_buffer,
-                0,
-                &slot.readback,
-                0,
-                slot.output_storage_size,
-            );
-            pack_encoder.copy_buffer_to_buffer(
-                &slot.total_bits_buffer,
-                0,
-                &slot.readback,
-                slot.output_storage_size,
-                4,
-            );
-
-            staged_pack.push((item.chunk_index, item.slot_index));
-            if let Some(start) = pack_encode_start {
-                timing.pack_encode_ms += elapsed_ms(start);
-            }
-            pack_submit_chunk_count += 1;
-
-            if pack_submit_chunk_count >= submit_group {
-                let pack_submit_start = if timing_enabled {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                self.queue.submit(Some(pack_encoder.finish()));
-                if let Some(start) = pack_submit_start {
-                    timing.pack_submit_ms += elapsed_ms(start);
+                let header_copy_size = plan.header_copy_size;
+                let header_copy_size_usize = usize::try_from(header_copy_size)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                if header_copy_size > slot.output_storage_size {
+                    return Err(CozipDeflateError::DataTooLarge);
                 }
-                for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let slot = &slots[pending_slot_index];
-                    let readback_size = slot
-                        .output_storage_size
-                        .checked_add(4)
-                        .ok_or(CozipDeflateError::DataTooLarge)?;
-                    slots[pending_slot_index]
-                        .readback
-                        .slice(0..readback_size)
-                        .map_async(wgpu::MapMode::Read, move |result| {
-                            let _ = tx.send(result);
-                        });
-                    pack_pending.push_back(PendingDynPackBitsReadback {
-                        chunk_index: pending_chunk_index,
-                        slot_index: pending_slot_index,
-                        output_storage_size: usize::try_from(slot.output_storage_size)
-                            .map_err(|_| CozipDeflateError::DataTooLarge)?,
-                        readback_size,
-                        receiver: rx,
+                let use_slot_header_staging = header_copy_size_usize <= DYN_HEADER_STAGING_BYTES;
+                let temp_header_staging = if use_slot_header_staging {
+                    None
+                } else {
+                    Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("cozip-deflate-dyn-header"),
+                        size: header_copy_size,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }))
+                };
+                if let Some(buffer) = &temp_header_staging {
+                    self.queue
+                        .write_buffer(buffer, 0, &plan.header_bytes_padded);
+                } else {
+                    self.queue.write_buffer(
+                        &slot.dyn_header_staging_buffer,
+                        0,
+                        &plan.header_bytes_padded,
+                    );
+                }
+                if let Some(start) = pack_upload_start {
+                    timing.pack_upload_ms += elapsed_ms(start);
+                }
+
+                pack_encoder.clear_buffer(&slot.token_total_buffer, 0, None);
+                pack_encoder.clear_buffer(&slot.bitlens_buffer, 0, None);
+                pack_encoder.clear_buffer(&slot.total_bits_buffer, 0, None);
+                pack_encoder.clear_buffer(&slot.dyn_overflow_buffer, 0, None);
+                pack_encoder.clear_buffer(&slot.output_words_buffer, 0, None);
+                let header_copy_src = if let Some(buffer) = &temp_header_staging {
+                    buffer
+                } else {
+                    &slot.dyn_header_staging_buffer
+                };
+                pack_encoder.copy_buffer_to_buffer(
+                    header_copy_src,
+                    0,
+                    &slot.output_words_buffer,
+                    0,
+                    header_copy_size,
+                );
+
+                self.dispatch_parallel_prefix_scan(
+                    &mut pack_encoder,
+                    slot,
+                    &slot.token_flags_buffer,
+                    &slot.token_prefix_buffer,
+                    &slot.token_total_buffer,
+                    item.len_u32 as usize,
+                    "token-prefix-dynamic",
+                )?;
+
+                {
+                    let (dispatch_x, dispatch_y) =
+                        dispatch_grid_for_items(item.len_u32 as usize, 128)?;
+                    let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-deflate-dyn-map-pass"),
+                        timestamp_writes: None,
                     });
-                    timing.bits_readback_bytes += 4;
+                    pass.set_pipeline(&self.dyn_map_pipeline);
+                    pass.set_bind_group(0, &slot.dyn_map_bg, &[]);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
                 }
-                let pack_poll_spin_start = if timing_enabled {
+
+                self.dispatch_parallel_prefix_scan(
+                    &mut pack_encoder,
+                    slot,
+                    &slot.bitlens_buffer,
+                    &slot.bit_offsets_buffer,
+                    &slot.total_bits_buffer,
+                    item.len_u32 as usize,
+                    "bitlen-prefix-dynamic",
+                )?;
+
+                {
+                    let (dispatch_x, dispatch_y) =
+                        dispatch_grid_for_items(item.len_u32 as usize, 128)?;
+                    let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-deflate-bitpack-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.bitpack_pipeline);
+                    pass.set_bind_group(0, &slot.bitpack_bg, &[]);
+                    pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+                }
+
+                {
+                    let mut pass = pack_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("cozip-deflate-dyn-finalize-pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.dyn_finalize_pipeline);
+                    pass.set_bind_group(0, &slot.dyn_finalize_bg, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                }
+
+                // Pack result payload and total_bits are copied in the same submission to reduce
+                // command submit round-trips in the dynamic path.
+                pack_encoder.copy_buffer_to_buffer(
+                    &slot.output_words_buffer,
+                    0,
+                    &slot.readback,
+                    0,
+                    slot.output_storage_size,
+                );
+                pack_encoder.copy_buffer_to_buffer(
+                    &slot.total_bits_buffer,
+                    0,
+                    &slot.readback,
+                    slot.output_storage_size,
+                    4,
+                );
+
+                staged_pack.push((item.chunk_index, item.slot_index));
+                if let Some(start) = pack_encode_start {
+                    timing.pack_encode_ms += elapsed_ms(start);
+                }
+                pack_submit_chunk_count += 1;
+                prepared_cursor += 1;
+
+                if pack_submit_chunk_count >= submit_group {
+                    let pack_submit_start = if timing_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    self.queue.submit(Some(pack_encoder.finish()));
+                    if let Some(start) = pack_submit_start {
+                        timing.pack_submit_ms += elapsed_ms(start);
+                    }
+                    for (pending_chunk_index, pending_slot_index) in staged_pack.drain(..) {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let slot = &slots[pending_slot_index];
+                        let readback_size = slot
+                            .output_storage_size
+                            .checked_add(4)
+                            .ok_or(CozipDeflateError::DataTooLarge)?;
+                        slots[pending_slot_index]
+                            .readback
+                            .slice(0..readback_size)
+                            .map_async(wgpu::MapMode::Read, move |result| {
+                                let _ = tx.send(result);
+                            });
+                        pack_pending.push_back(PendingDynPackBitsReadback {
+                            chunk_index: pending_chunk_index,
+                            slot_index: pending_slot_index,
+                            output_storage_size: usize::try_from(slot.output_storage_size)
+                                .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                            readback_size,
+                            receiver: rx,
+                        });
+                        timing.bits_readback_bytes += 4;
+                    }
+                    if !pack_pending.is_empty() {
+                        let pack_poll_spin_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        self.device.poll(wgpu::Maintain::Poll);
+                        if let Some(start) = pack_poll_spin_start {
+                            timing.pack_poll_spin_ms += elapsed_ms(start);
+                        }
+                        let _ = collect_ready_pack_any(&mut pack_pending, &mut timing, &mut slots)?;
+                    }
+                    pack_encoder =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("cozip-deflate-dynamic-pack-batch-encoder"),
+                            });
+                    pack_submit_chunk_count = 0;
+
+                    if !freq_pending.is_empty() {
+                        let freq_poll_spin_start = if timing_enabled {
+                            Some(Instant::now())
+                        } else {
+                            None
+                        };
+                        self.device.poll(wgpu::Maintain::Poll);
+                        if let Some(start) = freq_poll_spin_start {
+                            timing.freq_poll_spin_ms += elapsed_ms(start);
+                        }
+                        let _ = collect_ready_freq_any(
+                            &mut freq_pending,
+                            &mut prepared,
+                            &mut timing,
+                            &mut slots,
+                        )?;
+                    }
+                }
+            }
+
+            if freq_pending.is_empty() {
+                break;
+            }
+
+            let freq_poll_spin_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            self.device.poll(wgpu::Maintain::Poll);
+            if let Some(start) = freq_poll_spin_start {
+                timing.freq_poll_spin_ms += elapsed_ms(start);
+            }
+            let collected =
+                collect_ready_freq_any(&mut freq_pending, &mut prepared, &mut timing, &mut slots)?;
+            if collected == 0 {
+                let pending_before_wait = freq_pending.len();
+                let freq_poll_wait_start = if timing_enabled {
                     Some(Instant::now())
                 } else {
                     None
                 };
-                self.device.poll(wgpu::Maintain::Poll);
-                if let Some(start) = pack_poll_spin_start {
-                    timing.pack_poll_spin_ms += elapsed_ms(start);
+                self.device.poll(wgpu::Maintain::Wait);
+                if let Some(start) = freq_poll_wait_start {
+                    let wait_ms = elapsed_ms(start);
+                    timing.freq_poll_wait_ms += wait_ms;
+                    timing.freq_wait_calls += 1;
+                    timing.freq_wait_max_ms = timing.freq_wait_max_ms.max(wait_ms);
+                    timing.freq_wait_pending_sum += pending_before_wait;
                 }
-                let _ = collect_ready_pack_any(&mut pack_pending, &mut timing)?;
-                pack_encoder =
-                    self.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("cozip-deflate-dynamic-pack-batch-encoder"),
-                        });
-                pack_submit_chunk_count = 0;
+                let collected_after_wait = collect_ready_freq_any(
+                    &mut freq_pending,
+                    &mut prepared,
+                    &mut timing,
+                    &mut slots,
+                )?;
+                timing.freq_wait_collected_sum += collected_after_wait;
+                if collected_after_wait == 0 {
+                    return Err(CozipDeflateError::Internal(
+                        "freq pending stalled after gpu wait",
+                    ));
+                }
             }
         }
 
@@ -3290,6 +3366,18 @@ impl GpuAssist {
                 });
                 timing.bits_readback_bytes += 4;
             }
+            if !pack_pending.is_empty() {
+                let pack_poll_spin_start = if timing_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.device.poll(wgpu::Maintain::Poll);
+                if let Some(start) = pack_poll_spin_start {
+                    timing.pack_poll_spin_ms += elapsed_ms(start);
+                }
+                let _ = collect_ready_pack_any(&mut pack_pending, &mut timing, &mut slots)?;
+            }
         }
         while !pack_pending.is_empty() {
             let pack_poll_spin_start = if timing_enabled {
@@ -3301,7 +3389,7 @@ impl GpuAssist {
             if let Some(start) = pack_poll_spin_start {
                 timing.pack_poll_spin_ms += elapsed_ms(start);
             }
-            let collected = collect_ready_pack_any(&mut pack_pending, &mut timing)?;
+            let collected = collect_ready_pack_any(&mut pack_pending, &mut timing, &mut slots)?;
             if collected == 0 {
                 let pending_before_wait = pack_pending.len();
                 let pack_poll_wait_start = if timing_enabled {
@@ -3317,7 +3405,8 @@ impl GpuAssist {
                     timing.pack_wait_max_ms = timing.pack_wait_max_ms.max(wait_ms);
                     timing.pack_wait_pending_sum += pending_before_wait;
                 }
-                let collected_after_wait = collect_ready_pack_any(&mut pack_pending, &mut timing)?;
+                let collected_after_wait =
+                    collect_ready_pack_any(&mut pack_pending, &mut timing, &mut slots)?;
                 timing.pack_wait_collected_sum += collected_after_wait;
                 if collected_after_wait == 0 {
                     return Err(CozipDeflateError::Internal(
