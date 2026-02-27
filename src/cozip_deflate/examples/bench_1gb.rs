@@ -531,9 +531,25 @@ fn main() {
         hybrid.last_compress_stats.gpu_worker_busy_ms,
         hybrid.last_compress_stats.gpu_batch_count,
     );
+    let cpu_write_io_mib =
+        cpu.last_compress_stats.write_io_bytes as f64 / (1024.0_f64 * 1024.0_f64);
+    let hybrid_write_io_mib =
+        hybrid.last_compress_stats.write_io_bytes as f64 / (1024.0_f64 * 1024.0_f64);
+    let cpu_writer_hol_ready_avg = if cpu.last_compress_stats.writer_hol_wait_events > 0 {
+        cpu.last_compress_stats.writer_hol_ready_sum as f64
+            / cpu.last_compress_stats.writer_hol_wait_events as f64
+    } else {
+        0.0
+    };
+    let hybrid_writer_hol_ready_avg = if hybrid.last_compress_stats.writer_hol_wait_events > 0 {
+        hybrid.last_compress_stats.writer_hol_ready_sum as f64
+            / hybrid.last_compress_stats.writer_hol_wait_events as f64
+    } else {
+        0.0
+    };
 
     println!(
-        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         cpu.avg_compress_ms(cfg.iters),
         cpu.avg_decompress_ms(cfg.iters),
         cpu.compress_mib_s(),
@@ -546,10 +562,24 @@ fn main() {
         cpu.last_compress_stats.compress_stage_ms,
         cpu.last_compress_stats.layout_parse_ms,
         cpu.last_compress_stats.write_stage_ms,
+        cpu.last_compress_stats.write_pack_ms,
+        cpu.last_compress_stats.write_io_ms,
+        cpu.last_compress_stats.write_io_calls,
+        cpu_write_io_mib,
         cpu.last_compress_stats.cpu_worker_busy_ms,
         cpu.last_compress_stats.gpu_worker_busy_ms,
         cpu.last_compress_stats.cpu_queue_lock_wait_ms,
         cpu.last_compress_stats.gpu_queue_lock_wait_ms,
+        cpu.last_compress_stats.cpu_wait_for_task_ms,
+        cpu.last_compress_stats.gpu_wait_for_task_ms,
+        cpu.last_compress_stats.writer_wait_ms,
+        cpu.last_compress_stats.writer_wait_events,
+        cpu.last_compress_stats.writer_hol_wait_ms,
+        cpu.last_compress_stats.writer_hol_wait_events,
+        cpu_writer_hol_ready_avg,
+        cpu.last_compress_stats.writer_hol_ready_max,
+        cpu.last_compress_stats.inflight_chunks_max,
+        cpu.last_compress_stats.ready_chunks_max,
         cpu.last_compress_stats.cpu_no_task_events,
         cpu.last_compress_stats.gpu_no_task_events,
         cpu.last_compress_stats.cpu_yield_events,
@@ -572,7 +602,7 @@ fn main() {
         cpu.last_decompress_stats.gpu_available,
     );
     println!(
-        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         hybrid.avg_compress_ms(cfg.iters),
         hybrid.avg_decompress_ms(cfg.iters),
         hybrid.compress_mib_s(),
@@ -585,10 +615,24 @@ fn main() {
         hybrid.last_compress_stats.compress_stage_ms,
         hybrid.last_compress_stats.layout_parse_ms,
         hybrid.last_compress_stats.write_stage_ms,
+        hybrid.last_compress_stats.write_pack_ms,
+        hybrid.last_compress_stats.write_io_ms,
+        hybrid.last_compress_stats.write_io_calls,
+        hybrid_write_io_mib,
         hybrid.last_compress_stats.cpu_worker_busy_ms,
         hybrid.last_compress_stats.gpu_worker_busy_ms,
         hybrid.last_compress_stats.cpu_queue_lock_wait_ms,
         hybrid.last_compress_stats.gpu_queue_lock_wait_ms,
+        hybrid.last_compress_stats.cpu_wait_for_task_ms,
+        hybrid.last_compress_stats.gpu_wait_for_task_ms,
+        hybrid.last_compress_stats.writer_wait_ms,
+        hybrid.last_compress_stats.writer_wait_events,
+        hybrid.last_compress_stats.writer_hol_wait_ms,
+        hybrid.last_compress_stats.writer_hol_wait_events,
+        hybrid_writer_hol_ready_avg,
+        hybrid.last_compress_stats.writer_hol_ready_max,
+        hybrid.last_compress_stats.inflight_chunks_max,
+        hybrid.last_compress_stats.ready_chunks_max,
         hybrid.last_compress_stats.cpu_no_task_events,
         hybrid.last_compress_stats.gpu_no_task_events,
         hybrid.last_compress_stats.cpu_yield_events,

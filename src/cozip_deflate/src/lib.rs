@@ -570,6 +570,24 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+fn accumulate_write_stage_metrics(
+    stats: &mut DeflateCpuStreamStats,
+    elapsed_stage_ms: f64,
+    io_before: (u64, usize, u64),
+    io_after: (u64, usize, u64),
+) {
+    let io_ns = io_after.0.saturating_sub(io_before.0);
+    let io_calls = io_after.1.saturating_sub(io_before.1);
+    let io_bytes = io_after.2.saturating_sub(io_before.2);
+    let io_ms = io_ns as f64 / 1_000_000.0;
+    let pack_ms = (elapsed_stage_ms - io_ms).max(0.0);
+    stats.write_stage_ms += elapsed_stage_ms;
+    stats.write_io_ms += io_ms;
+    stats.write_pack_ms += pack_ms;
+    stats.write_io_calls = stats.write_io_calls.saturating_add(io_calls);
+    stats.write_io_bytes = stats.write_io_bytes.saturating_add(io_bytes);
+}
+
 #[derive(Debug, Clone)]
 struct ChunkTask {
     index: usize,
@@ -594,6 +612,8 @@ struct EncodeWorkStats {
     gpu_busy_ms: f64,
     cpu_queue_lock_wait_ms: f64,
     gpu_queue_lock_wait_ms: f64,
+    cpu_wait_for_task_ms: f64,
+    gpu_wait_for_task_ms: f64,
     cpu_chunks_done: usize,
     gpu_chunks_done: usize,
     cpu_steal_chunks: usize,
@@ -612,6 +632,8 @@ struct WorkerCounters {
     gpu_busy_ns: std::sync::atomic::AtomicU64,
     cpu_queue_lock_wait_ns: std::sync::atomic::AtomicU64,
     gpu_queue_lock_wait_ns: std::sync::atomic::AtomicU64,
+    cpu_wait_for_task_ns: std::sync::atomic::AtomicU64,
+    gpu_wait_for_task_ns: std::sync::atomic::AtomicU64,
     cpu_chunks: AtomicUsize,
     gpu_chunks: AtomicUsize,
     cpu_steal_chunks: AtomicUsize,
@@ -630,6 +652,10 @@ impl WorkerCounters {
             cpu_queue_lock_wait_ms: self.cpu_queue_lock_wait_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             gpu_queue_lock_wait_ms: self.gpu_queue_lock_wait_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            cpu_wait_for_task_ms: self.cpu_wait_for_task_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            gpu_wait_for_task_ms: self.gpu_wait_for_task_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             cpu_chunks_done: self.cpu_chunks.load(Ordering::Relaxed),
             gpu_chunks_done: self.gpu_chunks.load(Ordering::Relaxed),
@@ -759,10 +785,24 @@ pub struct DeflateCpuStreamStats {
     pub compress_stage_ms: f64,
     pub layout_parse_ms: f64,
     pub write_stage_ms: f64,
+    pub write_pack_ms: f64,
+    pub write_io_ms: f64,
+    pub write_io_calls: usize,
+    pub write_io_bytes: u64,
     pub cpu_worker_busy_ms: f64,
     pub gpu_worker_busy_ms: f64,
     pub cpu_queue_lock_wait_ms: f64,
     pub gpu_queue_lock_wait_ms: f64,
+    pub cpu_wait_for_task_ms: f64,
+    pub gpu_wait_for_task_ms: f64,
+    pub writer_wait_ms: f64,
+    pub writer_wait_events: usize,
+    pub writer_hol_wait_ms: f64,
+    pub writer_hol_wait_events: usize,
+    pub writer_hol_ready_sum: usize,
+    pub writer_hol_ready_max: usize,
+    pub inflight_chunks_max: usize,
+    pub ready_chunks_max: usize,
     pub gpu_runtime_disabled: bool,
     pub cpu_worker_chunks: usize,
     pub gpu_worker_chunks: usize,
@@ -888,7 +928,8 @@ struct DeflateStreamLayout {
 
 #[derive(Debug, Clone)]
 struct HuffmanDecoder {
-    by_len: Vec<std::collections::HashMap<u16, u16>>,
+    counts: [u16; DEFLATE_MAX_HUFF_BITS + 1],
+    symbols: Vec<u16>,
     max_bits: usize,
 }
 
@@ -946,6 +987,9 @@ struct DeflateBitWriter<'a, W: Write> {
     byte: u8,
     used: u8,
     out_buf: Vec<u8>,
+    io_ns: u64,
+    io_calls: usize,
+    io_bytes: u64,
 }
 
 struct PreparedDeflateBatch {
@@ -977,12 +1021,24 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
             byte: 0,
             used: 0,
             out_buf: Vec::with_capacity(64 * 1024),
+            io_ns: 0,
+            io_calls: 0,
+            io_bytes: 0,
         }
     }
 
     fn flush_out_buf(&mut self) -> Result<(), CozipDeflateError> {
         if !self.out_buf.is_empty() {
+            let bytes = self.out_buf.len();
+            let io_start = Instant::now();
             self.inner.write_all(&self.out_buf)?;
+            self.io_ns = self
+                .io_ns
+                .saturating_add(io_start.elapsed().as_nanos() as u64);
+            self.io_calls = self.io_calls.saturating_add(1);
+            self.io_bytes = self
+                .io_bytes
+                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
             self.out_buf.clear();
         }
         Ok(())
@@ -1002,14 +1058,30 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
         }
 
         if self.out_buf.is_empty() && bytes.len() >= 16 * 1024 {
+            let io_start = Instant::now();
             self.inner.write_all(bytes)?;
+            self.io_ns = self
+                .io_ns
+                .saturating_add(io_start.elapsed().as_nanos() as u64);
+            self.io_calls = self.io_calls.saturating_add(1);
+            self.io_bytes = self
+                .io_bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
             return Ok(());
         }
 
         if self.out_buf.len() + bytes.len() > 64 * 1024 {
             self.flush_out_buf()?;
             if bytes.len() >= 16 * 1024 {
+                let io_start = Instant::now();
                 self.inner.write_all(bytes)?;
+                self.io_ns = self
+                    .io_ns
+                    .saturating_add(io_start.elapsed().as_nanos() as u64);
+                self.io_calls = self.io_calls.saturating_add(1);
+                self.io_bytes = self
+                    .io_bytes
+                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 return Ok(());
             }
         }
@@ -1089,6 +1161,10 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
         self.flush_out_buf()?;
         Ok(())
     }
+
+    fn io_counters(&self) -> (u64, usize, u64) {
+        (self.io_ns, self.io_calls, self.io_bytes)
+    }
 }
 
 fn bit_at(bytes: &[u8], bit_pos: usize) -> u8 {
@@ -1108,17 +1184,8 @@ fn read_unaligned_byte(bytes: &[u8], bit_pos: usize) -> u8 {
     lo | hi
 }
 
-fn reverse_low_bits(mut code: u16, bit_len: u8) -> u16 {
-    let mut out = 0_u16;
-    for _ in 0..bit_len {
-        out = (out << 1) | (code & 1);
-        code >>= 1;
-    }
-    out
-}
-
 fn build_huffman_decoder(lengths: &[u8]) -> Result<HuffmanDecoder, CozipDeflateError> {
-    let mut bl_count = [0_u16; DEFLATE_MAX_HUFF_BITS + 1];
+    let mut counts = [0_u16; DEFLATE_MAX_HUFF_BITS + 1];
     for &len in lengths {
         let len_usize = usize::from(len);
         if len_usize > DEFLATE_MAX_HUFF_BITS {
@@ -1127,35 +1194,42 @@ fn build_huffman_decoder(lengths: &[u8]) -> Result<HuffmanDecoder, CozipDeflateE
             ));
         }
         if len_usize > 0 {
-            bl_count[len_usize] = bl_count[len_usize].saturating_add(1);
+            counts[len_usize] = counts[len_usize].saturating_add(1);
         }
     }
 
-    let mut next_code = [0_u16; DEFLATE_MAX_HUFF_BITS + 1];
-    let mut code = 0_u16;
-    for bits in 1..=DEFLATE_MAX_HUFF_BITS {
-        code = (code.saturating_add(bl_count[bits - 1])) << 1;
-        next_code[bits] = code;
+    let mut max_bits = 0_usize;
+    let total_symbols = counts
+        .iter()
+        .skip(1)
+        .fold(0_usize, |acc, &count| acc.saturating_add(count as usize));
+    let mut symbols = vec![0_u16; total_symbols];
+    let mut offsets = [0_usize; DEFLATE_MAX_HUFF_BITS + 1];
+    for bits in 1..DEFLATE_MAX_HUFF_BITS {
+        offsets[bits + 1] = offsets[bits].saturating_add(counts[bits] as usize);
     }
 
-    let mut by_len = vec![std::collections::HashMap::new(); DEFLATE_MAX_HUFF_BITS + 1];
-    let mut max_bits = 0_usize;
     for (symbol, &len) in lengths.iter().enumerate() {
         if len == 0 {
             continue;
         }
         let len_usize = usize::from(len);
         max_bits = max_bits.max(len_usize);
-        let canonical = next_code[len_usize];
-        next_code[len_usize] = next_code[len_usize].saturating_add(1);
-        let reversed = reverse_low_bits(canonical, len);
-        by_len[len_usize].insert(
-            reversed,
-            u16::try_from(symbol).map_err(|_| CozipDeflateError::DataTooLarge)?,
-        );
+        let slot = offsets[len_usize];
+        if slot >= symbols.len() {
+            return Err(CozipDeflateError::InvalidFrame(
+                "huffman symbol table overflow",
+            ));
+        }
+        symbols[slot] = u16::try_from(symbol).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        offsets[len_usize] = offsets[len_usize].saturating_add(1);
     }
 
-    Ok(HuffmanDecoder { by_len, max_bits })
+    Ok(HuffmanDecoder {
+        counts,
+        symbols,
+        max_bits,
+    })
 }
 
 fn decode_huffman_symbol(
@@ -1166,12 +1240,25 @@ fn decode_huffman_symbol(
         return Err(CozipDeflateError::InvalidFrame("empty huffman table"));
     }
 
-    let mut code = 0_u16;
+    // Canonical DEFLATE decode (LSB-first bit order), equivalent to zlib/puff style.
+    let mut code = 0_u32;
+    let mut first = 0_u32;
+    let mut index = 0_usize;
     for len in 1..=decoder.max_bits {
-        code |= u16::from(cursor.read_bit()?) << (len - 1);
-        if let Some(&symbol) = decoder.by_len[len].get(&code) {
+        code |= u32::from(cursor.read_bit()?);
+        let count = u32::from(decoder.counts[len]);
+        if code >= first && code - first < count {
+            let offset = index.saturating_add((code - first) as usize);
+            let Some(&symbol) = decoder.symbols.get(offset) else {
+                return Err(CozipDeflateError::InvalidFrame(
+                    "huffman symbol lookup out of range",
+                ));
+            };
             return Ok(symbol);
         }
+        index = index.saturating_add(count as usize);
+        first = (first + count) << 1;
+        code <<= 1;
     }
 
     Err(CozipDeflateError::InvalidFrame(
@@ -1387,6 +1474,23 @@ fn append_deflate_chunk_as_block_sequence_with_layout<W: Write>(
     Ok(())
 }
 
+fn append_empty_stored_block_non_final<W: Write>(
+    writer: &mut DeflateBitWriter<'_, W>,
+) -> Result<(), CozipDeflateError> {
+    // BFINAL=0, BTYPE=00 (stored), then byte-align and emit LEN=0, NLEN=0xffff.
+    writer.write_bit(0)?;
+    writer.write_bit(0)?;
+    writer.write_bit(0)?;
+    while writer.used != 0 {
+        writer.write_bit(0)?;
+    }
+    writer.write_byte_bits(0x00)?;
+    writer.write_byte_bits(0x00)?;
+    writer.write_byte_bits(0xff)?;
+    writer.write_byte_bits(0xff)?;
+    Ok(())
+}
+
 fn parse_deflate_stream_layouts_parallel(
     chunks: &[ChunkMember],
 ) -> Result<Vec<DeflateStreamLayout>, CozipDeflateError> {
@@ -1532,6 +1636,9 @@ fn write_prepared_batch<W: Write>(
     }
 
     for (idx, (chunk, layout)) in batch.chunks.iter().zip(batch.layouts.iter()).enumerate() {
+        if idx > 0 && bit_writer.used != 0 {
+            append_empty_stored_block_non_final(bit_writer)?;
+        }
         let is_final = final_batch && idx + 1 == batch.chunks.len();
         append_deflate_chunk_as_block_sequence_with_layout(
             bit_writer,
@@ -1880,16 +1987,22 @@ fn deflate_compress_stream_hybrid_zip_compatible_with_context<R: Read, W: Write>
         stats.gpu_steal_reserve_chunks += prepared.encode_work.gpu_steal_reserve_chunks;
 
         let is_final_batch = reached_eof && pending_prepares.is_empty();
+        let io_before = bit_writer.io_counters();
         let write_start = Instant::now();
         write_prepared_batch(&mut bit_writer, &prepared, is_final_batch)?;
-        stats.write_stage_ms += elapsed_ms(write_start);
+        let write_elapsed = elapsed_ms(write_start);
+        let io_after = bit_writer.io_counters();
+        accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
     }
 
     if stats.chunk_count == 0 {
         let empty = deflate_compress_cpu(&[], options.compression_level)?;
+        let io_before = bit_writer.io_counters();
         let write_start = Instant::now();
         append_deflate_chunk_as_block_sequence(&mut bit_writer, &empty, true)?;
-        stats.write_stage_ms += elapsed_ms(write_start);
+        let write_elapsed = elapsed_ms(write_start);
+        let io_after = bit_writer.io_counters();
+        accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
     }
 
     bit_writer.finish()?;
@@ -1979,6 +2092,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 break;
             }
             let inflight_chunks = next_read_index.saturating_sub(next_write_index);
+            stats.inflight_chunks_max = stats.inflight_chunks_max.max(inflight_chunks);
             if options.stream_max_inflight_chunks > 0
                 && inflight_chunks >= options.stream_max_inflight_chunks
             {
@@ -2035,25 +2149,33 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
         }
 
         loop {
-            let next_ready = {
+            let (next_ready, ready_len) = {
                 let (ready_lock, _) = &*ready_state;
                 let mut ready = lock(ready_lock)?;
-                ready.remove(&next_write_index)
+                let ready_len = ready.len();
+                (ready.remove(&next_write_index), ready_len)
             };
+            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
             let Some(ready) = next_ready else {
                 break;
             };
             progressed = true;
 
             let is_final_chunk = reached_eof && next_write_index + 1 == next_read_index;
+            let io_before = bit_writer.io_counters();
             let write_start = Instant::now();
+            if next_write_index > 0 && bit_writer.used != 0 {
+                append_empty_stored_block_non_final(&mut bit_writer)?;
+            }
             append_deflate_chunk_as_block_sequence_with_layout(
                 &mut bit_writer,
                 &ready.chunk.compressed,
                 ready.layout,
                 is_final_chunk,
             )?;
-            stats.write_stage_ms += elapsed_ms(write_start);
+            let write_elapsed = elapsed_ms(write_start);
+            let io_after = bit_writer.io_counters();
+            accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
 
             stats.chunk_count = stats.chunk_count.saturating_add(1);
             match ready.chunk.backend {
@@ -2070,13 +2192,26 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
         }
 
         if !progressed {
+            let wait_start = Instant::now();
             let (ready_lock, ready_cv) = &*ready_state;
             let guard = lock(ready_lock)?;
+            let ready_len = guard.len();
+            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+            let hol_wait = ready_len > 0;
             drop(wait_timeout_on_condvar(
                 ready_cv,
                 guard,
                 Duration::from_millis(2),
             )?);
+            let wait_ms = elapsed_ms(wait_start);
+            stats.writer_wait_ms += wait_ms;
+            stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
+            if hol_wait {
+                stats.writer_hol_wait_ms += wait_ms;
+                stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
+                stats.writer_hol_ready_sum = stats.writer_hol_ready_sum.saturating_add(ready_len);
+                stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
+            }
         }
     }
 
@@ -2097,9 +2232,12 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
 
     if stats.chunk_count == 0 {
         let empty = deflate_compress_cpu(&[], options.compression_level)?;
+        let io_before = bit_writer.io_counters();
         let write_start = Instant::now();
         append_deflate_chunk_as_block_sequence(&mut bit_writer, &empty, true)?;
-        stats.write_stage_ms += elapsed_ms(write_start);
+        let write_elapsed = elapsed_ms(write_start);
+        let io_after = bit_writer.io_counters();
+        accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
     }
 
     let counters = counters.snapshot();
@@ -2107,6 +2245,8 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     stats.gpu_worker_busy_ms += counters.gpu_busy_ms;
     stats.cpu_queue_lock_wait_ms += counters.cpu_queue_lock_wait_ms;
     stats.gpu_queue_lock_wait_ms += counters.gpu_queue_lock_wait_ms;
+    stats.cpu_wait_for_task_ms += counters.cpu_wait_for_task_ms;
+    stats.gpu_wait_for_task_ms += counters.gpu_wait_for_task_ms;
     stats.cpu_worker_chunks += counters.cpu_chunks_done;
     stats.gpu_worker_chunks += counters.gpu_chunks_done;
     stats.cpu_steal_chunks += counters.cpu_steal_chunks;
@@ -2168,6 +2308,7 @@ fn compress_cpu_stream_worker_continuous(
                 if let Some(counters) = &counters {
                     counters.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
                 }
+                let wait_start = Instant::now();
                 state = match wait_on_condvar(queue_cv, state) {
                     Ok(guard) => guard,
                     Err(err) => {
@@ -2175,6 +2316,11 @@ fn compress_cpu_stream_worker_continuous(
                         return;
                     }
                 };
+                if let Some(counters) = &counters {
+                    counters
+                        .cpu_wait_for_task_ns
+                        .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
             }
         };
 
@@ -2193,12 +2339,12 @@ fn compress_cpu_stream_worker_continuous(
                 break;
             }
         };
-        let layout = match parse_deflate_stream_layout(&encoded.compressed) {
-            Ok(value) => value,
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
+        let Some(layout) = encoded.layout else {
+            set_error(
+                &error,
+                CozipDeflateError::Internal("cpu chunk missing layout metadata"),
+            );
+            break;
         };
 
         if let Some(counters) = &counters {
@@ -2282,6 +2428,7 @@ fn compress_gpu_stream_worker_continuous(
                 if let Some(counters) = &counters {
                     counters.gpu_yield_events.fetch_add(1, Ordering::Relaxed);
                 }
+                let wait_start = Instant::now();
                 state = match wait_on_condvar(queue_cv, state) {
                     Ok(guard) => guard,
                     Err(err) => {
@@ -2289,6 +2436,11 @@ fn compress_gpu_stream_worker_continuous(
                         return;
                     }
                 };
+                if let Some(counters) = &counters {
+                    counters
+                        .gpu_wait_for_task_ns
+                        .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
             }
         };
 
@@ -2347,7 +2499,6 @@ fn compress_gpu_stream_worker_continuous(
                 return;
             }
         };
-
         let (ready_lock, ready_cv) = &*ready_state;
         let mut ready = match lock(ready_lock) {
             Ok(guard) => guard,

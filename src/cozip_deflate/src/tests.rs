@@ -8,6 +8,24 @@ fn patterned_data(len: usize) -> Vec<u8> {
     data
 }
 
+fn bench_mixed_data(bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes);
+    let mut state: u32 = 0x1234_5678;
+    while out.len() < bytes {
+        let zone = (out.len() / 4096) % 3;
+        match zone {
+            0 => out.extend_from_slice(b"cozip-cpu-gpu-deflate-"),
+            1 => out.extend_from_slice(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            _ => {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                out.push((state >> 24) as u8);
+            }
+        }
+    }
+    out.truncate(bytes);
+    out
+}
+
 #[test]
 fn raw_deflate_roundtrip() {
     let input = b"cozip-cozip-cozip-cozip-cozip";
@@ -196,4 +214,28 @@ fn raw_deflate_hybrid_stream_handles_empty_input() {
 
     assert!(restored.is_empty());
     assert_eq!(stats.input_bytes, 0);
+}
+
+#[test]
+fn raw_deflate_stream_roundtrip_chunk_5mib_cpu_only() {
+    let input = bench_mixed_data(16 * 1024 * 1024);
+    let options = HybridOptions {
+        chunk_size: 5 * 1024 * 1024,
+        compression_mode: CompressionMode::Ratio,
+        scheduler_policy: HybridSchedulerPolicy::GlobalQueueLocalBuffers,
+        stream_batch_chunks: 0,
+        stream_max_inflight_chunks: 0,
+        stream_max_inflight_bytes: 0,
+        prefer_gpu: false,
+        gpu_fraction: 0.0,
+        ..HybridOptions::default()
+    };
+    let cozip = CoZipDeflate::init(options).expect("init should succeed");
+    let mut src = std::io::Cursor::new(input.clone());
+    let mut compressed = Vec::new();
+    cozip
+        .deflate_compress_stream_zip_compatible(&mut src, &mut compressed)
+        .expect("stream deflate should succeed");
+    let restored = deflate_decompress_on_cpu(&compressed).expect("stream must be decodable");
+    assert_eq!(restored, input);
 }
