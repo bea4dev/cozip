@@ -1012,6 +1012,7 @@ struct StreamTaskQueueState {
 struct StreamReadyChunk {
     chunk: ChunkMember,
     layout: DeflateStreamLayout,
+    prepared_non_final_end_bit: Option<usize>,
 }
 
 impl<'a, W: Write> DeflateBitWriter<'a, W> {
@@ -1454,23 +1455,38 @@ fn append_deflate_chunk_as_block_sequence_with_layout<W: Write>(
     }
 
     let desired_final = if is_final_chunk { 1_u8 } else { 0_u8 };
+    write_chunk_bits_with_final_override(writer, chunk, layout, desired_final)
+}
+
+fn write_chunk_bits_with_final_override<W: Write>(
+    writer: &mut DeflateBitWriter<'_, W>,
+    chunk: &[u8],
+    layout: DeflateStreamLayout,
+    desired_final: u8,
+) -> Result<(), CozipDeflateError> {
+    if layout.end_bit == 0 {
+        return Ok(());
+    }
+    if layout.final_header_bit >= layout.end_bit {
+        return Err(CozipDeflateError::InvalidFrame(
+            "invalid deflate layout: final header bit out of range",
+        ));
+    }
+    let desired_final = desired_final & 1;
     let current_final = bit_at(chunk, layout.final_header_bit);
     if current_final == desired_final {
         writer.write_bits_from_slice(chunk, 0, layout.end_bit)?;
         return Ok(());
     }
 
-    // Fast path: patch only the BFINAL bit once, then copy the whole bit range.
-    let byte_len = layout.end_bit.div_ceil(8);
-    let mut patched = chunk[..byte_len].to_vec();
-    let byte_index = layout.final_header_bit / 8;
-    let bit_mask = 1_u8 << (layout.final_header_bit % 8);
-    if desired_final == 1 {
-        patched[byte_index] |= bit_mask;
-    } else {
-        patched[byte_index] &= !bit_mask;
+    if layout.final_header_bit > 0 {
+        writer.write_bits_from_slice(chunk, 0, layout.final_header_bit)?;
     }
-    writer.write_bits_from_slice(&patched, 0, layout.end_bit)?;
+    writer.write_bit(desired_final)?;
+    let tail_start = layout.final_header_bit + 1;
+    if tail_start < layout.end_bit {
+        writer.write_bits_from_slice(chunk, tail_start, layout.end_bit - tail_start)?;
+    }
     Ok(())
 }
 
@@ -1489,6 +1505,69 @@ fn append_empty_stored_block_non_final<W: Write>(
     writer.write_byte_bits(0xff)?;
     writer.write_byte_bits(0xff)?;
     Ok(())
+}
+
+fn append_bit_to_vec_lsb(bits: &mut Vec<u8>, bit_len: &mut usize, bit: u8) {
+    let byte_index = *bit_len / 8;
+    if byte_index == bits.len() {
+        bits.push(0);
+    }
+    let bit_index = *bit_len % 8;
+    if bit & 1 == 1 {
+        bits[byte_index] |= 1_u8 << bit_index;
+    }
+    *bit_len += 1;
+}
+
+fn append_byte_to_vec_lsb(bits: &mut Vec<u8>, bit_len: &mut usize, value: u8) {
+    for shift in 0..8 {
+        append_bit_to_vec_lsb(bits, bit_len, (value >> shift) & 1);
+    }
+}
+
+fn append_empty_stored_block_non_final_bits(bits: &mut Vec<u8>, bit_len: &mut usize) {
+    append_bit_to_vec_lsb(bits, bit_len, 0);
+    append_bit_to_vec_lsb(bits, bit_len, 0);
+    append_bit_to_vec_lsb(bits, bit_len, 0);
+    while *bit_len % 8 != 0 {
+        append_bit_to_vec_lsb(bits, bit_len, 0);
+    }
+    append_byte_to_vec_lsb(bits, bit_len, 0x00);
+    append_byte_to_vec_lsb(bits, bit_len, 0x00);
+    append_byte_to_vec_lsb(bits, bit_len, 0xff);
+    append_byte_to_vec_lsb(bits, bit_len, 0xff);
+}
+
+fn prepare_chunk_bits_for_non_final_stream(
+    chunk: &mut Vec<u8>,
+    layout: DeflateStreamLayout,
+) -> Result<usize, CozipDeflateError> {
+    if layout.end_bit == 0 {
+        return Ok(0);
+    }
+    if layout.final_header_bit >= layout.end_bit {
+        return Err(CozipDeflateError::InvalidFrame(
+            "invalid deflate layout: final header bit out of range",
+        ));
+    }
+
+    let required_bytes = layout.end_bit.div_ceil(8);
+    if chunk.len() < required_bytes {
+        return Err(CozipDeflateError::InvalidFrame(
+            "chunk shorter than declared deflate layout",
+        ));
+    }
+    chunk.truncate(required_bytes);
+
+    let byte_index = layout.final_header_bit / 8;
+    let bit_mask = 1_u8 << (layout.final_header_bit % 8);
+    chunk[byte_index] &= !bit_mask;
+
+    let mut end_bit = layout.end_bit;
+    if end_bit % 8 != 0 {
+        append_empty_stored_block_non_final_bits(chunk, &mut end_bit);
+    }
+    Ok(end_bit)
 }
 
 fn parse_deflate_stream_layouts_parallel(
@@ -1786,7 +1865,9 @@ fn compress_chunk_tasks_parallel(
                 let cpu_workers = cpu_worker_count(true);
                 initial_gpu_queue_chunks = lock(&queue)?
                     .iter()
-                    .filter(|task| task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size)
+                    .filter(|task| {
+                        task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size
+                    })
                     .count();
 
                 for _ in 0..cpu_workers {
@@ -2025,11 +2106,11 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     let mut output = HashingCountWriter::new(writer);
     let mut bit_writer = DeflateBitWriter::new(&mut output);
 
-    let queue_state = Arc::new((
-        Mutex::new(StreamTaskQueueState::default()),
+    let queue_state = Arc::new((Mutex::new(StreamTaskQueueState::default()), Condvar::new()));
+    let ready_state = Arc::new((
+        Mutex::new(BTreeMap::<usize, StreamReadyChunk>::new()),
         Condvar::new(),
     ));
-    let ready_state = Arc::new((Mutex::new(BTreeMap::<usize, StreamReadyChunk>::new()), Condvar::new()));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let counters = Arc::new(WorkerCounters::default());
     let total_tasks = Arc::new(AtomicUsize::new(0));
@@ -2167,12 +2248,29 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
             if next_write_index > 0 && bit_writer.used != 0 {
                 append_empty_stored_block_non_final(&mut bit_writer)?;
             }
-            append_deflate_chunk_as_block_sequence_with_layout(
-                &mut bit_writer,
-                &ready.chunk.compressed,
-                ready.layout,
-                is_final_chunk,
-            )?;
+            if let Some(non_final_end_bit) = ready.prepared_non_final_end_bit {
+                if is_final_chunk {
+                    write_chunk_bits_with_final_override(
+                        &mut bit_writer,
+                        &ready.chunk.compressed,
+                        ready.layout,
+                        1,
+                    )?;
+                } else {
+                    bit_writer.write_bits_from_slice(
+                        &ready.chunk.compressed,
+                        0,
+                        non_final_end_bit,
+                    )?;
+                }
+            } else {
+                append_deflate_chunk_as_block_sequence_with_layout(
+                    &mut bit_writer,
+                    &ready.chunk.compressed,
+                    ready.layout,
+                    is_final_chunk,
+                )?;
+            }
             let write_elapsed = elapsed_ms(write_start);
             let io_after = bit_writer.io_counters();
             accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
@@ -2182,8 +2280,7 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
                 ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
                 ChunkBackend::GpuAssisted => stats.gpu_chunks = stats.gpu_chunks.saturating_add(1),
             }
-            inflight_raw_bytes =
-                inflight_raw_bytes.saturating_sub(ready.chunk.raw_len as usize);
+            inflight_raw_bytes = inflight_raw_bytes.saturating_sub(ready.chunk.raw_len as usize);
             next_write_index = next_write_index.saturating_add(1);
         }
 
@@ -2363,10 +2460,20 @@ fn compress_cpu_stream_worker_continuous(
             }
         };
         if ready
-            .insert(encoded.index, StreamReadyChunk { chunk: encoded, layout })
+            .insert(
+                encoded.index,
+                StreamReadyChunk {
+                    chunk: encoded,
+                    layout,
+                    prepared_non_final_end_bit: None,
+                },
+            )
             .is_some()
         {
-            set_error(&error, CozipDeflateError::Internal("duplicate compressed index"));
+            set_error(
+                &error,
+                CozipDeflateError::Internal("duplicate compressed index"),
+            );
             break;
         }
         ready_cv.notify_all();
@@ -2399,7 +2506,11 @@ fn compress_gpu_stream_worker_continuous(
             loop {
                 let total = total_tasks.load(Ordering::Relaxed);
                 if state.closed
-                    && should_stop_gpu_tail_pop(total, state.queue.len(), options.gpu_tail_stop_ratio)
+                    && should_stop_gpu_tail_pop(
+                        total,
+                        state.queue.len(),
+                        options.gpu_tail_stop_ratio,
+                    )
                 {
                     break Vec::new();
                 }
@@ -2507,12 +2618,33 @@ fn compress_gpu_stream_worker_continuous(
                 break;
             }
         };
-        for (encoded, layout) in encoded_batch.into_iter().zip(layouts.into_iter()) {
+        for (mut encoded, layout) in encoded_batch.into_iter().zip(layouts.into_iter()) {
+            let prepared_non_final_end_bit = if encoded.backend == ChunkBackend::GpuAssisted {
+                match prepare_chunk_bits_for_non_final_stream(&mut encoded.compressed, layout) {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             if ready
-                .insert(encoded.index, StreamReadyChunk { chunk: encoded, layout })
+                .insert(
+                    encoded.index,
+                    StreamReadyChunk {
+                        chunk: encoded,
+                        layout,
+                        prepared_non_final_end_bit,
+                    },
+                )
                 .is_some()
             {
-                set_error(&error, CozipDeflateError::Internal("duplicate compressed index"));
+                set_error(
+                    &error,
+                    CozipDeflateError::Internal("duplicate compressed index"),
+                );
                 return;
             }
         }
@@ -3832,7 +3964,10 @@ fn pop_gpu_batch_tasks(
     tasks
 }
 
-fn pop_front_batch_tasks(queue: &mut VecDeque<ChunkTask>, max_batch_chunks: usize) -> Vec<ChunkTask> {
+fn pop_front_batch_tasks(
+    queue: &mut VecDeque<ChunkTask>,
+    max_batch_chunks: usize,
+) -> Vec<ChunkTask> {
     let mut tasks = Vec::with_capacity(max_batch_chunks.max(1));
     let batch_limit = max_batch_chunks.max(1);
     while tasks.len() < batch_limit {
