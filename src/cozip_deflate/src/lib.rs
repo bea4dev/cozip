@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File as StdFile;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use thiserror::Error;
@@ -26,7 +26,8 @@ const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUN
 const MAX_GPU_BATCH_CHUNKS: usize = 16;
 const GPU_FREQ_MAX_WORKGROUPS: u32 = 4096;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
-const TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
+const DEFAULT_TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
+const DEFAULT_STREAM_BATCH_CHUNKS: usize = 32;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
 const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
 
@@ -41,12 +42,18 @@ pub struct HybridOptions {
     pub chunk_size: usize,
     pub gpu_subchunk_size: usize,
     pub gpu_slot_count: usize,
+    pub stream_prepare_pipeline_depth: usize,
+    pub stream_batch_chunks: usize,
+    pub stream_max_inflight_chunks: usize,
+    pub stream_max_inflight_bytes: usize,
     pub gpu_batch_chunks: usize,
     pub gpu_pipelined_submit_chunks: usize,
+    pub token_finalize_segment_size: usize,
     pub compression_level: u32,
     pub compression_mode: CompressionMode,
     pub prefer_gpu: bool,
     pub gpu_fraction: f32,
+    pub gpu_tail_stop_ratio: f32,
     pub gpu_min_chunk_size: usize,
     pub gpu_validation_mode: GpuValidationMode,
     pub gpu_validation_sample_every: usize,
@@ -54,6 +61,10 @@ pub struct HybridOptions {
     pub gpu_dump_bad_chunk: bool,
     pub gpu_dump_bad_chunk_limit: usize,
     pub gpu_dump_bad_chunk_dir: Option<String>,
+    pub profile_timing: bool,
+    pub profile_timing_detail: bool,
+    pub profile_timing_deep: bool,
+    pub scheduler_policy: HybridSchedulerPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,18 +81,30 @@ pub enum GpuValidationMode {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridSchedulerPolicy {
+    Legacy,
+    GlobalQueueLocalBuffers,
+}
+
 impl Default for HybridOptions {
     fn default() -> Self {
         Self {
             chunk_size: 4 * 1024 * 1024,
             gpu_subchunk_size: 256 * 1024,
             gpu_slot_count: 4,
+            stream_prepare_pipeline_depth: 2,
+            stream_batch_chunks: DEFAULT_STREAM_BATCH_CHUNKS,
+            stream_max_inflight_chunks: 256,
+            stream_max_inflight_bytes: 0,
             gpu_batch_chunks: 4,
             gpu_pipelined_submit_chunks: 4,
+            token_finalize_segment_size: DEFAULT_TOKEN_FINALIZE_SEGMENT_SIZE,
             compression_level: 6,
             compression_mode: CompressionMode::Speed,
             prefer_gpu: true,
             gpu_fraction: 1.0,
+            gpu_tail_stop_ratio: 1.0,
             gpu_min_chunk_size: 64 * 1024,
             gpu_validation_mode: GpuValidationMode::Off,
             gpu_validation_sample_every: 8,
@@ -89,6 +112,10 @@ impl Default for HybridOptions {
             gpu_dump_bad_chunk: false,
             gpu_dump_bad_chunk_limit: 8,
             gpu_dump_bad_chunk_dir: None,
+            profile_timing: false,
+            profile_timing_detail: false,
+            profile_timing_deep: false,
+            scheduler_policy: HybridSchedulerPolicy::Legacy,
         }
     }
 }
@@ -152,9 +179,9 @@ impl CoZipDeflate {
     pub fn init(options: HybridOptions) -> Result<Self, CozipDeflateError> {
         validate_options(&options)?;
         let mut init_stats = CoZipDeflateInitStats::default();
-        let gpu_context = if options.prefer_gpu && options.gpu_fraction > 0.0 {
+        let gpu_context = if is_gpu_requested(&options) {
             let start = Instant::now();
-            let ctx = GpuAssist::new().ok().map(Arc::new);
+            let ctx = GpuAssist::new(&options).ok().map(Arc::new);
             init_stats.gpu_context_init_ms = elapsed_ms(start);
             init_stats.gpu_available = ctx.is_some();
             ctx
@@ -533,19 +560,11 @@ pub enum CozipDeflateError {
     Internal(&'static str),
 }
 
-fn timing_profile_enabled() -> bool {
-    false
+fn maybe_warn_deep_profile_enabled(options: &HybridOptions) {
+    if options.profile_timing_deep && !options.profile_timing {
+        eprintln!("[cozip][warn] profile_timing_deep=true ignored because profile_timing=false");
+    }
 }
-
-fn timing_profile_detail_enabled() -> bool {
-    false
-}
-
-fn deep_timing_profile_enabled() -> bool {
-    false
-}
-
-fn maybe_warn_deep_profile_enabled() {}
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
@@ -573,20 +592,34 @@ struct ChunkMember {
 struct EncodeWorkStats {
     cpu_busy_ms: f64,
     gpu_busy_ms: f64,
+    cpu_queue_lock_wait_ms: f64,
+    gpu_queue_lock_wait_ms: f64,
     cpu_chunks_done: usize,
     gpu_chunks_done: usize,
     cpu_steal_chunks: usize,
     gpu_batches: usize,
+    cpu_no_task_events: usize,
+    gpu_no_task_events: usize,
+    cpu_yield_events: usize,
+    gpu_yield_events: usize,
+    initial_gpu_queue_chunks: usize,
+    gpu_steal_reserve_chunks: usize,
 }
 
 #[derive(Debug, Default)]
 struct WorkerCounters {
     cpu_busy_ns: std::sync::atomic::AtomicU64,
     gpu_busy_ns: std::sync::atomic::AtomicU64,
+    cpu_queue_lock_wait_ns: std::sync::atomic::AtomicU64,
+    gpu_queue_lock_wait_ns: std::sync::atomic::AtomicU64,
     cpu_chunks: AtomicUsize,
     gpu_chunks: AtomicUsize,
     cpu_steal_chunks: AtomicUsize,
     gpu_batches: AtomicUsize,
+    cpu_no_task_events: AtomicUsize,
+    gpu_no_task_events: AtomicUsize,
+    cpu_yield_events: AtomicUsize,
+    gpu_yield_events: AtomicUsize,
 }
 
 impl WorkerCounters {
@@ -594,10 +627,20 @@ impl WorkerCounters {
         EncodeWorkStats {
             cpu_busy_ms: self.cpu_busy_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             gpu_busy_ms: self.gpu_busy_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            cpu_queue_lock_wait_ms: self.cpu_queue_lock_wait_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            gpu_queue_lock_wait_ms: self.gpu_queue_lock_wait_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
             cpu_chunks_done: self.cpu_chunks.load(Ordering::Relaxed),
             gpu_chunks_done: self.gpu_chunks.load(Ordering::Relaxed),
             cpu_steal_chunks: self.cpu_steal_chunks.load(Ordering::Relaxed),
             gpu_batches: self.gpu_batches.load(Ordering::Relaxed),
+            cpu_no_task_events: self.cpu_no_task_events.load(Ordering::Relaxed),
+            gpu_no_task_events: self.gpu_no_task_events.load(Ordering::Relaxed),
+            cpu_yield_events: self.cpu_yield_events.load(Ordering::Relaxed),
+            gpu_yield_events: self.gpu_yield_events.load(Ordering::Relaxed),
+            initial_gpu_queue_chunks: 0,
+            gpu_steal_reserve_chunks: 0,
         }
     }
 }
@@ -670,6 +713,26 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> Result<std::sync::MutexGuard<'a, T>, Cozi
         .map_err(|_| CozipDeflateError::Internal("mutex poisoned"))
 }
 
+fn wait_on_condvar<'a, T>(
+    condvar: &Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+) -> Result<std::sync::MutexGuard<'a, T>, CozipDeflateError> {
+    condvar
+        .wait(guard)
+        .map_err(|_| CozipDeflateError::Internal("mutex poisoned"))
+}
+
+fn wait_timeout_on_condvar<'a, T>(
+    condvar: &Condvar,
+    guard: std::sync::MutexGuard<'a, T>,
+    timeout: Duration,
+) -> Result<std::sync::MutexGuard<'a, T>, CozipDeflateError> {
+    condvar
+        .wait_timeout(guard, timeout)
+        .map(|(guard, _)| guard)
+        .map_err(|_| CozipDeflateError::Internal("mutex poisoned"))
+}
+
 pub fn deflate_compress_cpu(input: &[u8], level: u32) -> Result<Vec<u8>, CozipDeflateError> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), Compression::new(level.clamp(0, 9)));
@@ -698,11 +761,19 @@ pub struct DeflateCpuStreamStats {
     pub write_stage_ms: f64,
     pub cpu_worker_busy_ms: f64,
     pub gpu_worker_busy_ms: f64,
+    pub cpu_queue_lock_wait_ms: f64,
+    pub gpu_queue_lock_wait_ms: f64,
     pub gpu_runtime_disabled: bool,
     pub cpu_worker_chunks: usize,
     pub gpu_worker_chunks: usize,
     pub cpu_steal_chunks: usize,
     pub gpu_batch_count: usize,
+    pub cpu_no_task_events: usize,
+    pub gpu_no_task_events: usize,
+    pub cpu_yield_events: usize,
+    pub gpu_yield_events: usize,
+    pub initial_gpu_queue_chunks: usize,
+    pub gpu_steal_reserve_chunks: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,7 +868,6 @@ pub fn deflate_decompress_stream_on_cpu<R: Read, W: Write>(
     Ok(stats)
 }
 
-const RAW_DEFLATE_CHUNKS_PER_BATCH: usize = 32;
 const DEFLATE_MAX_HUFF_BITS: usize = 15;
 const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
@@ -886,6 +956,18 @@ struct PreparedDeflateBatch {
     encode_work: EncodeWorkStats,
     compress_ms: f64,
     layout_parse_ms: f64,
+}
+
+#[derive(Default)]
+struct StreamTaskQueueState {
+    queue: VecDeque<ChunkTask>,
+    queued_bytes: usize,
+    closed: bool,
+}
+
+struct StreamReadyChunk {
+    chunk: ChunkMember,
+    layout: DeflateStreamLayout,
 }
 
 impl<'a, W: Write> DeflateBitWriter<'a, W> {
@@ -1275,16 +1357,33 @@ fn append_deflate_chunk_as_block_sequence_with_layout<W: Write>(
     layout: DeflateStreamLayout,
     is_final_chunk: bool,
 ) -> Result<(), CozipDeflateError> {
-    if layout.final_header_bit > 0 {
-        writer.write_bits_from_slice(chunk, 0, layout.final_header_bit)?;
+    if layout.end_bit == 0 {
+        return Ok(());
     }
-    writer.write_bit(if is_final_chunk { 1 } else { 0 })?;
+    if layout.final_header_bit >= layout.end_bit {
+        return Err(CozipDeflateError::InvalidFrame(
+            "invalid deflate layout: final header bit out of range",
+        ));
+    }
 
-    let tail_start = layout.final_header_bit.saturating_add(1);
-    let tail_bits = layout.end_bit.saturating_sub(tail_start);
-    if tail_bits > 0 {
-        writer.write_bits_from_slice(chunk, tail_start, tail_bits)?;
+    let desired_final = if is_final_chunk { 1_u8 } else { 0_u8 };
+    let current_final = bit_at(chunk, layout.final_header_bit);
+    if current_final == desired_final {
+        writer.write_bits_from_slice(chunk, 0, layout.end_bit)?;
+        return Ok(());
     }
+
+    // Fast path: patch only the BFINAL bit once, then copy the whole bit range.
+    let byte_len = layout.end_bit.div_ceil(8);
+    let mut patched = chunk[..byte_len].to_vec();
+    let byte_index = layout.final_header_bit / 8;
+    let bit_mask = 1_u8 << (layout.final_header_bit % 8);
+    if desired_final == 1 {
+        patched[byte_index] |= bit_mask;
+    } else {
+        patched[byte_index] &= !bit_mask;
+    }
+    writer.write_bits_from_slice(&patched, 0, layout.end_bit)?;
     Ok(())
 }
 
@@ -1482,6 +1581,25 @@ fn default_hybrid_options_for_stream(level: u32) -> HybridOptions {
     options
 }
 
+fn is_gpu_requested(options: &HybridOptions) -> bool {
+    if !options.prefer_gpu {
+        return false;
+    }
+    match options.scheduler_policy {
+        HybridSchedulerPolicy::Legacy => options.gpu_fraction > 0.0,
+        HybridSchedulerPolicy::GlobalQueueLocalBuffers => true,
+    }
+}
+
+fn has_gpu_eligible_task(tasks: &[ChunkTask], options: &HybridOptions) -> bool {
+    match options.scheduler_policy {
+        HybridSchedulerPolicy::Legacy => tasks.iter().any(|task| task.preferred_gpu),
+        HybridSchedulerPolicy::GlobalQueueLocalBuffers => tasks
+            .iter()
+            .any(|task| task.raw.len() >= options.gpu_min_chunk_size),
+    }
+}
+
 fn compress_chunk_tasks_parallel(
     tasks: Vec<ChunkTask>,
     options: &HybridOptions,
@@ -1496,58 +1614,110 @@ fn compress_chunk_tasks_parallel(
     let results = Arc::new(Mutex::new(vec![None; chunk_count]));
     let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
     let counters = Arc::new(WorkerCounters::default());
+    let mut initial_gpu_queue_chunks = 0usize;
+    let gpu_steal_reserve_chunks_metric = 0usize;
 
     let mut handles = Vec::new();
     if gpu_enabled {
-        let mut cpu_init = VecDeque::new();
-        let mut gpu_init = VecDeque::new();
-        for task in tasks {
-            if task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size {
-                gpu_init.push_back(task);
-            } else {
-                cpu_init.push_back(task);
+        match options.scheduler_policy {
+            HybridSchedulerPolicy::Legacy => {
+                let mut cpu_init = VecDeque::new();
+                let mut gpu_init = VecDeque::new();
+                for task in tasks {
+                    if task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size {
+                        gpu_init.push_back(task);
+                    } else {
+                        cpu_init.push_back(task);
+                    }
+                }
+
+                let cpu_queue = Arc::new(Mutex::new(cpu_init));
+                let gpu_queue = Arc::new(Mutex::new(gpu_init));
+                let cpu_workers = cpu_worker_count(true);
+                initial_gpu_queue_chunks = lock(&gpu_queue)?.len();
+
+                for _ in 0..cpu_workers {
+                    let cpu_queue_ref = Arc::clone(&cpu_queue);
+                    let gpu_queue_ref = Arc::clone(&gpu_queue);
+                    let result_ref = Arc::clone(&results);
+                    let err_ref = Arc::clone(&error);
+                    let opts = options.clone();
+                    let counters_ref = Arc::clone(&counters);
+                    handles.push(std::thread::spawn(move || {
+                        compress_cpu_worker_split(
+                            cpu_queue_ref,
+                            gpu_queue_ref,
+                            result_ref,
+                            err_ref,
+                            &opts,
+                            Some(counters_ref),
+                        )
+                    }));
+                }
+
+                if let Some(gpu) = gpu_context {
+                    let gpu_queue_ref = Arc::clone(&gpu_queue);
+                    let result_ref = Arc::clone(&results);
+                    let err_ref = Arc::clone(&error);
+                    let opts = options.clone();
+                    let counters_ref = Arc::clone(&counters);
+                    handles.push(std::thread::spawn(move || {
+                        compress_gpu_worker_split(
+                            gpu_queue_ref,
+                            result_ref,
+                            err_ref,
+                            &opts,
+                            gpu,
+                            Some(counters_ref),
+                        )
+                    }));
+                }
             }
-        }
+            HybridSchedulerPolicy::GlobalQueueLocalBuffers => {
+                let total_task_count = tasks.len();
+                let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+                let cpu_workers = cpu_worker_count(true);
+                initial_gpu_queue_chunks = lock(&queue)?
+                    .iter()
+                    .filter(|task| task.preferred_gpu && task.raw.len() >= options.gpu_min_chunk_size)
+                    .count();
 
-        let cpu_queue = Arc::new(Mutex::new(cpu_init));
-        let gpu_queue = Arc::new(Mutex::new(gpu_init));
-        let cpu_workers = cpu_worker_count(true);
+                for _ in 0..cpu_workers {
+                    let queue_ref = Arc::clone(&queue);
+                    let result_ref = Arc::clone(&results);
+                    let err_ref = Arc::clone(&error);
+                    let opts = options.clone();
+                    let counters_ref = Arc::clone(&counters);
+                    handles.push(std::thread::spawn(move || {
+                        compress_cpu_worker_global_local(
+                            queue_ref,
+                            result_ref,
+                            err_ref,
+                            &opts,
+                            Some(counters_ref),
+                        )
+                    }));
+                }
 
-        for _ in 0..cpu_workers {
-            let cpu_queue_ref = Arc::clone(&cpu_queue);
-            let gpu_queue_ref = Arc::clone(&gpu_queue);
-            let result_ref = Arc::clone(&results);
-            let err_ref = Arc::clone(&error);
-            let opts = options.clone();
-            let counters_ref = Arc::clone(&counters);
-            handles.push(std::thread::spawn(move || {
-                compress_cpu_worker_split(
-                    cpu_queue_ref,
-                    gpu_queue_ref,
-                    result_ref,
-                    err_ref,
-                    &opts,
-                    Some(counters_ref),
-                )
-            }));
-        }
-
-        if let Some(gpu) = gpu_context {
-            let gpu_queue_ref = Arc::clone(&gpu_queue);
-            let result_ref = Arc::clone(&results);
-            let err_ref = Arc::clone(&error);
-            let opts = options.clone();
-            let counters_ref = Arc::clone(&counters);
-            handles.push(std::thread::spawn(move || {
-                compress_gpu_worker_split(
-                    gpu_queue_ref,
-                    result_ref,
-                    err_ref,
-                    &opts,
-                    gpu,
-                    Some(counters_ref),
-                )
-            }));
+                if let Some(gpu) = gpu_context {
+                    let queue_ref = Arc::clone(&queue);
+                    let result_ref = Arc::clone(&results);
+                    let err_ref = Arc::clone(&error);
+                    let opts = options.clone();
+                    let counters_ref = Arc::clone(&counters);
+                    handles.push(std::thread::spawn(move || {
+                        compress_gpu_worker_global_local(
+                            queue_ref,
+                            result_ref,
+                            err_ref,
+                            &opts,
+                            gpu,
+                            total_task_count,
+                            Some(counters_ref),
+                        )
+                    }));
+                }
+            }
         }
     } else {
         let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
@@ -1585,7 +1755,10 @@ fn compress_chunk_tasks_parallel(
         chunks.push(member);
     }
     chunks.sort_by_key(|chunk| chunk.index);
-    Ok((chunks, counters.snapshot()))
+    let mut encode_work = counters.snapshot();
+    encode_work.initial_gpu_queue_chunks = initial_gpu_queue_chunks;
+    encode_work.gpu_steal_reserve_chunks = gpu_steal_reserve_chunks_metric;
+    Ok((chunks, encode_work))
 }
 
 pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
@@ -1594,8 +1767,8 @@ pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
     level: u32,
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
     let options = default_hybrid_options_for_stream(level);
-    let gpu_context = if options.prefer_gpu && options.gpu_fraction > 0.0 {
-        GpuAssist::new().ok().map(Arc::new)
+    let gpu_context = if is_gpu_requested(&options) {
+        GpuAssist::new(&options).ok().map(Arc::new)
     } else {
         None
     };
@@ -1615,52 +1788,67 @@ fn deflate_compress_stream_hybrid_zip_compatible_with_context<R: Read, W: Write>
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
     validate_options(options)?;
 
+    if options.stream_batch_chunks == 0 {
+        return deflate_compress_stream_hybrid_zip_compatible_continuous_with_context(
+            reader,
+            writer,
+            options,
+            gpu_context,
+        );
+    }
+
     let mut stats = DeflateCpuStreamStats::default();
     let mut input_crc = crc32fast::Hasher::new();
     let mut output = HashingCountWriter::new(writer);
     let mut bit_writer = DeflateBitWriter::new(&mut output);
-
-    let mut pending_batch: Option<PreparedDeflateBatch> = None;
+    let mut pending_prepares: VecDeque<
+        std::thread::JoinHandle<Result<PreparedDeflateBatch, CozipDeflateError>>,
+    > = VecDeque::new();
+    let mut reached_eof = false;
 
     loop {
-        let mut tasks = Vec::with_capacity(RAW_DEFLATE_CHUNKS_PER_BATCH);
-        for _ in 0..RAW_DEFLATE_CHUNKS_PER_BATCH {
-            let Some(raw) = read_chunk_from_stream(reader, options.chunk_size)? else {
+        while !reached_eof && pending_prepares.len() < options.stream_prepare_pipeline_depth.max(1)
+        {
+            let batch_chunks = options.stream_batch_chunks.max(1);
+            let mut tasks = Vec::with_capacity(batch_chunks);
+            for _ in 0..batch_chunks {
+                let Some(raw) = read_chunk_from_stream(reader, options.chunk_size)? else {
+                    break;
+                };
+                input_crc.update(&raw);
+                stats.input_bytes = stats
+                    .input_bytes
+                    .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+                let batch_index = tasks.len();
+                tasks.push(ChunkTask {
+                    index: batch_index,
+                    preferred_gpu: false,
+                    raw,
+                });
+            }
+
+            if tasks.is_empty() {
+                reached_eof = true;
                 break;
+            }
+
+            mark_gpu_preference(&mut tasks, options, gpu_context.is_some())?;
+            let has_gpu_tasks = gpu_context.is_some() && has_gpu_eligible_task(&tasks, options);
+            let batch_gpu_context = if has_gpu_tasks {
+                gpu_context.clone()
+            } else {
+                None
             };
-            input_crc.update(&raw);
-            stats.input_bytes = stats
-                .input_bytes
-                .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
-            let batch_index = tasks.len();
-            tasks.push(ChunkTask {
-                index: batch_index,
-                preferred_gpu: false,
-                raw,
+            let prepare_options = options.clone();
+            let handle = std::thread::spawn(move || {
+                prepare_deflate_batch(tasks, prepare_options, batch_gpu_context)
             });
+            pending_prepares.push_back(handle);
         }
 
-        if tasks.is_empty() {
+        let Some(handle) = pending_prepares.pop_front() else {
             break;
-        }
-
-        mark_gpu_preference(&mut tasks, options, gpu_context.is_some())?;
-        let has_gpu_tasks = gpu_context.is_some() && tasks.iter().any(|task| task.preferred_gpu);
-        let batch_gpu_context = if has_gpu_tasks {
-            gpu_context.clone()
-        } else {
-            None
         };
-        let prepare_options = options.clone();
-        let handle = std::thread::spawn(move || {
-            prepare_deflate_batch(tasks, prepare_options, batch_gpu_context)
-        });
-
-        if let Some(batch) = pending_batch.take() {
-            let write_start = Instant::now();
-            write_prepared_batch(&mut bit_writer, &batch, false)?;
-            stats.write_stage_ms += elapsed_ms(write_start);
-        }
 
         let prepared = match handle.join() {
             Ok(result) => result?,
@@ -1678,18 +1866,26 @@ fn deflate_compress_stream_hybrid_zip_compatible_with_context<R: Read, W: Write>
         stats.layout_parse_ms += prepared.layout_parse_ms;
         stats.cpu_worker_busy_ms += prepared.encode_work.cpu_busy_ms;
         stats.gpu_worker_busy_ms += prepared.encode_work.gpu_busy_ms;
+        stats.cpu_queue_lock_wait_ms += prepared.encode_work.cpu_queue_lock_wait_ms;
+        stats.gpu_queue_lock_wait_ms += prepared.encode_work.gpu_queue_lock_wait_ms;
         stats.cpu_worker_chunks += prepared.encode_work.cpu_chunks_done;
         stats.gpu_worker_chunks += prepared.encode_work.gpu_chunks_done;
         stats.cpu_steal_chunks += prepared.encode_work.cpu_steal_chunks;
         stats.gpu_batch_count += prepared.encode_work.gpu_batches;
-        pending_batch = Some(prepared);
+        stats.cpu_no_task_events += prepared.encode_work.cpu_no_task_events;
+        stats.gpu_no_task_events += prepared.encode_work.gpu_no_task_events;
+        stats.cpu_yield_events += prepared.encode_work.cpu_yield_events;
+        stats.gpu_yield_events += prepared.encode_work.gpu_yield_events;
+        stats.initial_gpu_queue_chunks += prepared.encode_work.initial_gpu_queue_chunks;
+        stats.gpu_steal_reserve_chunks += prepared.encode_work.gpu_steal_reserve_chunks;
+
+        let is_final_batch = reached_eof && pending_prepares.is_empty();
+        let write_start = Instant::now();
+        write_prepared_batch(&mut bit_writer, &prepared, is_final_batch)?;
+        stats.write_stage_ms += elapsed_ms(write_start);
     }
 
-    if let Some(batch) = pending_batch.take() {
-        let write_start = Instant::now();
-        write_prepared_batch(&mut bit_writer, &batch, true)?;
-        stats.write_stage_ms += elapsed_ms(write_start);
-    } else {
+    if stats.chunk_count == 0 {
         let empty = deflate_compress_cpu(&[], options.compression_level)?;
         let write_start = Instant::now();
         append_deflate_chunk_as_block_sequence(&mut bit_writer, &empty, true)?;
@@ -1702,6 +1898,475 @@ fn deflate_compress_stream_hybrid_zip_compatible_with_context<R: Read, W: Write>
     stats.output_crc32 = output.hasher.finalize();
     stats.gpu_available = gpu_context.is_some();
     Ok(stats)
+}
+
+fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    options: &HybridOptions,
+    gpu_context: Option<Arc<GpuAssist>>,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    let total_start = Instant::now();
+    let mut stats = DeflateCpuStreamStats::default();
+    let mut input_crc = crc32fast::Hasher::new();
+    let mut output = HashingCountWriter::new(writer);
+    let mut bit_writer = DeflateBitWriter::new(&mut output);
+
+    let queue_state = Arc::new((
+        Mutex::new(StreamTaskQueueState::default()),
+        Condvar::new(),
+    ));
+    let ready_state = Arc::new((Mutex::new(BTreeMap::<usize, StreamReadyChunk>::new()), Condvar::new()));
+    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
+    let counters = Arc::new(WorkerCounters::default());
+    let total_tasks = Arc::new(AtomicUsize::new(0));
+
+    let gpu_enabled = gpu_context.is_some() && is_gpu_requested(options);
+    let cpu_workers = cpu_worker_count(gpu_enabled);
+    let mut handles = Vec::new();
+
+    for _ in 0..cpu_workers {
+        let queue_ref = Arc::clone(&queue_state);
+        let ready_ref = Arc::clone(&ready_state);
+        let err_ref = Arc::clone(&error);
+        let opts = options.clone();
+        let counters_ref = Arc::clone(&counters);
+        handles.push(std::thread::spawn(move || {
+            compress_cpu_stream_worker_continuous(
+                queue_ref,
+                ready_ref,
+                err_ref,
+                &opts,
+                Some(counters_ref),
+            )
+        }));
+    }
+
+    if let Some(gpu) = gpu_context.clone().filter(|_| gpu_enabled) {
+        let queue_ref = Arc::clone(&queue_state);
+        let ready_ref = Arc::clone(&ready_state);
+        let err_ref = Arc::clone(&error);
+        let opts = options.clone();
+        let counters_ref = Arc::clone(&counters);
+        let total_tasks_ref = Arc::clone(&total_tasks);
+        handles.push(std::thread::spawn(move || {
+            compress_gpu_stream_worker_continuous(
+                queue_ref,
+                ready_ref,
+                err_ref,
+                &opts,
+                gpu,
+                total_tasks_ref,
+                Some(counters_ref),
+            )
+        }));
+    }
+
+    let mut reached_eof = false;
+    let mut next_read_index = 0usize;
+    let mut next_write_index = 0usize;
+    let mut inflight_raw_bytes = 0usize;
+    let mut gpu_fraction_accum = 0.0_f32;
+
+    loop {
+        if has_error(&error) {
+            break;
+        }
+
+        let mut progressed = false;
+        loop {
+            if reached_eof {
+                break;
+            }
+            let inflight_chunks = next_read_index.saturating_sub(next_write_index);
+            if options.stream_max_inflight_chunks > 0
+                && inflight_chunks >= options.stream_max_inflight_chunks
+            {
+                break;
+            }
+            if options.stream_max_inflight_bytes > 0
+                && inflight_raw_bytes >= options.stream_max_inflight_bytes
+            {
+                break;
+            }
+
+            let Some(raw) = read_chunk_from_stream(reader, options.chunk_size)? else {
+                reached_eof = true;
+                let (queue_lock, queue_cv) = &*queue_state;
+                let mut state = lock(queue_lock)?;
+                state.closed = true;
+                queue_cv.notify_all();
+                break;
+            };
+
+            input_crc.update(&raw);
+            stats.input_bytes = stats
+                .input_bytes
+                .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+
+            let mut preferred_gpu = false;
+            if options.scheduler_policy == HybridSchedulerPolicy::Legacy
+                && options.prefer_gpu
+                && options.gpu_fraction > 0.0
+                && raw.len() >= options.gpu_min_chunk_size
+            {
+                gpu_fraction_accum += options.gpu_fraction;
+                if gpu_fraction_accum >= 1.0 {
+                    preferred_gpu = true;
+                    gpu_fraction_accum -= 1.0;
+                }
+            }
+
+            let task = ChunkTask {
+                index: next_read_index,
+                preferred_gpu,
+                raw,
+            };
+            next_read_index = next_read_index.saturating_add(1);
+            total_tasks.store(next_read_index, Ordering::Relaxed);
+            inflight_raw_bytes = inflight_raw_bytes.saturating_add(task.raw.len());
+
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = lock(queue_lock)?;
+            state.queued_bytes = state.queued_bytes.saturating_add(task.raw.len());
+            state.queue.push_back(task);
+            queue_cv.notify_one();
+            progressed = true;
+        }
+
+        loop {
+            let next_ready = {
+                let (ready_lock, _) = &*ready_state;
+                let mut ready = lock(ready_lock)?;
+                ready.remove(&next_write_index)
+            };
+            let Some(ready) = next_ready else {
+                break;
+            };
+            progressed = true;
+
+            let is_final_chunk = reached_eof && next_write_index + 1 == next_read_index;
+            let write_start = Instant::now();
+            append_deflate_chunk_as_block_sequence_with_layout(
+                &mut bit_writer,
+                &ready.chunk.compressed,
+                ready.layout,
+                is_final_chunk,
+            )?;
+            stats.write_stage_ms += elapsed_ms(write_start);
+
+            stats.chunk_count = stats.chunk_count.saturating_add(1);
+            match ready.chunk.backend {
+                ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
+                ChunkBackend::GpuAssisted => stats.gpu_chunks = stats.gpu_chunks.saturating_add(1),
+            }
+            inflight_raw_bytes =
+                inflight_raw_bytes.saturating_sub(ready.chunk.raw_len as usize);
+            next_write_index = next_write_index.saturating_add(1);
+        }
+
+        if reached_eof && next_write_index == next_read_index {
+            break;
+        }
+
+        if !progressed {
+            let (ready_lock, ready_cv) = &*ready_state;
+            let guard = lock(ready_lock)?;
+            drop(wait_timeout_on_condvar(
+                ready_cv,
+                guard,
+                Duration::from_millis(2),
+            )?);
+        }
+    }
+
+    {
+        let (queue_lock, queue_cv) = &*queue_state;
+        let mut state = lock(queue_lock)?;
+        state.closed = true;
+        queue_cv.notify_all();
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(err) = lock(&error)?.take() {
+        return Err(err);
+    }
+
+    if stats.chunk_count == 0 {
+        let empty = deflate_compress_cpu(&[], options.compression_level)?;
+        let write_start = Instant::now();
+        append_deflate_chunk_as_block_sequence(&mut bit_writer, &empty, true)?;
+        stats.write_stage_ms += elapsed_ms(write_start);
+    }
+
+    let counters = counters.snapshot();
+    stats.cpu_worker_busy_ms += counters.cpu_busy_ms;
+    stats.gpu_worker_busy_ms += counters.gpu_busy_ms;
+    stats.cpu_queue_lock_wait_ms += counters.cpu_queue_lock_wait_ms;
+    stats.gpu_queue_lock_wait_ms += counters.gpu_queue_lock_wait_ms;
+    stats.cpu_worker_chunks += counters.cpu_chunks_done;
+    stats.gpu_worker_chunks += counters.gpu_chunks_done;
+    stats.cpu_steal_chunks += counters.cpu_steal_chunks;
+    stats.gpu_batch_count += counters.gpu_batches;
+    stats.cpu_no_task_events += counters.cpu_no_task_events;
+    stats.gpu_no_task_events += counters.gpu_no_task_events;
+    stats.cpu_yield_events += counters.cpu_yield_events;
+    stats.gpu_yield_events += counters.gpu_yield_events;
+    stats.initial_gpu_queue_chunks += counters.initial_gpu_queue_chunks;
+    stats.gpu_steal_reserve_chunks += counters.gpu_steal_reserve_chunks;
+
+    bit_writer.finish()?;
+    stats.input_crc32 = input_crc.finalize();
+    stats.output_bytes = output.written;
+    stats.output_crc32 = output.hasher.finalize();
+    stats.gpu_available = gpu_enabled;
+    stats.compress_stage_ms = (elapsed_ms(total_start) - stats.write_stage_ms).max(0.0);
+    Ok(stats)
+}
+
+fn stream_task_is_gpu_eligible(task: &ChunkTask, options: &HybridOptions) -> bool {
+    if task.raw.len() < options.gpu_min_chunk_size {
+        return false;
+    }
+    match options.scheduler_policy {
+        HybridSchedulerPolicy::Legacy => task.preferred_gpu,
+        HybridSchedulerPolicy::GlobalQueueLocalBuffers => true,
+    }
+}
+
+fn compress_cpu_stream_worker_continuous(
+    queue_state: Arc<(Mutex<StreamTaskQueueState>, Condvar)>,
+    ready_state: Arc<(Mutex<BTreeMap<usize, StreamReadyChunk>>, Condvar)>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    options: &HybridOptions,
+    counters: Option<Arc<WorkerCounters>>,
+) {
+    loop {
+        if has_error(&error) {
+            break;
+        }
+        let task = {
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = match lock(queue_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            loop {
+                if let Some(task) = state.queue.pop_front() {
+                    state.queued_bytes = state.queued_bytes.saturating_sub(task.raw.len());
+                    break Some(task);
+                }
+                if state.closed {
+                    break None;
+                }
+                if let Some(counters) = &counters {
+                    counters.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                }
+                state = match wait_on_condvar(queue_cv, state) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+            }
+        };
+
+        let Some(task) = task else {
+            if let Some(counters) = &counters {
+                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
+            break;
+        };
+
+        let start = Instant::now();
+        let encoded = match compress_chunk_cpu(task, options.compression_level) {
+            Ok(value) => value,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        let layout = match parse_deflate_stream_layout(&encoded.compressed) {
+            Ok(value) => value,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+
+        if let Some(counters) = &counters {
+            counters
+                .cpu_busy_ns
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            counters.cpu_chunks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (ready_lock, ready_cv) = &*ready_state;
+        let mut ready = match lock(ready_lock) {
+            Ok(guard) => guard,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        if ready
+            .insert(encoded.index, StreamReadyChunk { chunk: encoded, layout })
+            .is_some()
+        {
+            set_error(&error, CozipDeflateError::Internal("duplicate compressed index"));
+            break;
+        }
+        ready_cv.notify_all();
+    }
+}
+
+fn compress_gpu_stream_worker_continuous(
+    queue_state: Arc<(Mutex<StreamTaskQueueState>, Condvar)>,
+    ready_state: Arc<(Mutex<BTreeMap<usize, StreamReadyChunk>>, Condvar)>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    options: &HybridOptions,
+    gpu: Arc<GpuAssist>,
+    total_tasks: Arc<AtomicUsize>,
+    counters: Option<Arc<WorkerCounters>>,
+) {
+    let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
+    loop {
+        if has_error(&error) {
+            break;
+        }
+        let tasks = {
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = match lock(queue_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            loop {
+                let total = total_tasks.load(Ordering::Relaxed);
+                if state.closed
+                    && should_stop_gpu_tail_pop(total, state.queue.len(), options.gpu_tail_stop_ratio)
+                {
+                    break Vec::new();
+                }
+
+                let mut tasks = Vec::with_capacity(batch_limit);
+                while tasks.len() < batch_limit {
+                    let pos = state
+                        .queue
+                        .iter()
+                        .position(|task| stream_task_is_gpu_eligible(task, options));
+                    if let Some(pos) = pos {
+                        if let Some(task) = state.queue.remove(pos) {
+                            state.queued_bytes = state.queued_bytes.saturating_sub(task.raw.len());
+                            tasks.push(task);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if !tasks.is_empty() {
+                    break tasks;
+                }
+                if state.closed {
+                    break Vec::new();
+                }
+                if let Some(counters) = &counters {
+                    counters.gpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                }
+                state = match wait_on_condvar(queue_cv, state) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+            }
+        };
+
+        if tasks.is_empty() {
+            if let Some(counters) = &counters {
+                counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
+            break;
+        }
+
+        let batch_start = Instant::now();
+        let encoded_batch = match compress_chunk_gpu_batch(&tasks, options, &gpu) {
+            Ok(values) => {
+                if values.len() != tasks.len() {
+                    set_error(
+                        &error,
+                        CozipDeflateError::Internal("gpu worker produced mismatched batch"),
+                    );
+                    break;
+                }
+                values
+            }
+            Err(_) => {
+                let mut fallback = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    match compress_chunk_cpu(task, options.compression_level) {
+                        Ok(value) => fallback.push(value),
+                        Err(err) => {
+                            set_error(&error, err);
+                            return;
+                        }
+                    }
+                }
+                fallback
+            }
+        };
+
+        if let Some(counters) = &counters {
+            counters
+                .gpu_busy_ns
+                .fetch_add(batch_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            counters.gpu_batches.fetch_add(1, Ordering::Relaxed);
+            let gpu_chunks = encoded_batch
+                .iter()
+                .filter(|chunk| chunk.backend == ChunkBackend::GpuAssisted)
+                .count();
+            counters.gpu_chunks.fetch_add(gpu_chunks, Ordering::Relaxed);
+            let cpu_chunks = encoded_batch.len().saturating_sub(gpu_chunks);
+            counters.cpu_chunks.fetch_add(cpu_chunks, Ordering::Relaxed);
+        }
+
+        let layouts = match parse_deflate_stream_layouts_parallel(&encoded_batch) {
+            Ok(value) => value,
+            Err(err) => {
+                set_error(&error, err);
+                return;
+            }
+        };
+
+        let (ready_lock, ready_cv) = &*ready_state;
+        let mut ready = match lock(ready_lock) {
+            Ok(guard) => guard,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        for (encoded, layout) in encoded_batch.into_iter().zip(layouts.into_iter()) {
+            if ready
+                .insert(encoded.index, StreamReadyChunk { chunk: encoded, layout })
+                .is_some()
+            {
+                set_error(&error, CozipDeflateError::Internal("duplicate compressed index"));
+                return;
+            }
+        }
+        ready_cv.notify_all();
+    }
 }
 
 struct HashingCountWriter<'a, W: Write> {
@@ -1750,7 +2415,7 @@ fn compress_hybrid_with_context(
     options: &HybridOptions,
     gpu_context: Option<Arc<GpuAssist>>,
 ) -> Result<CompressedFrame, CozipDeflateError> {
-    maybe_warn_deep_profile_enabled();
+    maybe_warn_deep_profile_enabled(options);
     validate_options(options)?;
 
     if input.is_empty() {
@@ -1767,11 +2432,10 @@ fn compress_hybrid_with_context(
         });
     }
 
-    let gpu_requested = options.prefer_gpu && options.gpu_fraction > 0.0;
+    let gpu_requested = is_gpu_requested(options);
     let gpu_available = gpu_context.is_some();
     let tasks = build_chunk_tasks(input, options, gpu_requested && gpu_available)?;
-    let has_gpu_tasks =
-        gpu_available && gpu_requested && tasks.iter().any(|task| task.preferred_gpu);
+    let has_gpu_tasks = gpu_available && gpu_requested && has_gpu_eligible_task(&tasks, options);
     if has_gpu_tasks {
         return compress_hybrid_work_stealing_scheduler(input.len(), tasks, options, gpu_context);
     }
@@ -1835,24 +2499,58 @@ fn compress_hybrid_work_stealing_scheduler(
     let cpu_workers = cpu_worker_count(gpu_available);
     let mut handles = Vec::new();
 
-    for _ in 0..cpu_workers {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-        handles.push(std::thread::spawn(move || {
-            compress_cpu_worker(queue_ref, result_ref, err_ref, &opts, gpu_available, None)
-        }));
-    }
+    match options.scheduler_policy {
+        HybridSchedulerPolicy::Legacy => {
+            for _ in 0..cpu_workers {
+                let queue_ref = Arc::clone(&queue);
+                let result_ref = Arc::clone(&results);
+                let err_ref = Arc::clone(&error);
+                let opts = options.clone();
+                handles.push(std::thread::spawn(move || {
+                    compress_cpu_worker(queue_ref, result_ref, err_ref, &opts, gpu_available, None)
+                }));
+            }
 
-    if let Some(gpu) = gpu_context {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-        handles.push(std::thread::spawn(move || {
-            compress_gpu_worker(queue_ref, result_ref, err_ref, &opts, gpu, None)
-        }));
+            if let Some(gpu) = gpu_context {
+                let queue_ref = Arc::clone(&queue);
+                let result_ref = Arc::clone(&results);
+                let err_ref = Arc::clone(&error);
+                let opts = options.clone();
+                handles.push(std::thread::spawn(move || {
+                    compress_gpu_worker(queue_ref, result_ref, err_ref, &opts, gpu, None)
+                }));
+            }
+        }
+        HybridSchedulerPolicy::GlobalQueueLocalBuffers => {
+            let total_task_count = chunk_count;
+            for _ in 0..cpu_workers {
+                let queue_ref = Arc::clone(&queue);
+                let result_ref = Arc::clone(&results);
+                let err_ref = Arc::clone(&error);
+                let opts = options.clone();
+                handles.push(std::thread::spawn(move || {
+                    compress_cpu_worker_global_local(queue_ref, result_ref, err_ref, &opts, None)
+                }));
+            }
+
+            if let Some(gpu) = gpu_context {
+                let queue_ref = Arc::clone(&queue);
+                let result_ref = Arc::clone(&results);
+                let err_ref = Arc::clone(&error);
+                let opts = options.clone();
+                handles.push(std::thread::spawn(move || {
+                    compress_gpu_worker_global_local(
+                        queue_ref,
+                        result_ref,
+                        err_ref,
+                        &opts,
+                        gpu,
+                        total_task_count,
+                        None,
+                    )
+                }));
+            }
+        }
     }
 
     for handle in handles {
@@ -2127,11 +2825,11 @@ fn cpu_worker_count(has_gpu: bool) -> usize {
         .map(|value| value.get())
         .unwrap_or(1);
 
-    if has_gpu {
-        available.saturating_sub(1).max(1)
-    } else {
-        available.max(1)
-    }
+    // Keep CPU worker parallelism unchanged even in hybrid mode.
+    // The GPU worker mostly blocks on GPU progress, and reducing CPU workers by one
+    // can underutilize CPU on CPU-heavy workloads (especially when GPU share is low).
+    let _ = has_gpu;
+    available.max(1)
 }
 
 fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {
@@ -2161,10 +2859,25 @@ fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {
             "gpu_pipelined_submit_chunks must be greater than 0",
         ));
     }
+    if options.token_finalize_segment_size == 0 {
+        return Err(CozipDeflateError::InvalidOptions(
+            "token_finalize_segment_size must be greater than 0",
+        ));
+    }
+    if options.stream_prepare_pipeline_depth == 0 {
+        return Err(CozipDeflateError::InvalidOptions(
+            "stream_prepare_pipeline_depth must be greater than 0",
+        ));
+    }
 
     if !(0.0..=1.0).contains(&options.gpu_fraction) {
         return Err(CozipDeflateError::InvalidOptions(
             "gpu_fraction must be in range 0.0..=1.0",
+        ));
+    }
+    if !(0.0..=1.0).contains(&options.gpu_tail_stop_ratio) {
+        return Err(CozipDeflateError::InvalidOptions(
+            "gpu_tail_stop_ratio must be in range 0.0..=1.0",
         ));
     }
 
@@ -2370,6 +3083,13 @@ fn mark_gpu_preference(
     options: &HybridOptions,
     gpu_available: bool,
 ) -> Result<(), CozipDeflateError> {
+    if options.scheduler_policy == HybridSchedulerPolicy::GlobalQueueLocalBuffers {
+        for task in tasks.iter_mut() {
+            task.preferred_gpu = false;
+        }
+        return Ok(());
+    }
+
     if !gpu_available || options.gpu_fraction <= 0.0 || tasks.is_empty() {
         return Ok(());
     }
@@ -2441,32 +3161,60 @@ fn compress_cpu_worker_split(
     options: &HybridOptions,
     counters: Option<Arc<WorkerCounters>>,
 ) {
+    // Queues are pre-partitioned and never refilled. Once cpu_queue is observed empty,
+    // workers can skip touching it to reduce lock traffic in hybrid-heavy runs.
+    let mut cpu_queue_drained = false;
     loop {
         if has_error(&error) {
             break;
         }
 
-        let (task, stolen) = match lock(&cpu_queue) {
-            Ok(mut queue) => {
-                if let Some(task) = queue.pop_front() {
-                    (Some(task), false)
-                } else {
-                    match lock(&gpu_queue) {
-                        Ok(mut gpu_q) => (gpu_q.pop_front(), true),
-                        Err(err) => {
-                            set_error(&error, err);
-                            (None, false)
-                        }
+        let mut stolen = false;
+        let mut task = None;
+        if !cpu_queue_drained {
+            let lock_start = Instant::now();
+            match lock(&cpu_queue) {
+                Ok(mut queue) => {
+                    if let Some(counters) = &counters {
+                        counters
+                            .cpu_queue_lock_wait_ns
+                            .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    task = queue.pop_front();
+                    if task.is_none() {
+                        cpu_queue_drained = true;
                     }
                 }
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
             }
-            Err(err) => {
-                set_error(&error, err);
-                (None, false)
+        }
+
+        if task.is_none() {
+            let lock_start = Instant::now();
+            match lock(&gpu_queue) {
+                Ok(mut gpu_q) => {
+                    if let Some(counters) = &counters {
+                        counters
+                            .gpu_queue_lock_wait_ns
+                            .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    task = gpu_q.pop_front();
+                    stolen = task.is_some();
+                }
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
             }
-        };
+        }
 
         let Some(task) = task else {
+            if let Some(counters) = &counters {
+                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
             break;
         };
 
@@ -2507,8 +3255,14 @@ fn compress_gpu_worker_split(
             break;
         }
 
+        let lock_start = Instant::now();
         let tasks = match lock(&gpu_queue) {
             Ok(mut queue) => {
+                if let Some(counters) = &counters {
+                    counters
+                        .gpu_queue_lock_wait_ns
+                        .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
                 let mut tasks = Vec::with_capacity(batch_limit);
                 while tasks.len() < batch_limit {
@@ -2526,6 +3280,9 @@ fn compress_gpu_worker_split(
         };
 
         if tasks.is_empty() {
+            if let Some(counters) = &counters {
+                counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
             break;
         }
 
@@ -2573,6 +3330,164 @@ fn compress_gpu_worker_split(
     }
 }
 
+fn compress_cpu_worker_global_local(
+    queue: Arc<Mutex<VecDeque<ChunkTask>>>,
+    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    options: &HybridOptions,
+    counters: Option<Arc<WorkerCounters>>,
+) {
+    loop {
+        if has_error(&error) {
+            break;
+        }
+
+        let task = (|| -> Result<Option<ChunkTask>, CozipDeflateError> {
+            let lock_start = Instant::now();
+            let mut guard = lock(&queue)?;
+            if let Some(counters) = &counters {
+                counters
+                    .cpu_queue_lock_wait_ns
+                    .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            Ok(guard.pop_front())
+        })();
+        let Some(task) = (match task {
+            Ok(value) => value,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        }) else {
+            if let Some(counters) = &counters {
+                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
+            break;
+        };
+
+        let start = Instant::now();
+        match compress_chunk_cpu(task, options.compression_level) {
+            Ok(encoded) => {
+                if let Some(counters) = &counters {
+                    let nanos = start.elapsed().as_nanos() as u64;
+                    counters.cpu_busy_ns.fetch_add(nanos, Ordering::Relaxed);
+                    counters.cpu_chunks.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Err(err) = store_encoded_result(&results, encoded) {
+                    set_error(&error, err);
+                    break;
+                }
+            }
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        }
+    }
+}
+
+fn compress_gpu_worker_global_local(
+    queue: Arc<Mutex<VecDeque<ChunkTask>>>,
+    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    options: &HybridOptions,
+    gpu: Arc<GpuAssist>,
+    total_task_count: usize,
+    counters: Option<Arc<WorkerCounters>>,
+) {
+    let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
+    let mut local_batch = Vec::with_capacity(batch_limit);
+
+    loop {
+        if has_error(&error) {
+            break;
+        }
+
+        if local_batch.is_empty() {
+            let refill = (|| -> Result<(), CozipDeflateError> {
+                let lock_start = Instant::now();
+                let mut guard = lock(&queue)?;
+                if let Some(counters) = &counters {
+                    counters
+                        .gpu_queue_lock_wait_ns
+                        .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                if should_stop_gpu_tail_pop(
+                    total_task_count,
+                    guard.len(),
+                    options.gpu_tail_stop_ratio,
+                ) {
+                    return Ok(());
+                }
+                local_batch = pop_front_batch_tasks(&mut guard, batch_limit);
+                Ok(())
+            })();
+            if let Err(err) = refill {
+                set_error(&error, err);
+                break;
+            }
+        }
+
+        if local_batch.is_empty() {
+            if let Some(counters) = &counters {
+                counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
+            break;
+        }
+
+        let tasks = std::mem::take(&mut local_batch);
+        let batch_start = Instant::now();
+        let encoded_batch = match compress_chunk_gpu_batch(&tasks, options, &gpu) {
+            Ok(value) => value,
+            Err(_) => {
+                let mut fallback = Vec::with_capacity(tasks.len());
+                for task in tasks {
+                    match compress_chunk_cpu(task, options.compression_level) {
+                        Ok(value) => fallback.push(value),
+                        Err(err) => {
+                            set_error(&error, err);
+                            return;
+                        }
+                    }
+                }
+                fallback
+            }
+        };
+
+        if let Some(counters) = &counters {
+            let nanos = batch_start.elapsed().as_nanos() as u64;
+            counters.gpu_busy_ns.fetch_add(nanos, Ordering::Relaxed);
+            counters.gpu_batches.fetch_add(1, Ordering::Relaxed);
+            let gpu_chunks = encoded_batch
+                .iter()
+                .filter(|chunk| chunk.backend == ChunkBackend::GpuAssisted)
+                .count();
+            counters.gpu_chunks.fetch_add(gpu_chunks, Ordering::Relaxed);
+            let cpu_chunks = encoded_batch.len().saturating_sub(gpu_chunks);
+            counters.cpu_chunks.fetch_add(cpu_chunks, Ordering::Relaxed);
+        }
+
+        for value in encoded_batch {
+            if let Err(err) = store_encoded_result(&results, value) {
+                set_error(&error, err);
+                break;
+            }
+        }
+
+        if has_error(&error) {
+            break;
+        }
+    }
+}
+
+fn should_stop_gpu_tail_pop(total_task_count: usize, queue_remaining: usize, ratio: f32) -> bool {
+    if ratio >= 1.0 || total_task_count == 0 {
+        return false;
+    }
+    let completed = total_task_count.saturating_sub(queue_remaining);
+    (completed as f32 / total_task_count as f32) >= ratio
+}
+
 fn compress_cpu_worker(
     queue: Arc<Mutex<VecDeque<ChunkTask>>>,
     results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
@@ -2587,6 +3502,7 @@ fn compress_cpu_worker(
         }
 
         let task = {
+            let lock_start = Instant::now();
             let mut guard = match lock(&queue) {
                 Ok(value) => value,
                 Err(err) => {
@@ -2594,13 +3510,24 @@ fn compress_cpu_worker(
                     break;
                 }
             };
+            if let Some(counters) = &counters {
+                counters
+                    .cpu_queue_lock_wait_ns
+                    .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             pop_cpu_task(&mut guard, gpu_enabled, options.gpu_min_chunk_size)
         };
 
         let Some(task) = task else {
             let queue_empty = lock(&queue).map(|guard| guard.is_empty()).unwrap_or(true);
+            if let Some(counters) = &counters {
+                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
             if queue_empty {
                 break;
+            }
+            if let Some(counters) = &counters {
+                counters.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
             }
             std::thread::yield_now();
             continue;
@@ -2641,6 +3568,7 @@ fn compress_gpu_worker(
         }
 
         let tasks = {
+            let lock_start = Instant::now();
             let mut guard = match lock(&queue) {
                 Ok(value) => value,
                 Err(err) => {
@@ -2648,6 +3576,11 @@ fn compress_gpu_worker(
                     break;
                 }
             };
+            if let Some(counters) = &counters {
+                counters
+                    .gpu_queue_lock_wait_ns
+                    .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
             pop_gpu_batch_tasks(
                 &mut guard,
                 options.gpu_min_chunk_size,
@@ -2656,6 +3589,9 @@ fn compress_gpu_worker(
         };
 
         if tasks.is_empty() {
+            if let Some(counters) = &counters {
+                counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            }
             break;
         }
 
@@ -2742,6 +3678,16 @@ fn pop_gpu_batch_tasks(
         tasks.push(task);
     }
 
+    tasks
+}
+
+fn pop_front_batch_tasks(queue: &mut VecDeque<ChunkTask>, max_batch_chunks: usize) -> Vec<ChunkTask> {
+    let mut tasks = Vec::with_capacity(max_batch_chunks.max(1));
+    let batch_limit = max_batch_chunks.max(1);
+    while tasks.len() < batch_limit {
+        let Some(task) = queue.pop_front() else { break };
+        tasks.push(task);
+    }
     tasks
 }
 
@@ -3204,11 +4150,9 @@ fn encode_code_lengths_rle(lengths: &[u8]) -> Vec<(u8, u8)> {
 
 #[derive(Debug, Clone)]
 struct DynamicHuffmanPlan {
-    litlen_codes: Vec<u32>,
-    litlen_bits: Vec<u32>,
-    dist_codes: Vec<u32>,
-    dist_bits: Vec<u32>,
-    header_bytes: Vec<u8>,
+    dyn_table: Vec<u32>,
+    header_bytes_padded: Vec<u8>,
+    header_copy_size: u64,
     header_bits: u32,
     eob_code: u16,
     eob_bits: u8,
@@ -3308,6 +4252,12 @@ fn build_dynamic_huffman_plan(
     let header_bits =
         u32::try_from(writer.bit_len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
     let header_bytes = writer.finish();
+    let header_words = header_bytes.len().div_ceil(std::mem::size_of::<u32>());
+    let header_copy_size = bytes_len::<u32>(header_words)?;
+    let header_copy_size_usize =
+        usize::try_from(header_copy_size).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let mut header_bytes_padded = vec![0_u8; header_copy_size_usize];
+    header_bytes_padded[..header_bytes.len()].copy_from_slice(&header_bytes);
 
     let mut litlen_codes = vec![0_u32; LITLEN_SYMBOL_COUNT];
     let mut litlen_bits = vec![0_u32; LITLEN_SYMBOL_COUNT];
@@ -3322,6 +4272,11 @@ fn build_dynamic_huffman_plan(
         dist_codes[idx] = code as u32;
         dist_bits[idx] = bits as u32;
     }
+    let mut dyn_table = Vec::with_capacity(DYN_TABLE_U32_COUNT);
+    dyn_table.extend_from_slice(&litlen_codes);
+    dyn_table.extend_from_slice(&litlen_bits);
+    dyn_table.extend_from_slice(&dist_codes);
+    dyn_table.extend_from_slice(&dist_bits);
 
     let eob_code = litlen_codes[256] as u16;
     let eob_bits = litlen_bits[256] as u8;
@@ -3330,11 +4285,9 @@ fn build_dynamic_huffman_plan(
     }
 
     Ok(DynamicHuffmanPlan {
-        litlen_codes,
-        litlen_bits,
-        dist_codes,
-        dist_bits,
-        header_bytes,
+        dyn_table,
+        header_bytes_padded,
+        header_copy_size,
         header_bits,
         eob_code,
         eob_bits,

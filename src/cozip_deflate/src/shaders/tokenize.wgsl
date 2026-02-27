@@ -247,6 +247,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (mlen > best_len || (mlen == best_len && (best_dist == 0u || dist < best_dist))) {
                     best_len = mlen;
                     best_dist = dist;
+                    // Cannot improve beyond mode cap; stop checking farther candidates.
+                    if (best_len >= match_len_limit) {
+                        break;
+                    }
                 }
             }
         }

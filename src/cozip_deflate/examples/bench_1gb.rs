@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use cozip_deflate::{
-    CoZipDeflate, CompressionMode, DeflateCpuStreamStats, HybridOptions,
+    CoZipDeflate, CompressionMode, DeflateCpuStreamStats, HybridOptions, HybridSchedulerPolicy,
     deflate_decompress_stream_on_cpu,
 };
 
@@ -14,9 +14,21 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     gpu_subchunk_kib: usize,
+    token_finalize_segment_size: usize,
     gpu_slots: usize,
+    gpu_batch_chunks: usize,
+    gpu_submit_chunks: usize,
+    stream_pipeline_depth: usize,
+    stream_batch_chunks: usize,
+    stream_max_inflight_chunks: usize,
+    stream_max_inflight_mib: usize,
+    scheduler_policy: HybridSchedulerPolicy,
     gpu_fraction: f32,
+    gpu_tail_stop_ratio: f32,
     mode: CompressionMode,
+    profile_timing: bool,
+    profile_timing_detail: bool,
+    profile_timing_deep: bool,
 }
 
 impl Default for BenchConfig {
@@ -27,10 +39,32 @@ impl Default for BenchConfig {
             warmups: 0,
             chunk_mib: 4,
             gpu_subchunk_kib: 256,
-            gpu_slots: 4,
+            token_finalize_segment_size: 4096,
+            gpu_slots: 6,
+            gpu_batch_chunks: 6,
+            gpu_submit_chunks: 6,
+            stream_pipeline_depth: 2,
+            stream_batch_chunks: 32,
+            stream_max_inflight_chunks: 256,
+            stream_max_inflight_mib: 0,
+            scheduler_policy: HybridSchedulerPolicy::Legacy,
             gpu_fraction: 1.0,
+            gpu_tail_stop_ratio: 1.0,
             mode: CompressionMode::Speed,
+            profile_timing: env_flag("COZIP_PROFILE_TIMING"),
+            profile_timing_detail: env_flag("COZIP_PROFILE_TIMING_DETAIL"),
+            profile_timing_deep: env_flag("COZIP_PROFILE_DEEP"),
         }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => {
+            let lowered = value.trim().to_ascii_lowercase();
+            !(lowered.is_empty() || lowered == "0" || lowered == "false" || lowered == "off")
+        }
+        Err(_) => false,
     }
 }
 
@@ -42,6 +76,24 @@ impl BenchConfig {
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 return Err(help_text());
+            }
+
+            match arg.as_str() {
+                "--profile-timing" => {
+                    cfg.profile_timing = true;
+                    continue;
+                }
+                "--profile-timing-detail" => {
+                    cfg.profile_timing = true;
+                    cfg.profile_timing_detail = true;
+                    continue;
+                }
+                "--profile-timing-deep" => {
+                    cfg.profile_timing = true;
+                    cfg.profile_timing_deep = true;
+                    continue;
+                }
+                _ => {}
             }
 
             let value = args
@@ -74,15 +126,66 @@ impl BenchConfig {
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-subchunk-kib".to_string())?;
                 }
+                "--token-finalize-segment-size" => {
+                    cfg.token_finalize_segment_size = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --token-finalize-segment-size".to_string())?;
+                }
                 "--gpu-slots" => {
                     cfg.gpu_slots = value
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-slots".to_string())?;
                 }
+                "--gpu-submit-chunks" => {
+                    cfg.gpu_submit_chunks = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --gpu-submit-chunks".to_string())?;
+                }
+                "--gpu-batch-chunks" => {
+                    cfg.gpu_batch_chunks = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --gpu-batch-chunks".to_string())?;
+                }
+                "--stream-pipeline-depth" => {
+                    cfg.stream_pipeline_depth = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --stream-pipeline-depth".to_string())?;
+                }
+                "--stream-batch-chunks" => {
+                    cfg.stream_batch_chunks = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --stream-batch-chunks".to_string())?;
+                }
+                "--stream-max-inflight-chunks" => {
+                    cfg.stream_max_inflight_chunks = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --stream-max-inflight-chunks".to_string())?;
+                }
+                "--stream-max-inflight-mib" => {
+                    cfg.stream_max_inflight_mib = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --stream-max-inflight-mib".to_string())?;
+                }
+                "--scheduler" => {
+                    cfg.scheduler_policy = match value.as_str() {
+                        "legacy" => HybridSchedulerPolicy::Legacy,
+                        "global-local" => HybridSchedulerPolicy::GlobalQueueLocalBuffers,
+                        _ => {
+                            return Err(
+                                "invalid --scheduler (expected: legacy|global-local)".to_string()
+                            );
+                        }
+                    };
+                }
                 "--gpu-fraction" => {
                     cfg.gpu_fraction = value
                         .parse::<f32>()
                         .map_err(|_| "invalid --gpu-fraction".to_string())?;
+                }
+                "--gpu-tail-stop-ratio" => {
+                    cfg.gpu_tail_stop_ratio = value
+                        .parse::<f32>()
+                        .map_err(|_| "invalid --gpu-tail-stop-ratio".to_string())?;
                 }
                 "--mode" => {
                     cfg.mode = match value.as_str() {
@@ -106,12 +209,24 @@ impl BenchConfig {
             || cfg.iters == 0
             || cfg.chunk_mib == 0
             || cfg.gpu_subchunk_kib == 0
+            || cfg.token_finalize_segment_size == 0
             || cfg.gpu_slots == 0
+            || cfg.gpu_batch_chunks == 0
+            || cfg.gpu_submit_chunks == 0
+            || cfg.stream_pipeline_depth == 0
         {
-            return Err("size/iters/chunk/subchunk must be > 0".to_string());
+            return Err(
+                "size/iters/chunk/subchunk/token-finalize-segment-size/gpu-batch-chunks/gpu-submit-chunks must be > 0".to_string(),
+            );
         }
         if !(0.0..=1.0).contains(&cfg.gpu_fraction) {
             return Err("gpu-fraction must be in range 0.0..=1.0".to_string());
+        }
+        if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
+            return Err("gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
+        }
+        if cfg.profile_timing_detail || cfg.profile_timing_deep {
+            cfg.profile_timing = true;
         }
 
         Ok(cfg)
@@ -125,9 +240,21 @@ fn help_text() -> String {
   --warmups <N>            warmup iterations (default: 0)
   --chunk-mib <N>          host chunk size in MiB (default: 4)
   --gpu-subchunk-kib <N>   gpu subchunk size in KiB (default: 256)
-  --gpu-slots <N>          gpu slot/batch/submit count (default: 4)
+  --token-finalize-segment-size <N> token finalize segment size (default: 4096)
+  --gpu-slots <N>          gpu slot/batch count (default: 6)
+  --gpu-batch-chunks <N>   gpu dequeue batch size (default: 6)
+  --gpu-submit-chunks <N>  gpu submit group size (default: 6)
+  --stream-pipeline-depth <N>  stream prepare pipeline depth (default: 2)
+  --stream-batch-chunks <N>    stream batch chunk count (default: 32, 0: batch off continuous)
+  --stream-max-inflight-chunks <N> inflight chunk cap in continuous mode (default: 256, 0: unlimited)
+  --stream-max-inflight-mib <N> inflight raw MiB cap in continuous mode (default: 0, disabled)
+  --scheduler <S>          legacy|global-local (default: legacy)
   --gpu-fraction <R>       gpu scheduling target ratio 0.0..=1.0 (default: 1.0)
-  --mode <M>               speed|balanced|ratio (default: speed)"#;
+  --gpu-tail-stop-ratio <R>  stop new GPU dequeues when progress reaches ratio (default: 1.0; disabled)
+  --mode <M>               speed|balanced|ratio (default: speed)
+  --profile-timing         enable GPU timing logs
+  --profile-timing-detail  enable detailed GPU timing logs
+  --profile-timing-deep    enable one-shot deep GPU timing probe"#;
     text.to_string()
 }
 
@@ -242,6 +369,22 @@ fn run_case(input: &[u8], cozip: &CoZipDeflate, iters: usize) -> BenchAgg {
     agg
 }
 
+fn avg_ms(total_ms: f64, count: usize) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_ms / count as f64
+    }
+}
+
+fn worker_parallelism_equiv(worker_busy_ms: f64, wall_ms: f64) -> f64 {
+    if wall_ms <= 0.0 {
+        0.0
+    } else {
+        worker_busy_ms / wall_ms
+    }
+}
+
 fn main() {
     let cfg = match BenchConfig::from_args() {
         Ok(value) => value,
@@ -265,13 +408,23 @@ fn main() {
         chunk_size,
         gpu_subchunk_size,
         gpu_slot_count: cfg.gpu_slots,
-        gpu_batch_chunks: cfg.gpu_slots,
-        gpu_pipelined_submit_chunks: cfg.gpu_slots,
+        stream_prepare_pipeline_depth: cfg.stream_pipeline_depth,
+        stream_batch_chunks: cfg.stream_batch_chunks,
+        stream_max_inflight_chunks: cfg.stream_max_inflight_chunks,
+        stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
+        scheduler_policy: cfg.scheduler_policy,
+        gpu_batch_chunks: cfg.gpu_batch_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
+        token_finalize_segment_size: cfg.token_finalize_segment_size,
         compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: false,
         gpu_fraction: 0.0,
+        gpu_tail_stop_ratio: 1.0,
         gpu_min_chunk_size: 64 * 1024,
+        profile_timing: cfg.profile_timing,
+        profile_timing_detail: cfg.profile_timing_detail,
+        profile_timing_deep: cfg.profile_timing_deep,
         ..HybridOptions::default()
     };
 
@@ -279,13 +432,23 @@ fn main() {
         chunk_size,
         gpu_subchunk_size,
         gpu_slot_count: cfg.gpu_slots,
-        gpu_batch_chunks: cfg.gpu_slots,
-        gpu_pipelined_submit_chunks: cfg.gpu_slots,
+        stream_prepare_pipeline_depth: cfg.stream_pipeline_depth,
+        stream_batch_chunks: cfg.stream_batch_chunks,
+        stream_max_inflight_chunks: cfg.stream_max_inflight_chunks,
+        stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
+        scheduler_policy: cfg.scheduler_policy,
+        gpu_batch_chunks: cfg.gpu_batch_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
+        token_finalize_segment_size: cfg.token_finalize_segment_size,
         compression_level: 6,
         compression_mode: cfg.mode,
         prefer_gpu: true,
         gpu_fraction: cfg.gpu_fraction,
+        gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
         gpu_min_chunk_size: 64 * 1024,
+        profile_timing: cfg.profile_timing,
+        profile_timing_detail: cfg.profile_timing_detail,
+        profile_timing_deep: cfg.profile_timing_deep,
         ..HybridOptions::default()
     };
 
@@ -295,8 +458,21 @@ fn main() {
         cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib, cfg.mode
     );
     println!(
-        "gpu_fraction={:.2} gpu_slots={}",
-        cfg.gpu_fraction, cfg.gpu_slots
+        "gpu_fraction={:.2} gpu_tail_stop_ratio={:.2} token_finalize_segment_size={} gpu_slots={} gpu_batch_chunks={} gpu_submit_chunks={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} scheduler={:?} profile_timing={} profile_timing_detail={} profile_timing_deep={}",
+        cfg.gpu_fraction,
+        cfg.gpu_tail_stop_ratio,
+        cfg.token_finalize_segment_size,
+        cfg.gpu_slots,
+        cfg.gpu_batch_chunks,
+        cfg.gpu_submit_chunks,
+        cfg.stream_pipeline_depth,
+        cfg.stream_batch_chunks,
+        cfg.stream_max_inflight_chunks,
+        cfg.stream_max_inflight_mib,
+        cfg.scheduler_policy,
+        cfg.profile_timing,
+        cfg.profile_timing_detail,
+        cfg.profile_timing_deep
     );
 
     let cpu_only_cozip = CoZipDeflate::init(cpu_only).expect("cpu-only init should succeed");
@@ -315,9 +491,49 @@ fn main() {
     } else {
         0.0
     };
+    let cpu_cpu_parallelism = worker_parallelism_equiv(
+        cpu.last_compress_stats.cpu_worker_busy_ms,
+        cpu.avg_compress_ms(cfg.iters),
+    );
+    let cpu_gpu_parallelism = worker_parallelism_equiv(
+        cpu.last_compress_stats.gpu_worker_busy_ms,
+        cpu.avg_compress_ms(cfg.iters),
+    );
+    let hybrid_cpu_parallelism = worker_parallelism_equiv(
+        hybrid.last_compress_stats.cpu_worker_busy_ms,
+        hybrid.avg_compress_ms(cfg.iters),
+    );
+    let hybrid_gpu_parallelism = worker_parallelism_equiv(
+        hybrid.last_compress_stats.gpu_worker_busy_ms,
+        hybrid.avg_compress_ms(cfg.iters),
+    );
+    let cpu_cpu_chunk_ms = avg_ms(
+        cpu.last_compress_stats.cpu_worker_busy_ms,
+        cpu.last_compress_stats.cpu_worker_chunks,
+    );
+    let cpu_gpu_chunk_ms = avg_ms(
+        cpu.last_compress_stats.gpu_worker_busy_ms,
+        cpu.last_compress_stats.gpu_worker_chunks,
+    );
+    let cpu_gpu_batch_avg_ms = avg_ms(
+        cpu.last_compress_stats.gpu_worker_busy_ms,
+        cpu.last_compress_stats.gpu_batch_count,
+    );
+    let hybrid_cpu_chunk_ms = avg_ms(
+        hybrid.last_compress_stats.cpu_worker_busy_ms,
+        hybrid.last_compress_stats.cpu_worker_chunks,
+    );
+    let hybrid_gpu_chunk_ms = avg_ms(
+        hybrid.last_compress_stats.gpu_worker_busy_ms,
+        hybrid.last_compress_stats.gpu_worker_chunks,
+    );
+    let hybrid_gpu_batch_avg_ms = avg_ms(
+        hybrid.last_compress_stats.gpu_worker_busy_ms,
+        hybrid.last_compress_stats.gpu_batch_count,
+    );
 
     println!(
-        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_worker_chunks={} gpu_worker_chunks={} cpu_steal_chunks={} gpu_batches={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         cpu.avg_compress_ms(cfg.iters),
         cpu.avg_decompress_ms(cfg.iters),
         cpu.compress_mib_s(),
@@ -332,10 +548,23 @@ fn main() {
         cpu.last_compress_stats.write_stage_ms,
         cpu.last_compress_stats.cpu_worker_busy_ms,
         cpu.last_compress_stats.gpu_worker_busy_ms,
+        cpu.last_compress_stats.cpu_queue_lock_wait_ms,
+        cpu.last_compress_stats.gpu_queue_lock_wait_ms,
+        cpu.last_compress_stats.cpu_no_task_events,
+        cpu.last_compress_stats.gpu_no_task_events,
+        cpu.last_compress_stats.cpu_yield_events,
+        cpu.last_compress_stats.gpu_yield_events,
+        cpu_cpu_parallelism,
+        cpu_gpu_parallelism,
         cpu.last_compress_stats.cpu_worker_chunks,
         cpu.last_compress_stats.gpu_worker_chunks,
+        cpu_cpu_chunk_ms,
+        cpu_gpu_chunk_ms,
         cpu.last_compress_stats.cpu_steal_chunks,
         cpu.last_compress_stats.gpu_batch_count,
+        cpu_gpu_batch_avg_ms,
+        cpu.last_compress_stats.initial_gpu_queue_chunks,
+        cpu.last_compress_stats.gpu_steal_reserve_chunks,
         cpu.last_compress_stats.gpu_runtime_disabled,
         cpu.last_decompress_stats.chunk_count,
         cpu.last_decompress_stats.cpu_chunks,
@@ -343,7 +572,7 @@ fn main() {
         cpu.last_decompress_stats.gpu_available,
     );
     println!(
-        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_worker_chunks={} gpu_worker_chunks={} cpu_steal_chunks={} gpu_batches={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
         hybrid.avg_compress_ms(cfg.iters),
         hybrid.avg_decompress_ms(cfg.iters),
         hybrid.compress_mib_s(),
@@ -358,10 +587,23 @@ fn main() {
         hybrid.last_compress_stats.write_stage_ms,
         hybrid.last_compress_stats.cpu_worker_busy_ms,
         hybrid.last_compress_stats.gpu_worker_busy_ms,
+        hybrid.last_compress_stats.cpu_queue_lock_wait_ms,
+        hybrid.last_compress_stats.gpu_queue_lock_wait_ms,
+        hybrid.last_compress_stats.cpu_no_task_events,
+        hybrid.last_compress_stats.gpu_no_task_events,
+        hybrid.last_compress_stats.cpu_yield_events,
+        hybrid.last_compress_stats.gpu_yield_events,
+        hybrid_cpu_parallelism,
+        hybrid_gpu_parallelism,
         hybrid.last_compress_stats.cpu_worker_chunks,
         hybrid.last_compress_stats.gpu_worker_chunks,
+        hybrid_cpu_chunk_ms,
+        hybrid_gpu_chunk_ms,
         hybrid.last_compress_stats.cpu_steal_chunks,
         hybrid.last_compress_stats.gpu_batch_count,
+        hybrid_gpu_batch_avg_ms,
+        hybrid.last_compress_stats.initial_gpu_queue_chunks,
+        hybrid.last_compress_stats.gpu_steal_reserve_chunks,
         hybrid.last_compress_stats.gpu_runtime_disabled,
         hybrid.last_decompress_stats.chunk_count,
         hybrid.last_decompress_stats.cpu_chunks,
