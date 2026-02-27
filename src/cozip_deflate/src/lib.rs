@@ -1,24 +1,11 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::File as StdFile;
 use std::io::{Read, Write};
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use thiserror::Error;
-
-const FRAME_MAGIC: [u8; 4] = *b"CZDF";
-const FRAME_VERSION: u8 = 3;
-const STREAM_MAGIC: [u8; 4] = *b"CZDS";
-const STREAM_VERSION: u8 = 1;
-const STREAM_HEADER_LEN: usize = 8;
-const HEADER_LEN: usize = 22;
-const CHUNK_META_LEN_V3: usize = 11;
-const CHUNK_META_LEN_V2: usize = 10;
-const CHUNK_META_LEN_V1: usize = 9;
-const TRANSFORM_LANES: usize = 2;
 
 const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
@@ -30,11 +17,11 @@ const DEFAULT_TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
 const DEFAULT_STREAM_BATCH_CHUNKS: usize = 0;
 const GPU_DEFLATE_MAX_BITS_PER_BYTE: usize = 12;
 const MAX_DISPATCH_WORKGROUPS_PER_DIM: u32 = 65_535;
+#[cfg(test)]
+const TRANSFORM_LANES: usize = 2;
 
-mod frame;
 mod gpu;
 
-use frame::{encode_frame, parse_frame};
 use gpu::GpuAssist;
 
 #[derive(Debug, Clone)]
@@ -129,38 +116,6 @@ pub struct HybridStats {
     pub gpu_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct CompressedFrame {
-    pub bytes: Vec<u8>,
-    pub stats: HybridStats,
-}
-
-#[derive(Debug, Clone)]
-pub struct DecompressedFrame {
-    pub bytes: Vec<u8>,
-    pub stats: HybridStats,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct StreamOptions {
-    pub frame_input_size: usize,
-}
-
-impl Default for StreamOptions {
-    fn default() -> Self {
-        Self {
-            frame_input_size: 64 * 1024 * 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StreamStats {
-    pub frames: usize,
-    pub input_bytes: usize,
-    pub output_bytes: usize,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CoZipDeflateInitStats {
     pub gpu_context_init_ms: f64,
@@ -202,18 +157,6 @@ impl CoZipDeflate {
         self.init_stats.gpu_context_init_ms
     }
 
-    pub fn compress(&self, input: &[u8]) -> Result<CompressedFrame, CozipDeflateError> {
-        compress_hybrid_with_context(input, &self.options, self.gpu_context.clone())
-    }
-
-    pub fn decompress_on_cpu(&self, frame: &[u8]) -> Result<DecompressedFrame, CozipDeflateError> {
-        decompress_on_cpu_with_context(frame, &self.options)
-    }
-
-    pub fn decompress(&self, frame: &[u8]) -> Result<DecompressedFrame, CozipDeflateError> {
-        self.decompress_on_cpu(frame)
-    }
-
     pub fn deflate_compress_stream_zip_compatible<R: Read, W: Write>(
         &self,
         reader: &mut R,
@@ -226,319 +169,12 @@ impl CoZipDeflate {
             self.gpu_context.clone(),
         )
     }
-
-    pub fn compress_stream<R: Read, W: Write>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        stream_options: StreamOptions,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        if stream_options.frame_input_size == 0 {
-            return Err(CozipDeflateError::InvalidOptions(
-                "stream frame_input_size must be greater than 0",
-            ));
-        }
-
-        writer.write_all(&stream_header_bytes())?;
-        let mut stats = StreamStats {
-            frames: 0,
-            input_bytes: 0,
-            output_bytes: STREAM_HEADER_LEN,
-        };
-
-        let mut buffer = vec![0_u8; stream_options.frame_input_size];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            let compressed = self.compress(&buffer[..read])?;
-            let frame_len = u64::try_from(compressed.bytes.len())
-                .map_err(|_| CozipDeflateError::DataTooLarge)?;
-            writer.write_all(&frame_len.to_le_bytes())?;
-            writer.write_all(&compressed.bytes)?;
-
-            stats.frames += 1;
-            stats.input_bytes = stats.input_bytes.saturating_add(read);
-            stats.output_bytes = stats
-                .output_bytes
-                .saturating_add(std::mem::size_of::<u64>())
-                .saturating_add(compressed.bytes.len());
-        }
-
-        writer.write_all(&0_u64.to_le_bytes())?;
-        writer.flush()?;
-        stats.output_bytes = stats
-            .output_bytes
-            .saturating_add(std::mem::size_of::<u64>());
-        Ok(stats)
-    }
-
-    pub fn decompress_stream<R: Read, W: Write>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let mut header = [0_u8; STREAM_HEADER_LEN];
-        read_exact_frame(reader, &mut header)?;
-        validate_stream_header(&header)?;
-
-        let mut stats = StreamStats {
-            frames: 0,
-            input_bytes: STREAM_HEADER_LEN,
-            output_bytes: 0,
-        };
-        let mut len_buf = [0_u8; std::mem::size_of::<u64>()];
-
-        loop {
-            read_exact_frame(reader, &mut len_buf)?;
-            stats.input_bytes = stats.input_bytes.saturating_add(std::mem::size_of::<u64>());
-
-            let frame_len = u64::from_le_bytes(len_buf);
-            if frame_len == 0 {
-                break;
-            }
-
-            let frame_len_usize =
-                usize::try_from(frame_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
-            let mut frame = vec![0_u8; frame_len_usize];
-            read_exact_frame(reader, &mut frame)?;
-            stats.input_bytes = stats.input_bytes.saturating_add(frame_len_usize);
-
-            let decompressed = self.decompress_on_cpu(&frame)?;
-            writer.write_all(&decompressed.bytes)?;
-            stats.frames += 1;
-            stats.output_bytes = stats.output_bytes.saturating_add(decompressed.bytes.len());
-        }
-
-        writer.flush()?;
-        Ok(stats)
-    }
-
-    pub fn compress_file(
-        &self,
-        input_file: StdFile,
-        output_file: StdFile,
-        stream_options: StreamOptions,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let mut reader = std::io::BufReader::new(input_file);
-        let mut writer = std::io::BufWriter::new(output_file);
-        self.compress_stream(&mut reader, &mut writer, stream_options)
-    }
-
-    pub fn decompress_file(
-        &self,
-        input_file: StdFile,
-        output_file: StdFile,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let mut reader = std::io::BufReader::new(input_file);
-        let mut writer = std::io::BufWriter::new(output_file);
-        self.decompress_stream(&mut reader, &mut writer)
-    }
-
-    pub fn compress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
-        &self,
-        input_path: PIn,
-        output_path: POut,
-        stream_options: StreamOptions,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let input = StdFile::open(input_path)?;
-        let output = StdFile::create(output_path)?;
-        self.compress_file(input, output, stream_options)
-    }
-
-    pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
-        &self,
-        input_path: PIn,
-        output_path: POut,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let input = StdFile::open(input_path)?;
-        let output = StdFile::create(output_path)?;
-        self.decompress_file(input, output)
-    }
-
-    pub async fn compress_file_async(
-        &self,
-        mut input_file: tokio::fs::File,
-        mut output_file: tokio::fs::File,
-        stream_options: StreamOptions,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        if stream_options.frame_input_size == 0 {
-            return Err(CozipDeflateError::InvalidOptions(
-                "stream frame_input_size must be greater than 0",
-            ));
-        }
-
-        output_file.write_all(&stream_header_bytes()).await?;
-        let mut stats = StreamStats {
-            frames: 0,
-            input_bytes: 0,
-            output_bytes: STREAM_HEADER_LEN,
-        };
-
-        let mut buffer = vec![0_u8; stream_options.frame_input_size];
-        loop {
-            let read = input_file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            let compressed = self.compress(&buffer[..read])?;
-            let frame_len = u64::try_from(compressed.bytes.len())
-                .map_err(|_| CozipDeflateError::DataTooLarge)?;
-            output_file.write_all(&frame_len.to_le_bytes()).await?;
-            output_file.write_all(&compressed.bytes).await?;
-
-            stats.frames += 1;
-            stats.input_bytes = stats.input_bytes.saturating_add(read);
-            stats.output_bytes = stats
-                .output_bytes
-                .saturating_add(std::mem::size_of::<u64>())
-                .saturating_add(compressed.bytes.len());
-        }
-
-        output_file.write_all(&0_u64.to_le_bytes()).await?;
-        output_file.flush().await?;
-        stats.output_bytes = stats
-            .output_bytes
-            .saturating_add(std::mem::size_of::<u64>());
-        Ok(stats)
-    }
-
-    pub async fn decompress_file_async(
-        &self,
-        mut input_file: tokio::fs::File,
-        mut output_file: tokio::fs::File,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut header = [0_u8; STREAM_HEADER_LEN];
-        read_exact_frame_async(&mut input_file, &mut header).await?;
-        validate_stream_header(&header)?;
-
-        let mut stats = StreamStats {
-            frames: 0,
-            input_bytes: STREAM_HEADER_LEN,
-            output_bytes: 0,
-        };
-        let mut len_buf = [0_u8; std::mem::size_of::<u64>()];
-
-        loop {
-            read_exact_frame_async(&mut input_file, &mut len_buf).await?;
-            stats.input_bytes = stats.input_bytes.saturating_add(std::mem::size_of::<u64>());
-
-            let frame_len = u64::from_le_bytes(len_buf);
-            if frame_len == 0 {
-                break;
-            }
-
-            let frame_len_usize =
-                usize::try_from(frame_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
-            let mut frame = vec![0_u8; frame_len_usize];
-            read_exact_frame_async(&mut input_file, &mut frame).await?;
-            stats.input_bytes = stats.input_bytes.saturating_add(frame_len_usize);
-
-            let decompressed = self.decompress_on_cpu(&frame)?;
-            output_file.write_all(&decompressed.bytes).await?;
-            stats.frames += 1;
-            stats.output_bytes = stats.output_bytes.saturating_add(decompressed.bytes.len());
-        }
-
-        output_file.flush().await?;
-        Ok(stats)
-    }
-
-    pub async fn compress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
-        &self,
-        input_path: PIn,
-        output_path: POut,
-        stream_options: StreamOptions,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let input = tokio::fs::File::open(input_path).await?;
-        let output = tokio::fs::File::create(output_path).await?;
-        self.compress_file_async(input, output, stream_options)
-            .await
-    }
-
-    pub async fn decompress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
-        &self,
-        input_path: PIn,
-        output_path: POut,
-    ) -> Result<StreamStats, CozipDeflateError> {
-        let input = tokio::fs::File::open(input_path).await?;
-        let output = tokio::fs::File::create(output_path).await?;
-        self.decompress_file_async(input, output).await
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkBackend {
     Cpu,
     GpuAssisted,
-}
-
-impl ChunkBackend {
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::Cpu => 0,
-            Self::GpuAssisted => 1,
-        }
-    }
-
-    fn from_u8(value: u8) -> Result<Self, CozipDeflateError> {
-        match value {
-            0 => Ok(Self::Cpu),
-            1 => Ok(Self::GpuAssisted),
-            _ => Err(CozipDeflateError::InvalidFrame("unknown backend id")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkTransform {
-    None,
-    EvenOdd,
-}
-
-impl ChunkTransform {
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::None => 0,
-            Self::EvenOdd => 1,
-        }
-    }
-
-    fn from_u8(value: u8) -> Result<Self, CozipDeflateError> {
-        match value {
-            0 => Ok(Self::None),
-            1 => Ok(Self::EvenOdd),
-            _ => Err(CozipDeflateError::InvalidFrame("unknown transform id")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkCodec {
-    DeflateCpu,
-    DeflateGpuFast,
-}
-
-impl ChunkCodec {
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::DeflateCpu => 0,
-            Self::DeflateGpuFast => 1,
-        }
-    }
-
-    fn from_u8(value: u8) -> Result<Self, CozipDeflateError> {
-        match value {
-            0 => Ok(Self::DeflateCpu),
-            1 => Ok(Self::DeflateGpuFast),
-            _ => Err(CozipDeflateError::InvalidFrame("unknown codec id")),
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -557,12 +193,6 @@ pub enum CozipDeflateError {
     GpuExecution(String),
     #[error("internal error: {0}")]
     Internal(&'static str),
-}
-
-fn maybe_warn_deep_profile_enabled(options: &HybridOptions) {
-    if options.profile_timing_deep && !options.profile_timing {
-        eprintln!("[cozip][warn] profile_timing_deep=true ignored because profile_timing=false");
-    }
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -590,7 +220,6 @@ fn accumulate_write_stage_metrics(
 #[derive(Debug, Clone)]
 struct ChunkTask {
     index: usize,
-    preferred_gpu: bool,
     raw: Vec<u8>,
 }
 
@@ -598,8 +227,6 @@ struct ChunkTask {
 struct ChunkMember {
     index: usize,
     backend: ChunkBackend,
-    transform: ChunkTransform,
-    codec: ChunkCodec,
     raw_len: u32,
     layout: Option<DeflateStreamLayout>,
     compressed: Vec<u8>,
@@ -668,22 +295,6 @@ impl WorkerCounters {
             gpu_steal_reserve_chunks: 0,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct DecodedChunk {
-    index: usize,
-    raw: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct ChunkDescriptor {
-    index: usize,
-    backend: ChunkBackend,
-    transform: ChunkTransform,
-    codec: ChunkCodec,
-    raw_len: u32,
-    compressed: Vec<u8>,
 }
 
 fn workgroup_count(items: usize, group_size: usize) -> Result<u32, CozipDeflateError> {
@@ -1704,12 +1315,6 @@ fn is_gpu_requested(options: &HybridOptions) -> bool {
     options.prefer_gpu
 }
 
-fn has_gpu_eligible_task(tasks: &[ChunkTask], options: &HybridOptions) -> bool {
-    tasks
-        .iter()
-        .any(|task| task.raw.len() >= options.gpu_min_chunk_size)
-}
-
 pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1850,7 +1455,6 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
 
             let task = ChunkTask {
                 index: next_read_index,
-                preferred_gpu: false,
                 raw,
             };
             next_read_index = next_read_index.saturating_add(1);
@@ -2315,398 +1919,6 @@ impl<W: Write> Write for HashingCountWriter<'_, W> {
     }
 }
 
-pub fn compress_hybrid(
-    input: &[u8],
-    options: &HybridOptions,
-) -> Result<CompressedFrame, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.compress(input)
-}
-
-fn compress_hybrid_with_context(
-    input: &[u8],
-    options: &HybridOptions,
-    gpu_context: Option<Arc<GpuAssist>>,
-) -> Result<CompressedFrame, CozipDeflateError> {
-    maybe_warn_deep_profile_enabled(options);
-    validate_options(options)?;
-
-    if input.is_empty() {
-        return Ok(CompressedFrame {
-            bytes: encode_frame(0, &[])?,
-            stats: HybridStats {
-                chunk_count: 0,
-                cpu_chunks: 0,
-                gpu_chunks: 0,
-                gpu_available: false,
-                cpu_bytes: 0,
-                gpu_bytes: 0,
-            },
-        });
-    }
-
-    let gpu_requested = is_gpu_requested(options);
-    let gpu_available = gpu_context.is_some();
-    let tasks = build_chunk_tasks(input, options, gpu_requested && gpu_available)?;
-    let has_gpu_tasks = gpu_available && gpu_requested && has_gpu_eligible_task(&tasks, options);
-    if has_gpu_tasks {
-        return compress_hybrid_work_stealing_scheduler(input.len(), tasks, options, gpu_context);
-    }
-
-    let chunk_count = tasks.len();
-    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
-    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
-    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
-
-    let cpu_workers = cpu_worker_count(false);
-    let mut handles = Vec::new();
-
-    for _ in 0..cpu_workers {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-
-        handles.push(std::thread::spawn(move || {
-            compress_cpu_worker(queue_ref, result_ref, err_ref, &opts, None)
-        }));
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    if let Some(err) = lock(&error)?.take() {
-        return Err(err);
-    }
-
-    let mut chunks = Vec::new();
-    for item in lock(&results)?.drain(..) {
-        let member = item.ok_or(CozipDeflateError::Internal("missing compressed chunk"))?;
-        chunks.push(member);
-    }
-    chunks.sort_by_key(|chunk| chunk.index);
-
-    let stats = summarize_encoded_chunks(&chunks, false);
-    let frame = encode_frame(input.len(), &chunks)?;
-
-    Ok(CompressedFrame {
-        bytes: frame,
-        stats,
-    })
-}
-
-fn compress_hybrid_work_stealing_scheduler(
-    original_len: usize,
-    tasks: Vec<ChunkTask>,
-    options: &HybridOptions,
-    gpu_context: Option<Arc<GpuAssist>>,
-) -> Result<CompressedFrame, CozipDeflateError> {
-    let chunk_count = tasks.len();
-    let gpu_available = gpu_context.is_some();
-    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
-    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
-    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
-
-    let cpu_workers = cpu_worker_count(gpu_available);
-    let mut handles = Vec::new();
-
-    let total_task_count = chunk_count;
-    for _ in 0..cpu_workers {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-        handles.push(std::thread::spawn(move || {
-            compress_cpu_worker_global_local(queue_ref, result_ref, err_ref, &opts, None)
-        }));
-    }
-
-    if let Some(gpu) = gpu_context {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-        handles.push(std::thread::spawn(move || {
-            compress_gpu_worker_global_local(
-                queue_ref,
-                result_ref,
-                err_ref,
-                &opts,
-                gpu,
-                total_task_count,
-                None,
-            )
-        }));
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    if let Some(err) = lock(&error)?.take() {
-        return Err(err);
-    }
-
-    let mut chunks = Vec::new();
-    for item in lock(&results)?.drain(..) {
-        let member = item.ok_or(CozipDeflateError::Internal("missing compressed chunk"))?;
-        chunks.push(member);
-    }
-    chunks.sort_by_key(|chunk| chunk.index);
-
-    let stats = summarize_encoded_chunks(&chunks, gpu_available);
-    let frame = encode_frame(original_len, &chunks)?;
-
-    Ok(CompressedFrame {
-        bytes: frame,
-        stats,
-    })
-}
-
-pub fn decompress_on_cpu(
-    frame: &[u8],
-    options: &HybridOptions,
-) -> Result<DecompressedFrame, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.decompress_on_cpu(frame)
-}
-
-pub fn decompress_hybrid(
-    frame: &[u8],
-    options: &HybridOptions,
-) -> Result<DecompressedFrame, CozipDeflateError> {
-    decompress_on_cpu(frame, options)
-}
-
-pub fn compress_stream<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    options: &HybridOptions,
-    stream_options: StreamOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.compress_stream(reader, writer, stream_options)
-}
-
-pub fn decompress_stream<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    options: &HybridOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.decompress_stream(reader, writer)
-}
-
-pub fn compress_file(
-    input_file: StdFile,
-    output_file: StdFile,
-    options: &HybridOptions,
-    stream_options: StreamOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.compress_file(input_file, output_file, stream_options)
-}
-
-pub fn decompress_file(
-    input_file: StdFile,
-    output_file: StdFile,
-    options: &HybridOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.decompress_file(input_file, output_file)
-}
-
-pub fn compress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
-    input_path: PIn,
-    output_path: POut,
-    options: &HybridOptions,
-    stream_options: StreamOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.compress_file_from_name(input_path, output_path, stream_options)
-}
-
-pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
-    input_path: PIn,
-    output_path: POut,
-    options: &HybridOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.decompress_file_from_name(input_path, output_path)
-}
-
-pub async fn compress_file_async(
-    input_file: tokio::fs::File,
-    output_file: tokio::fs::File,
-    options: &HybridOptions,
-    stream_options: StreamOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip
-        .compress_file_async(input_file, output_file, stream_options)
-        .await
-}
-
-pub async fn decompress_file_async(
-    input_file: tokio::fs::File,
-    output_file: tokio::fs::File,
-    options: &HybridOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip.decompress_file_async(input_file, output_file).await
-}
-
-pub async fn compress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
-    input_path: PIn,
-    output_path: POut,
-    options: &HybridOptions,
-    stream_options: StreamOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip
-        .compress_file_from_name_async(input_path, output_path, stream_options)
-        .await
-}
-
-pub async fn decompress_file_from_name_async<PIn: AsRef<Path>, POut: AsRef<Path>>(
-    input_path: PIn,
-    output_path: POut,
-    options: &HybridOptions,
-) -> Result<StreamStats, CozipDeflateError> {
-    let cozip = CoZipDeflate::init(options.clone())?;
-    cozip
-        .decompress_file_from_name_async(input_path, output_path)
-        .await
-}
-
-fn stream_header_bytes() -> [u8; STREAM_HEADER_LEN] {
-    let mut header = [0_u8; STREAM_HEADER_LEN];
-    header[0..4].copy_from_slice(&STREAM_MAGIC);
-    header[4] = STREAM_VERSION;
-    header
-}
-
-fn validate_stream_header(header: &[u8; STREAM_HEADER_LEN]) -> Result<(), CozipDeflateError> {
-    if &header[0..4] != STREAM_MAGIC.as_slice() {
-        return Err(CozipDeflateError::InvalidFrame("invalid stream magic"));
-    }
-    if header[4] != STREAM_VERSION {
-        return Err(CozipDeflateError::InvalidFrame(
-            "unsupported stream version",
-        ));
-    }
-    Ok(())
-}
-
-fn read_exact_frame<R: Read>(reader: &mut R, out: &mut [u8]) -> Result<(), CozipDeflateError> {
-    let mut offset = 0usize;
-    while offset < out.len() {
-        match reader.read(&mut out[offset..]) {
-            Ok(0) => return Err(CozipDeflateError::InvalidFrame("truncated stream")),
-            Ok(read) => {
-                offset += read;
-            }
-            Err(err) => return Err(CozipDeflateError::Io(err)),
-        }
-    }
-    Ok(())
-}
-
-async fn read_exact_frame_async<R>(reader: &mut R, out: &mut [u8]) -> Result<(), CozipDeflateError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut offset = 0usize;
-    while offset < out.len() {
-        match reader.read(&mut out[offset..]).await {
-            Ok(0) => return Err(CozipDeflateError::InvalidFrame("truncated stream")),
-            Ok(read) => {
-                offset += read;
-            }
-            Err(err) => return Err(CozipDeflateError::Io(err)),
-        }
-    }
-    Ok(())
-}
-
-fn decompress_on_cpu_with_context(
-    frame: &[u8],
-    options: &HybridOptions,
-) -> Result<DecompressedFrame, CozipDeflateError> {
-    validate_options(options)?;
-
-    let (original_len, descriptors) = parse_frame(frame)?;
-    if descriptors.is_empty() {
-        return Ok(DecompressedFrame {
-            bytes: Vec::new(),
-            stats: HybridStats {
-                chunk_count: 0,
-                cpu_chunks: 0,
-                gpu_chunks: 0,
-                gpu_available: false,
-                cpu_bytes: 0,
-                gpu_bytes: 0,
-            },
-        });
-    }
-
-    let queue = Arc::new(Mutex::new(VecDeque::from(descriptors)));
-    let chunk_count = lock(&queue)?.len();
-    let results = Arc::new(Mutex::new(vec![None; chunk_count]));
-    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
-
-    let cpu_workers = cpu_worker_count(false);
-    let mut handles = Vec::new();
-
-    for _ in 0..cpu_workers {
-        let queue_ref = Arc::clone(&queue);
-        let result_ref = Arc::clone(&results);
-        let err_ref = Arc::clone(&error);
-        let opts = options.clone();
-
-        handles.push(std::thread::spawn(move || {
-            decompress_worker_on_cpu(queue_ref, result_ref, err_ref, &opts)
-        }));
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    if let Some(err) = lock(&error)?.take() {
-        return Err(err);
-    }
-
-    let mut decoded = Vec::with_capacity(original_len);
-    let mut cpu_bytes = 0usize;
-    for item in lock(&results)?.drain(..) {
-        let chunk = item.ok_or(CozipDeflateError::Internal("missing decompressed chunk"))?;
-        cpu_bytes = cpu_bytes.saturating_add(chunk.raw.len());
-        decoded.extend_from_slice(&chunk.raw);
-    }
-
-    if decoded.len() != original_len {
-        return Err(CozipDeflateError::InvalidFrame(
-            "decoded size does not match frame header",
-        ));
-    }
-
-    Ok(DecompressedFrame {
-        bytes: decoded,
-        stats: HybridStats {
-            chunk_count,
-            cpu_chunks: chunk_count,
-            gpu_chunks: 0,
-            gpu_available: false,
-            cpu_bytes,
-            gpu_bytes: 0,
-        },
-    })
-}
-
 fn cpu_worker_count(has_gpu: bool) -> usize {
     let available = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -2951,289 +2163,12 @@ fn dump_gpu_dynamic_bad_chunk(
     let _ = std::fs::write(meta_path, meta);
 }
 
-fn build_chunk_tasks(
-    input: &[u8],
-    options: &HybridOptions,
-    gpu_available: bool,
-) -> Result<Vec<ChunkTask>, CozipDeflateError> {
-    let mut tasks: Vec<ChunkTask> = input
-        .chunks(options.chunk_size)
-        .enumerate()
-        .map(|(index, raw)| ChunkTask {
-            index,
-            preferred_gpu: false,
-            raw: raw.to_vec(),
-        })
-        .collect();
-
-    mark_gpu_preference(&mut tasks, options, gpu_available)?;
-    Ok(tasks)
-}
-
-fn mark_gpu_preference(
-    tasks: &mut [ChunkTask],
-    _options: &HybridOptions,
-    _gpu_available: bool,
-) -> Result<(), CozipDeflateError> {
-    for task in tasks.iter_mut() {
-        task.preferred_gpu = false;
-    }
-
-    Ok(())
-}
-
-fn summarize_encoded_chunks(chunks: &[ChunkMember], gpu_available: bool) -> HybridStats {
-    let mut stats = HybridStats {
-        chunk_count: chunks.len(),
-        cpu_chunks: 0,
-        gpu_chunks: 0,
-        gpu_available,
-        cpu_bytes: 0,
-        gpu_bytes: 0,
-    };
-
-    for chunk in chunks {
-        match chunk.backend {
-            ChunkBackend::Cpu => {
-                stats.cpu_chunks += 1;
-                stats.cpu_bytes += chunk.raw_len as usize;
-            }
-            ChunkBackend::GpuAssisted => {
-                stats.gpu_chunks += 1;
-                stats.gpu_bytes += chunk.raw_len as usize;
-            }
-        }
-    }
-
-    stats
-}
-
-fn compress_cpu_worker_global_local(
-    queue: Arc<Mutex<VecDeque<ChunkTask>>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    options: &HybridOptions,
-    counters: Option<Arc<WorkerCounters>>,
-) {
-    loop {
-        if has_error(&error) {
-            break;
-        }
-
-        let task = (|| -> Result<Option<ChunkTask>, CozipDeflateError> {
-            let lock_start = Instant::now();
-            let mut guard = lock(&queue)?;
-            if let Some(counters) = &counters {
-                counters
-                    .cpu_queue_lock_wait_ns
-                    .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            Ok(guard.pop_front())
-        })();
-        let Some(task) = (match task {
-            Ok(value) => value,
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
-        }) else {
-            if let Some(counters) = &counters {
-                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
-            }
-            break;
-        };
-
-        let start = Instant::now();
-        match compress_chunk_cpu(task, options.compression_level) {
-            Ok(encoded) => {
-                if let Some(counters) = &counters {
-                    let nanos = start.elapsed().as_nanos() as u64;
-                    counters.cpu_busy_ns.fetch_add(nanos, Ordering::Relaxed);
-                    counters.cpu_chunks.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Err(err) = store_encoded_result(&results, encoded) {
-                    set_error(&error, err);
-                    break;
-                }
-            }
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
-        }
-    }
-}
-
-fn compress_gpu_worker_global_local(
-    queue: Arc<Mutex<VecDeque<ChunkTask>>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    options: &HybridOptions,
-    gpu: Arc<GpuAssist>,
-    total_task_count: usize,
-    counters: Option<Arc<WorkerCounters>>,
-) {
-    let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
-    let mut local_batch = Vec::with_capacity(batch_limit);
-
-    loop {
-        if has_error(&error) {
-            break;
-        }
-
-        if local_batch.is_empty() {
-            let refill = (|| -> Result<(), CozipDeflateError> {
-                let lock_start = Instant::now();
-                let mut guard = lock(&queue)?;
-                if let Some(counters) = &counters {
-                    counters
-                        .gpu_queue_lock_wait_ns
-                        .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                }
-                if should_stop_gpu_tail_pop(
-                    total_task_count,
-                    guard.len(),
-                    options.gpu_tail_stop_ratio,
-                ) {
-                    return Ok(());
-                }
-                local_batch = pop_front_batch_tasks(&mut guard, batch_limit);
-                Ok(())
-            })();
-            if let Err(err) = refill {
-                set_error(&error, err);
-                break;
-            }
-        }
-
-        if local_batch.is_empty() {
-            if let Some(counters) = &counters {
-                counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
-            }
-            break;
-        }
-
-        let tasks = std::mem::take(&mut local_batch);
-        let batch_start = Instant::now();
-        let encoded_batch = match compress_chunk_gpu_batch(&tasks, options, &gpu) {
-            Ok(value) => value,
-            Err(_) => {
-                let mut fallback = Vec::with_capacity(tasks.len());
-                for task in tasks {
-                    match compress_chunk_cpu(task, options.compression_level) {
-                        Ok(value) => fallback.push(value),
-                        Err(err) => {
-                            set_error(&error, err);
-                            return;
-                        }
-                    }
-                }
-                fallback
-            }
-        };
-
-        if let Some(counters) = &counters {
-            let nanos = batch_start.elapsed().as_nanos() as u64;
-            counters.gpu_busy_ns.fetch_add(nanos, Ordering::Relaxed);
-            counters.gpu_batches.fetch_add(1, Ordering::Relaxed);
-            let gpu_chunks = encoded_batch
-                .iter()
-                .filter(|chunk| chunk.backend == ChunkBackend::GpuAssisted)
-                .count();
-            counters.gpu_chunks.fetch_add(gpu_chunks, Ordering::Relaxed);
-            let cpu_chunks = encoded_batch.len().saturating_sub(gpu_chunks);
-            counters.cpu_chunks.fetch_add(cpu_chunks, Ordering::Relaxed);
-        }
-
-        for value in encoded_batch {
-            if let Err(err) = store_encoded_result(&results, value) {
-                set_error(&error, err);
-                break;
-            }
-        }
-
-        if has_error(&error) {
-            break;
-        }
-    }
-}
-
 fn should_stop_gpu_tail_pop(total_task_count: usize, queue_remaining: usize, ratio: f32) -> bool {
     if ratio >= 1.0 || total_task_count == 0 {
         return false;
     }
     let completed = total_task_count.saturating_sub(queue_remaining);
     (completed as f32 / total_task_count as f32) >= ratio
-}
-
-fn compress_cpu_worker(
-    queue: Arc<Mutex<VecDeque<ChunkTask>>>,
-    results: Arc<Mutex<Vec<Option<ChunkMember>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    options: &HybridOptions,
-    counters: Option<Arc<WorkerCounters>>,
-) {
-    loop {
-        if has_error(&error) {
-            break;
-        }
-
-        let task = {
-            let lock_start = Instant::now();
-            let mut guard = match lock(&queue) {
-                Ok(value) => value,
-                Err(err) => {
-                    set_error(&error, err);
-                    break;
-                }
-            };
-            if let Some(counters) = &counters {
-                counters
-                    .cpu_queue_lock_wait_ns
-                    .fetch_add(lock_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            guard.pop_front()
-        };
-
-        let Some(task) = task else {
-            if let Some(counters) = &counters {
-                counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
-            }
-            break;
-        };
-
-        let start = Instant::now();
-        match compress_chunk_cpu(task, options.compression_level) {
-            Ok(encoded) => {
-                if let Some(counters) = &counters {
-                    let nanos = start.elapsed().as_nanos() as u64;
-                    counters.cpu_busy_ns.fetch_add(nanos, Ordering::Relaxed);
-                    counters.cpu_chunks.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Err(err) = store_encoded_result(&results, encoded) {
-                    set_error(&error, err);
-                    break;
-                }
-            }
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
-        }
-    }
-}
-
-fn pop_front_batch_tasks(
-    queue: &mut VecDeque<ChunkTask>,
-    max_batch_chunks: usize,
-) -> Vec<ChunkTask> {
-    let mut tasks = Vec::with_capacity(max_batch_chunks.max(1));
-    let batch_limit = max_batch_chunks.max(1);
-    while tasks.len() < batch_limit {
-        let Some(task) = queue.pop_front() else { break };
-        tasks.push(task);
-    }
-    tasks
 }
 
 fn compress_chunk_gpu_batch(
@@ -3262,11 +2197,6 @@ fn compress_chunk_gpu_batch(
         } else {
             ChunkBackend::Cpu
         };
-        let mut codec = if encoded.used_gpu {
-            ChunkCodec::DeflateGpuFast
-        } else {
-            ChunkCodec::DeflateCpu
-        };
         let mut compressed = encoded.compressed;
         let mut layout = encoded.end_bit.map(|end_bit| DeflateStreamLayout {
             final_header_bit: 0,
@@ -3279,15 +2209,12 @@ fn compress_chunk_gpu_batch(
         {
             compressed = deflate_compress_cpu(&task.raw, options.compression_level)?;
             backend = ChunkBackend::Cpu;
-            codec = ChunkCodec::DeflateCpu;
             layout = Some(parse_deflate_stream_layout(&compressed)?);
         }
 
         let member = ChunkMember {
             index: task.index,
             backend,
-            transform: ChunkTransform::None,
-            codec,
             raw_len,
             layout,
             compressed,
@@ -3296,45 +2223,6 @@ fn compress_chunk_gpu_batch(
     }
 
     Ok(out)
-}
-
-fn decompress_worker_on_cpu(
-    queue: Arc<Mutex<VecDeque<ChunkDescriptor>>>,
-    results: Arc<Mutex<Vec<Option<DecodedChunk>>>>,
-    error: Arc<Mutex<Option<CozipDeflateError>>>,
-    options: &HybridOptions,
-) {
-    loop {
-        if has_error(&error) {
-            break;
-        }
-
-        let descriptor = {
-            let mut guard = match lock(&queue) {
-                Ok(value) => value,
-                Err(err) => {
-                    set_error(&error, err);
-                    break;
-                }
-            };
-            pop_cpu_descriptor(&mut guard)
-        };
-
-        let Some(descriptor) = descriptor else { break };
-
-        match decode_descriptor_on_cpu(descriptor, options) {
-            Ok(decoded) => {
-                if let Err(err) = store_decoded_result(&results, decoded) {
-                    set_error(&error, err);
-                    break;
-                }
-            }
-            Err(err) => {
-                set_error(&error, err);
-                break;
-            }
-        }
-    }
 }
 
 fn has_error(error: &Mutex<Option<CozipDeflateError>>) -> bool {
@@ -3349,10 +2237,6 @@ fn set_error(error: &Mutex<Option<CozipDeflateError>>, value: CozipDeflateError)
     }
 }
 
-fn pop_cpu_descriptor(queue: &mut VecDeque<ChunkDescriptor>) -> Option<ChunkDescriptor> {
-    queue.pop_front()
-}
-
 fn compress_chunk_cpu(
     task: ChunkTask,
     compression_level: u32,
@@ -3362,59 +2246,13 @@ fn compress_chunk_cpu(
     Ok(ChunkMember {
         index: task.index,
         backend: ChunkBackend::Cpu,
-        transform: ChunkTransform::None,
-        codec: ChunkCodec::DeflateCpu,
         raw_len: u32::try_from(task.raw.len()).map_err(|_| CozipDeflateError::DataTooLarge)?,
         layout: Some(layout),
         compressed,
     })
 }
 
-fn decode_deflate_by_codec(
-    codec: ChunkCodec,
-    compressed: &[u8],
-) -> Result<Vec<u8>, CozipDeflateError> {
-    match codec {
-        ChunkCodec::DeflateCpu | ChunkCodec::DeflateGpuFast => {
-            deflate_decompress_on_cpu(compressed)
-        }
-    }
-}
-
-fn decode_descriptor_on_cpu(
-    descriptor: ChunkDescriptor,
-    options: &HybridOptions,
-) -> Result<DecodedChunk, CozipDeflateError> {
-    let inflated = decode_deflate_by_codec(descriptor.codec, &descriptor.compressed)?;
-
-    let raw = match descriptor.transform {
-        ChunkTransform::None => inflated,
-        ChunkTransform::EvenOdd => {
-            even_odd_transform_cpu(&inflated, options.gpu_subchunk_size, true)
-        }
-    };
-
-    if raw.len() != descriptor.raw_len as usize {
-        eprintln!(
-            "[cozip][error] cpu_decode_len_mismatch index={} backend={:?} codec={:?} raw_len={} decoded_len={} compressed_len={}",
-            descriptor.index,
-            descriptor.backend,
-            descriptor.codec,
-            descriptor.raw_len,
-            raw.len(),
-            descriptor.compressed.len(),
-        );
-        return Err(CozipDeflateError::InvalidFrame(
-            "raw chunk length mismatch in cpu path",
-        ));
-    }
-
-    Ok(DecodedChunk {
-        index: descriptor.index,
-        raw,
-    })
-}
-
+#[cfg(test)]
 fn even_odd_transform_cpu(data: &[u8], block_size: usize, inverse: bool) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -3804,42 +2642,6 @@ fn build_dynamic_huffman_plan(
         eob_code,
         eob_bits,
     })
-}
-
-fn store_encoded_result(
-    results: &Mutex<Vec<Option<ChunkMember>>>,
-    encoded: ChunkMember,
-) -> Result<(), CozipDeflateError> {
-    let mut guard = lock(results)?;
-    let index = encoded.index;
-    let slot = guard
-        .get_mut(index)
-        .ok_or(CozipDeflateError::Internal("compressed index out of range"))?;
-
-    if slot.is_some() {
-        return Err(CozipDeflateError::Internal("duplicate compressed index"));
-    }
-
-    *slot = Some(encoded);
-    Ok(())
-}
-
-fn store_decoded_result(
-    results: &Mutex<Vec<Option<DecodedChunk>>>,
-    decoded: DecodedChunk,
-) -> Result<(), CozipDeflateError> {
-    let mut guard = lock(results)?;
-    let index = decoded.index;
-    let slot = guard
-        .get_mut(index)
-        .ok_or(CozipDeflateError::Internal("decoded index out of range"))?;
-
-    if slot.is_some() {
-        return Err(CozipDeflateError::Internal("duplicate decoded index"));
-    }
-
-    *slot = Some(decoded);
-    Ok(())
 }
 
 #[cfg(test)]
