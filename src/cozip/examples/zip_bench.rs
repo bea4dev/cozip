@@ -273,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             compression_level: args.level,
             deflate_mode: args.engine,
         },
-    });
+    })?;
 
     println!(
         "cozip zip bench\ninput={} mode={:?} engine={:?} output={} level={} warmups={} runs={} async={}",
