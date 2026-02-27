@@ -174,3 +174,126 @@ fn write_chunk_bits_with_final_override_handles_nonzero_final_bit_position() {
         );
     }
 }
+
+#[test]
+fn czdi_v1_roundtrip() {
+    let index = DeflateChunkIndex {
+        chunk_size: 4 * 1024 * 1024,
+        chunk_count: 3,
+        uncompressed_size: 12 * 1024 * 1024,
+        compressed_size: 4 * 1024 * 1024,
+        entries: vec![
+            DeflateChunkIndexEntry {
+                comp_bit_off: 0,
+                comp_bit_len: 1_234,
+                final_header_rel_bit: 5,
+                raw_len: 4 * 1024 * 1024,
+            },
+            DeflateChunkIndexEntry {
+                comp_bit_off: 1_300,
+                comp_bit_len: 1_456,
+                final_header_rel_bit: 3,
+                raw_len: 4 * 1024 * 1024,
+            },
+            DeflateChunkIndexEntry {
+                comp_bit_off: 2_900,
+                comp_bit_len: 1_111,
+                final_header_rel_bit: 2,
+                raw_len: 4 * 1024 * 1024,
+            },
+        ],
+    };
+
+    let encoded = index.encode_czdi_v1().expect("encode should succeed");
+    let decoded = DeflateChunkIndex::decode_czdi_v1(&encoded).expect("decode should succeed");
+    assert_eq!(decoded, index);
+}
+
+#[test]
+fn czdi_v1_detects_crc_corruption() {
+    let index = DeflateChunkIndex {
+        chunk_size: 1024,
+        chunk_count: 1,
+        uncompressed_size: 100,
+        compressed_size: 80,
+        entries: vec![DeflateChunkIndexEntry {
+            comp_bit_off: 0,
+            comp_bit_len: 80,
+            final_header_rel_bit: 0,
+            raw_len: 100,
+        }],
+    };
+    let mut encoded = index.encode_czdi_v1().expect("encode should succeed");
+    let last = encoded.len() - 1;
+    encoded[last] ^= 0x80;
+    let err =
+        DeflateChunkIndex::decode_czdi_v1(&encoded).expect_err("corruption should be detected");
+    assert!(matches!(err, CozipDeflateError::InvalidFrame(_)));
+}
+
+#[test]
+fn indexed_cpu_decompress_roundtrip() {
+    let input = bench_mixed_data(6 * 1024 * 1024 + 123);
+    let options = HybridOptions {
+        chunk_size: 4 * 1024 * 1024,
+        stream_batch_chunks: 0,
+        prefer_gpu: false,
+        compression_mode: CompressionMode::Ratio,
+        scheduler_policy: HybridSchedulerPolicy::GlobalQueueLocalBuffers,
+        ..HybridOptions::default()
+    };
+    let cozip = CoZipDeflate::init(options).expect("init should succeed");
+
+    let mut src = std::io::Cursor::new(input.clone());
+    let mut compressed = Vec::new();
+    let result = cozip
+        .deflate_compress_stream_zip_compatible_with_index(&mut src, &mut compressed)
+        .expect("compression with index should succeed");
+    let index = result.index.expect("index should exist");
+
+    let mut decoded = Vec::new();
+    let mut comp_reader = std::io::Cursor::new(compressed);
+    let stats = deflate_decompress_stream_indexed_on_cpu(&mut comp_reader, &mut decoded, &index)
+        .expect("indexed cpu decompression should succeed");
+
+    assert_eq!(decoded, input);
+    assert_eq!(
+        stats.chunk_count,
+        usize::try_from(index.chunk_count).unwrap_or(0)
+    );
+    assert_eq!(stats.cpu_chunks, stats.chunk_count);
+    assert_eq!(stats.gpu_chunks, 0);
+}
+
+#[test]
+fn indexed_hybrid_decode_is_cpu_only_even_if_gpu_requested() {
+    let input = bench_mixed_data(1024 * 1024 + 7);
+    let mut src = std::io::Cursor::new(input);
+    let mut compressed = Vec::new();
+    let result =
+        deflate_compress_stream_hybrid_zip_compatible_with_index(&mut src, &mut compressed, 6)
+            .expect("compression with index should succeed");
+    let index = result.index.expect("index should exist");
+
+    let options = HybridOptions::default();
+    let mut comp_reader = std::io::Cursor::new(compressed);
+    let mut decoded = Vec::new();
+    let stats = deflate_decompress_stream_hybrid_indexed(
+        &mut comp_reader,
+        &mut decoded,
+        &index,
+        &options,
+    )
+    .expect("hybrid indexed decode should succeed on cpu");
+    assert_eq!(
+        decoded.len(),
+        usize::try_from(index.uncompressed_size).unwrap_or(0)
+    );
+    assert_eq!(
+        stats.chunk_count,
+        usize::try_from(index.chunk_count).unwrap_or(0)
+    );
+    assert!(!stats.gpu_available);
+    assert_eq!(stats.gpu_chunks, 0);
+    assert_eq!(stats.cpu_chunks, stats.chunk_count);
+}

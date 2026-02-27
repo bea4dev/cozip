@@ -14,6 +14,7 @@ GPU_SUBCHUNK_KIB=512
 TOKEN_FINALIZE_SEGMENT_SIZE=4096
 GPU_SLOTS=6
 GPU_BATCH_CHUNKS=""
+DECOMP_GPU_BATCH_CHUNKS=0
 GPU_SUBMIT_CHUNKS=3
 STREAM_PIPELINE_DEPTH=3
 STREAM_BATCH_CHUNKS=0
@@ -44,6 +45,7 @@ Options:
   --token-finalize-segment-size <N>  Token finalize segment size (default: 4096)
   --gpu-slots <N>          GPU slot/batch count (default: 6)
   --gpu-batch-chunks <N>   GPU dequeue batch size (default: same as --gpu-slots)
+  --decomp-gpu-batch-chunks <N> Decode-side GPU dequeue batch size (0: unlimited, default: 0)
   --gpu-submit-chunks <N>  GPU submit group size (default: 3)
   --stream-pipeline-depth <N>  Stream prepare pipeline depth (default: 3)
   --stream-batch-chunks <N>    Fixed to 0 (legacy batch mode removed)
@@ -153,6 +155,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --gpu-batch-chunks)
       GPU_BATCH_CHUNKS="$2"
+      shift 2
+      ;;
+    --decomp-gpu-batch-chunks)
+      DECOMP_GPU_BATCH_CHUNKS="$2"
       shift 2
       ;;
     --gpu-submit-chunks)
@@ -290,7 +296,7 @@ for mode in "${MODE_LIST[@]}"; do
     echo "# cozip bench log"
     echo "timestamp=${TS}"
     echo "mode=${mode}"
-    echo "size_mib=${SIZE_MIB} runs=${RUNS} iters=${ITERS} warmups=${WARMUPS} chunk_mib=${CHUNK_MIB} gpu_subchunk_kib=${GPU_SUBCHUNK_KIB} token_finalize_segment_size=${TOKEN_FINALIZE_SEGMENT_SIZE} gpu_slots=${GPU_SLOTS} gpu_batch_chunks=${GPU_BATCH_CHUNKS} gpu_submit_chunks=${GPU_SUBMIT_CHUNKS} stream_pipeline_depth=${STREAM_PIPELINE_DEPTH} stream_batch_chunks=${STREAM_BATCH_CHUNKS} stream_max_inflight_chunks=${STREAM_MAX_INFLIGHT_CHUNKS} stream_max_inflight_mib=${STREAM_MAX_INFLIGHT_MIB} scheduler=${SCHEDULER} gpu_fraction=${GPU_FRACTION} gpu_tail_stop_ratio=${GPU_TAIL_STOP_RATIO}"
+    echo "size_mib=${SIZE_MIB} runs=${RUNS} iters=${ITERS} warmups=${WARMUPS} chunk_mib=${CHUNK_MIB} gpu_subchunk_kib=${GPU_SUBCHUNK_KIB} token_finalize_segment_size=${TOKEN_FINALIZE_SEGMENT_SIZE} gpu_slots=${GPU_SLOTS} gpu_batch_chunks=${GPU_BATCH_CHUNKS} decomp_gpu_batch_chunks=${DECOMP_GPU_BATCH_CHUNKS} gpu_submit_chunks=${GPU_SUBMIT_CHUNKS} stream_pipeline_depth=${STREAM_PIPELINE_DEPTH} stream_batch_chunks=${STREAM_BATCH_CHUNKS} stream_max_inflight_chunks=${STREAM_MAX_INFLIGHT_CHUNKS} stream_max_inflight_mib=${STREAM_MAX_INFLIGHT_MIB} scheduler=${SCHEDULER} gpu_fraction=${GPU_FRACTION} gpu_tail_stop_ratio=${GPU_TAIL_STOP_RATIO}"
     echo "profile_timing=${PROFILE_TIMING} profile_timing_detail=${PROFILE_TIMING_DETAIL} profile_timing_deep=${PROFILE_TIMING_DEEP}"
     echo
   } | tee "${LOG_FILE}"
@@ -307,6 +313,7 @@ for mode in "${MODE_LIST[@]}"; do
       --token-finalize-segment-size "${TOKEN_FINALIZE_SEGMENT_SIZE}"
       --gpu-slots "${GPU_SLOTS}"
       --gpu-batch-chunks "${GPU_BATCH_CHUNKS}"
+      --decomp-gpu-batch-chunks "${DECOMP_GPU_BATCH_CHUNKS}"
       --gpu-submit-chunks "${GPU_SUBMIT_CHUNKS}"
       --stream-pipeline-depth "${STREAM_PIPELINE_DEPTH}"
       --stream-batch-chunks "${STREAM_BATCH_CHUNKS}"
@@ -346,7 +353,6 @@ for mode in "${MODE_LIST[@]}"; do
 
   echo "----- SUMMARY mode=${mode} -----" | tee -a "${LOG_FILE}"
   stats_line "speedup_compress_x" "${comp_speedup_values}" | tee -a "${LOG_FILE}"
-  echo "speedup_decompress_x: n=0 (deprecated: decompress is CPU-only path)" | tee -a "${LOG_FILE}"
   stats_line "cpu_only_avg_comp_ms" "${cpu_comp_values}" | tee -a "${LOG_FILE}"
   stats_line "cpu_gpu_avg_comp_ms" "${hybrid_comp_values}" | tee -a "${LOG_FILE}"
   stats_line "gpu_chunks" "${gpu_chunks_values}" | tee -a "${LOG_FILE}"

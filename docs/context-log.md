@@ -259,6 +259,29 @@
 
 ### 検証
 
+---
+
+## 2026-02-27 - D0実装（CZDIメタデータ基盤）
+
+### 実装内容
+
+- `cozip_deflate` に `DeflateChunkIndex` / `DeflateChunkIndexEntry` を追加
+- `CZDI v1` の encode/decode を実装（varint table + CRC）
+- 圧縮APIを拡張し、`deflate_compress_stream_zip_compatible_with_index` で索引を返せるようにした
+- 圧縮時のビット書き込み位置を追跡し、チャンクごとの `comp_bit_off / comp_bit_len / final_header_rel_bit / raw_len` を収集
+
+### ZIP統合
+
+- `cozip` で CZDIメタデータを書き込む実装を追加
+  - まず Central Directory extra field へ inline 格納
+  - 容量超過時は ZIP64 EOCD extensible data へ退避し、extraには locator を記録
+- 読み取り側でも CZDI extra + EOCD64退避データを復元し、index decode まで実装
+
+### 補足
+
+- D0段階のため、解凍実行はまだ既存CPU経路のまま（indexは読み取り・保持まで）
+- `CoZipDeflate` では未対応GPU解凍時にフォールバックせずエラー返却する方針を維持（実行切替は `cozip` 側責務）
+
 1. `cargo test -p cozip_deflate` 通過
 2. `cargo test --workspace` 通過
 3. `cargo test -p cozip_deflate --test hybrid_integration -- --nocapture` 通過

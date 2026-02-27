@@ -11,6 +11,8 @@ const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
 const DYN_TABLE_U32_COUNT: usize = (LITLEN_SYMBOL_COUNT * 2) + (DIST_SYMBOL_COUNT * 2);
 const MAX_GPU_BATCH_CHUNKS: usize = 16;
+const MAX_GPU_DECODE_BATCH_OUTPUT_BYTES: usize = 120 * 1024 * 1024;
+const MAX_GPU_DECODE_AUTO_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const GPU_FREQ_MAX_WORKGROUPS: u32 = 4096;
 const PREFIX_SCAN_BLOCK_SIZE: usize = 256;
 const DEFAULT_TOKEN_FINALIZE_SEGMENT_SIZE: usize = 4096;
@@ -34,6 +36,7 @@ pub struct HybridOptions {
     pub stream_max_inflight_chunks: usize,
     pub stream_max_inflight_bytes: usize,
     pub gpu_batch_chunks: usize,
+    pub decode_gpu_batch_chunks: usize,
     pub gpu_pipelined_submit_chunks: usize,
     pub token_finalize_segment_size: usize,
     pub compression_level: u32,
@@ -84,6 +87,7 @@ impl Default for HybridOptions {
             stream_max_inflight_chunks: 256,
             stream_max_inflight_bytes: 0,
             gpu_batch_chunks: 4,
+            decode_gpu_batch_chunks: 0,
             gpu_pipelined_submit_chunks: 4,
             token_finalize_segment_size: DEFAULT_TOKEN_FINALIZE_SEGMENT_SIZE,
             compression_level: 6,
@@ -132,13 +136,14 @@ pub struct CoZipDeflate {
 impl CoZipDeflate {
     pub fn init(options: HybridOptions) -> Result<Self, CozipDeflateError> {
         validate_options(&options)?;
+        let gpu_requested = options.prefer_gpu;
         let mut init_stats = CoZipDeflateInitStats::default();
-        let gpu_context = if is_gpu_requested(&options) {
-            let start = Instant::now();
-            let ctx = GpuAssist::new(&options).ok().map(Arc::new);
-            init_stats.gpu_context_init_ms = elapsed_ms(start);
-            init_stats.gpu_available = ctx.is_some();
-            ctx
+        let gpu_context = if gpu_requested {
+            let t0 = Instant::now();
+            let runtime = GpuAssist::new(&options).ok().map(Arc::new);
+            init_stats.gpu_context_init_ms = elapsed_ms(t0);
+            init_stats.gpu_available = runtime.is_some();
+            runtime
         } else {
             None
         };
@@ -162,12 +167,46 @@ impl CoZipDeflate {
         reader: &mut R,
         writer: &mut W,
     ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
-        deflate_compress_stream_hybrid_zip_compatible_with_context(
+        let result = deflate_compress_stream_hybrid_zip_compatible_with_index_and_context(
+            reader,
+            writer,
+            &self.options,
+            self.gpu_context.clone(),
+        )?;
+        Ok(result.stats)
+    }
+
+    pub fn deflate_compress_stream_zip_compatible_with_index<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<DeflateHybridCompressResult, CozipDeflateError> {
+        deflate_compress_stream_hybrid_zip_compatible_with_index_and_context(
             reader,
             writer,
             &self.options,
             self.gpu_context.clone(),
         )
+    }
+
+    pub fn deflate_decompress_stream_zip_compatible_with_index<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        index: &DeflateChunkIndex,
+    ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+        let _ = self;
+        deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
+    }
+
+    pub fn deflate_decompress_stream_zip_compatible_with_index_cpu<R: Read, W: Write>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        index: &DeflateChunkIndex,
+    ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+        let _ = self;
+        deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
     }
 }
 
@@ -250,6 +289,11 @@ struct EncodeWorkStats {
     gpu_yield_events: usize,
     initial_gpu_queue_chunks: usize,
     gpu_steal_reserve_chunks: usize,
+    decode_prepare_ms: f64,
+    decode_gpu_call_ms: f64,
+    decode_gpu_fallback_cpu_ms: f64,
+    decode_gpu_attempt_chunks: usize,
+    decode_gpu_fallback_chunks: usize,
 }
 
 #[derive(Debug, Default)]
@@ -268,6 +312,11 @@ struct WorkerCounters {
     gpu_no_task_events: AtomicUsize,
     cpu_yield_events: AtomicUsize,
     gpu_yield_events: AtomicUsize,
+    decode_prepare_ns: std::sync::atomic::AtomicU64,
+    decode_gpu_call_ns: std::sync::atomic::AtomicU64,
+    decode_gpu_fallback_cpu_ns: std::sync::atomic::AtomicU64,
+    decode_gpu_attempt_chunks: AtomicUsize,
+    decode_gpu_fallback_chunks: AtomicUsize,
 }
 
 impl WorkerCounters {
@@ -293,6 +342,14 @@ impl WorkerCounters {
             gpu_yield_events: self.gpu_yield_events.load(Ordering::Relaxed),
             initial_gpu_queue_chunks: 0,
             gpu_steal_reserve_chunks: 0,
+            decode_prepare_ms: self.decode_prepare_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            decode_gpu_call_ms: self.decode_gpu_call_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            decode_gpu_fallback_cpu_ms: self.decode_gpu_fallback_cpu_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            decode_gpu_attempt_chunks: self.decode_gpu_attempt_chunks.load(Ordering::Relaxed),
+            decode_gpu_fallback_chunks: self.decode_gpu_fallback_chunks.load(Ordering::Relaxed),
         }
     }
 }
@@ -377,7 +434,14 @@ pub fn deflate_compress_cpu(input: &[u8], level: u32) -> Result<Vec<u8>, CozipDe
 }
 
 pub fn deflate_decompress_on_cpu(input: &[u8]) -> Result<Vec<u8>, CozipDeflateError> {
-    let mut decoder = flate2::write::DeflateDecoder::new(Vec::new());
+    deflate_decompress_on_cpu_with_capacity(input, 0)
+}
+
+fn deflate_decompress_on_cpu_with_capacity(
+    input: &[u8],
+    output_capacity: usize,
+) -> Result<Vec<u8>, CozipDeflateError> {
+    let mut decoder = flate2::write::DeflateDecoder::new(Vec::with_capacity(output_capacity));
     decoder.write_all(input)?;
     Ok(decoder.finish()?)
 }
@@ -424,6 +488,221 @@ pub struct DeflateCpuStreamStats {
     pub gpu_yield_events: usize,
     pub initial_gpu_queue_chunks: usize,
     pub gpu_steal_reserve_chunks: usize,
+    pub decode_prepare_ms: f64,
+    pub decode_gpu_call_ms: f64,
+    pub decode_gpu_fallback_cpu_ms: f64,
+    pub decode_gpu_attempt_chunks: usize,
+    pub decode_gpu_fallback_chunks: usize,
+}
+
+const CZDI_MAGIC: [u8; 4] = *b"CZDI";
+const CZDI_VERSION_V1: u8 = 1;
+const CZDI_FLAG_INDEXED_DEFLATE: u8 = 1 << 0;
+const CZDI_FLAG_TABLE_VARINT: u8 = 1 << 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeflateChunkIndex {
+    pub chunk_size: u32,
+    pub chunk_count: u32,
+    pub uncompressed_size: u64,
+    pub compressed_size: u64,
+    pub entries: Vec<DeflateChunkIndexEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeflateChunkIndexEntry {
+    pub comp_bit_off: u64,
+    pub comp_bit_len: u32,
+    pub final_header_rel_bit: u32,
+    pub raw_len: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeflateHybridCompressResult {
+    pub stats: DeflateCpuStreamStats,
+    pub index: Option<DeflateChunkIndex>,
+}
+
+impl DeflateChunkIndex {
+    pub fn encode_czdi_v1(&self) -> Result<Vec<u8>, CozipDeflateError> {
+        if usize::try_from(self.chunk_count).ok() != Some(self.entries.len()) {
+            return Err(CozipDeflateError::InvalidFrame(
+                "chunk_count and entries length mismatch",
+            ));
+        }
+
+        let mut table = Vec::new();
+        let mut prev_off = 0_u64;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if idx > 0 && entry.comp_bit_off < prev_off {
+                return Err(CozipDeflateError::InvalidFrame(
+                    "chunk offsets are not monotonic",
+                ));
+            }
+            let delta = if idx == 0 {
+                entry.comp_bit_off
+            } else {
+                entry.comp_bit_off.saturating_sub(prev_off)
+            };
+            append_uleb128_u64(&mut table, delta);
+            append_uleb128_u64(&mut table, u64::from(entry.comp_bit_len));
+            append_uleb128_u64(&mut table, u64::from(entry.final_header_rel_bit));
+            append_uleb128_u64(&mut table, u64::from(entry.raw_len));
+            prev_off = entry.comp_bit_off;
+        }
+
+        let table_crc32 = crc32fast::hash(&table);
+        let mut out = Vec::with_capacity(40 + table.len());
+        out.extend_from_slice(&CZDI_MAGIC);
+        out.push(CZDI_VERSION_V1);
+        out.push(CZDI_FLAG_INDEXED_DEFLATE | CZDI_FLAG_TABLE_VARINT);
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&self.chunk_size.to_le_bytes());
+        out.extend_from_slice(&self.chunk_count.to_le_bytes());
+        out.extend_from_slice(&self.uncompressed_size.to_le_bytes());
+        out.extend_from_slice(&self.compressed_size.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(table.len())
+                .map_err(|_| CozipDeflateError::DataTooLarge)?
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&table_crc32.to_le_bytes());
+        out.extend_from_slice(&table);
+        Ok(out)
+    }
+
+    pub fn decode_czdi_v1(bytes: &[u8]) -> Result<Self, CozipDeflateError> {
+        const HEADER_LEN: usize = 40;
+        if bytes.len() < HEADER_LEN {
+            return Err(CozipDeflateError::InvalidFrame("czdi header truncated"));
+        }
+        if bytes[..4] != CZDI_MAGIC {
+            return Err(CozipDeflateError::InvalidFrame("czdi magic mismatch"));
+        }
+        if bytes[4] != CZDI_VERSION_V1 {
+            return Err(CozipDeflateError::InvalidFrame("unsupported czdi version"));
+        }
+        let flags = bytes[5];
+        if (flags & CZDI_FLAG_TABLE_VARINT) == 0 {
+            return Err(CozipDeflateError::InvalidFrame(
+                "unsupported czdi table encoding",
+            ));
+        }
+        let chunk_size = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| CozipDeflateError::InvalidFrame("czdi chunk size parse failed"))?,
+        );
+        let chunk_count = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .map_err(|_| CozipDeflateError::InvalidFrame("czdi chunk count parse failed"))?,
+        );
+        let uncompressed_size =
+            u64::from_le_bytes(bytes[16..24].try_into().map_err(|_| {
+                CozipDeflateError::InvalidFrame("czdi uncompressed size parse failed")
+            })?);
+        let compressed_size =
+            u64::from_le_bytes(bytes[24..32].try_into().map_err(|_| {
+                CozipDeflateError::InvalidFrame("czdi compressed size parse failed")
+            })?);
+        let table_len =
+            usize::try_from(u32::from_le_bytes(bytes[32..36].try_into().map_err(
+                |_| CozipDeflateError::InvalidFrame("czdi table len parse failed"),
+            )?))
+            .map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let table_crc = u32::from_le_bytes(
+            bytes[36..40]
+                .try_into()
+                .map_err(|_| CozipDeflateError::InvalidFrame("czdi table crc parse failed"))?,
+        );
+
+        let table_end = HEADER_LEN
+            .checked_add(table_len)
+            .ok_or(CozipDeflateError::DataTooLarge)?;
+        let table = bytes
+            .get(HEADER_LEN..table_end)
+            .ok_or(CozipDeflateError::InvalidFrame("czdi table truncated"))?;
+        if crc32fast::hash(table) != table_crc {
+            return Err(CozipDeflateError::InvalidFrame("czdi table crc mismatch"));
+        }
+
+        let mut entries = Vec::with_capacity(
+            usize::try_from(chunk_count).map_err(|_| CozipDeflateError::DataTooLarge)?,
+        );
+        let mut pos = 0_usize;
+        let mut prev_off = 0_u64;
+        for idx in 0..chunk_count {
+            let delta = read_uleb128_u64(table, &mut pos)?;
+            let comp_bit_len_u64 = read_uleb128_u64(table, &mut pos)?;
+            let final_header_rel_bit_u64 = read_uleb128_u64(table, &mut pos)?;
+            let raw_len_u64 = read_uleb128_u64(table, &mut pos)?;
+            let comp_bit_off = if idx == 0 {
+                delta
+            } else {
+                prev_off
+                    .checked_add(delta)
+                    .ok_or(CozipDeflateError::DataTooLarge)?
+            };
+            let comp_bit_len =
+                u32::try_from(comp_bit_len_u64).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let final_header_rel_bit = u32::try_from(final_header_rel_bit_u64)
+                .map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let raw_len =
+                u32::try_from(raw_len_u64).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            entries.push(DeflateChunkIndexEntry {
+                comp_bit_off,
+                comp_bit_len,
+                final_header_rel_bit,
+                raw_len,
+            });
+            prev_off = comp_bit_off;
+        }
+        if pos != table.len() {
+            return Err(CozipDeflateError::InvalidFrame(
+                "czdi table has trailing bytes",
+            ));
+        }
+
+        Ok(Self {
+            chunk_size,
+            chunk_count,
+            uncompressed_size,
+            compressed_size,
+            entries,
+        })
+    }
+}
+
+fn append_uleb128_u64(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn read_uleb128_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, CozipDeflateError> {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    for _ in 0..10 {
+        let byte = *bytes
+            .get(*pos)
+            .ok_or(CozipDeflateError::InvalidFrame("truncated uleb128"))?;
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok(value);
+        }
+        shift = shift.saturating_add(7);
+    }
+    Err(CozipDeflateError::InvalidFrame("uleb128 value too large"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -518,6 +797,809 @@ pub fn deflate_decompress_stream_on_cpu<R: Read, W: Write>(
     Ok(stats)
 }
 
+pub fn deflate_decompress_stream_hybrid_indexed<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    index: &DeflateChunkIndex,
+    options: &HybridOptions,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    deflate_decompress_stream_hybrid_indexed_with_context(
+        reader,
+        writer,
+        index,
+        options,
+        None,
+    )
+}
+
+fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    index: &DeflateChunkIndex,
+    options: &HybridOptions,
+    _gpu_context: Option<Arc<GpuAssist>>,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    validate_options(options)?;
+    if usize::try_from(index.chunk_count).ok() != Some(index.entries.len()) {
+        return Err(CozipDeflateError::InvalidFrame(
+            "chunk_count and entries length mismatch",
+        ));
+    }
+    // Decode path is CPU-only by design in CoZipDeflate.
+    let gpu_enabled = false;
+    let gpu_runtime: Option<Arc<GpuAssist>> = None;
+
+    let mut compressed = Vec::new();
+    reader.read_to_end(&mut compressed)?;
+    if u64::try_from(compressed.len()).unwrap_or(u64::MAX) != index.compressed_size {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed compressed size mismatch",
+        ));
+    }
+    let input_crc32 = crc32fast::hash(&compressed);
+
+    let entries = Arc::<[DeflateChunkIndexEntry]>::from(index.entries.clone().into_boxed_slice());
+    let compressed = Arc::<[u8]>::from(compressed);
+    let task_count = entries.len();
+
+    let queue_state = Arc::new((Mutex::new(DecodeTaskQueueState::default()), Condvar::new()));
+    let ready_state = Arc::new((
+        Mutex::new(DecodeReadyState {
+            slots: vec![None; task_count],
+            ready_count: 0,
+        }),
+        Condvar::new(),
+    ));
+    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
+    let counters = Arc::new(WorkerCounters::default());
+
+    {
+        let (queue_lock, _) = &*queue_state;
+        let mut queue = lock(queue_lock)?;
+        queue.queue.reserve(task_count);
+        for index in 0..task_count {
+            queue.queue.push_back(DecodeTask { index });
+        }
+        queue.closed = true;
+    }
+
+    let cpu_workers = cpu_worker_count(gpu_enabled).min(task_count.max(1));
+    let gpu_workers = if gpu_enabled {
+        decode_gpu_worker_count(options, task_count)
+    } else {
+        0
+    };
+    let mut handles = Vec::with_capacity(cpu_workers + gpu_workers);
+    if let Some(gpu) = gpu_runtime {
+        let total_tasks = Arc::new(AtomicUsize::new(task_count));
+        for _ in 0..gpu_workers {
+            let queue_ref = Arc::clone(&queue_state);
+            let ready_ref = Arc::clone(&ready_state);
+            let err_ref = Arc::clone(&error);
+            let input_ref = Arc::clone(&compressed);
+            let entries_ref = Arc::clone(&entries);
+            let counters_ref = Arc::clone(&counters);
+            let opts = options.clone();
+            let gpu_ref = Arc::clone(&gpu);
+            let total_tasks_ref = Arc::clone(&total_tasks);
+            handles.push(std::thread::spawn(move || {
+                decode_gpu_indexed_worker(
+                    queue_ref,
+                    ready_ref,
+                    err_ref,
+                    input_ref,
+                    entries_ref,
+                    &opts,
+                    gpu_ref,
+                    total_tasks_ref,
+                    counters_ref,
+                )
+            }));
+        }
+    }
+    for _ in 0..cpu_workers {
+        let queue_ref = Arc::clone(&queue_state);
+        let ready_ref = Arc::clone(&ready_state);
+        let err_ref = Arc::clone(&error);
+        let input_ref = Arc::clone(&compressed);
+        let entries_ref = Arc::clone(&entries);
+        let counters_ref = Arc::clone(&counters);
+        handles.push(std::thread::spawn(move || {
+            decode_cpu_indexed_worker(
+                queue_ref,
+                ready_ref,
+                err_ref,
+                input_ref,
+                entries_ref,
+                counters_ref,
+            )
+        }));
+    }
+
+    let mut stats = DeflateCpuStreamStats::default();
+    stats.input_bytes = u64::try_from(compressed.len()).unwrap_or(u64::MAX);
+    stats.input_crc32 = input_crc32;
+    stats.chunk_count = task_count;
+    stats.gpu_available = gpu_enabled;
+
+    let mut out = HashingCountWriter::new(writer);
+    let mut next_index = 0usize;
+    while next_index < task_count {
+        if has_error(&error) {
+            break;
+        }
+
+        let mut progressed = false;
+        loop {
+            let ready_len_and_chunk = {
+                let (ready_lock, _) = &*ready_state;
+                let mut ready = lock(ready_lock)?;
+                let ready_len = ready.ready_count;
+                let chunk = ready.slots.get_mut(next_index).and_then(Option::take);
+                if chunk.is_some() {
+                    ready.ready_count = ready.ready_count.saturating_sub(1);
+                }
+                (ready_len, chunk)
+            };
+            let ready_len = ready_len_and_chunk.0;
+            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+            let Some(decoded) = ready_len_and_chunk.1 else {
+                break;
+            };
+            if decoded.index != next_index {
+                return Err(CozipDeflateError::Internal("decoded chunk index mismatch"));
+            }
+            out.write_all(&decoded.raw)?;
+            match decoded.backend {
+                ChunkBackend::Cpu => stats.cpu_chunks = stats.cpu_chunks.saturating_add(1),
+                ChunkBackend::GpuAssisted => stats.gpu_chunks = stats.gpu_chunks.saturating_add(1),
+            }
+            next_index = next_index.saturating_add(1);
+            progressed = true;
+        }
+
+        if next_index >= task_count {
+            break;
+        }
+
+        if !progressed {
+            let wait_start = Instant::now();
+            let (ready_lock, ready_cv) = &*ready_state;
+            let guard = lock(ready_lock)?;
+            let ready_len = guard.ready_count;
+            stats.ready_chunks_max = stats.ready_chunks_max.max(ready_len);
+            let hol_wait = ready_len > 0;
+            drop(wait_timeout_on_condvar(
+                ready_cv,
+                guard,
+                Duration::from_millis(2),
+            )?);
+            let wait_ms = elapsed_ms(wait_start);
+            stats.writer_wait_ms += wait_ms;
+            stats.writer_wait_events = stats.writer_wait_events.saturating_add(1);
+            if hol_wait {
+                stats.writer_hol_wait_ms += wait_ms;
+                stats.writer_hol_wait_events = stats.writer_hol_wait_events.saturating_add(1);
+                stats.writer_hol_ready_sum = stats.writer_hol_ready_sum.saturating_add(ready_len);
+                stats.writer_hol_ready_max = stats.writer_hol_ready_max.max(ready_len);
+            }
+        }
+    }
+
+    {
+        let (ready_lock, ready_cv) = &*ready_state;
+        drop(lock(ready_lock)?);
+        ready_cv.notify_all();
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(err) = lock(&error)?.take() {
+        return Err(err);
+    }
+
+    stats.output_bytes = out.written;
+    stats.output_crc32 = out.hasher.finalize();
+    if stats.output_bytes != index.uncompressed_size {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed uncompressed size mismatch",
+        ));
+    }
+
+    let counter_snapshot = counters.snapshot();
+    stats.cpu_worker_busy_ms = counter_snapshot.cpu_busy_ms;
+    stats.gpu_worker_busy_ms = counter_snapshot.gpu_busy_ms;
+    stats.cpu_queue_lock_wait_ms = counter_snapshot.cpu_queue_lock_wait_ms;
+    stats.gpu_queue_lock_wait_ms = counter_snapshot.gpu_queue_lock_wait_ms;
+    stats.cpu_wait_for_task_ms = counter_snapshot.cpu_wait_for_task_ms;
+    stats.gpu_wait_for_task_ms = counter_snapshot.gpu_wait_for_task_ms;
+    stats.cpu_worker_chunks = counter_snapshot.cpu_chunks_done;
+    stats.gpu_worker_chunks = counter_snapshot.gpu_chunks_done;
+    stats.gpu_batch_count = counter_snapshot.gpu_batches;
+    stats.cpu_no_task_events = counter_snapshot.cpu_no_task_events;
+    stats.gpu_no_task_events = counter_snapshot.gpu_no_task_events;
+    stats.cpu_yield_events = counter_snapshot.cpu_yield_events;
+    stats.gpu_yield_events = counter_snapshot.gpu_yield_events;
+    stats.decode_prepare_ms = counter_snapshot.decode_prepare_ms;
+    stats.decode_gpu_call_ms = counter_snapshot.decode_gpu_call_ms;
+    stats.decode_gpu_fallback_cpu_ms = counter_snapshot.decode_gpu_fallback_cpu_ms;
+    stats.decode_gpu_attempt_chunks = counter_snapshot.decode_gpu_attempt_chunks;
+    stats.decode_gpu_fallback_chunks = counter_snapshot.decode_gpu_fallback_chunks;
+    Ok(stats)
+}
+
+pub fn deflate_decompress_stream_indexed_on_cpu<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    index: &DeflateChunkIndex,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    let mut options = HybridOptions::default();
+    options.prefer_gpu = false;
+    deflate_decompress_stream_hybrid_indexed_with_context(reader, writer, index, &options, None)
+}
+
+fn decode_cpu_indexed_worker(
+    queue_state: Arc<(Mutex<DecodeTaskQueueState>, Condvar)>,
+    ready_state: Arc<(Mutex<DecodeReadyState>, Condvar)>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    compressed: Arc<[u8]>,
+    entries: Arc<[DeflateChunkIndexEntry]>,
+    counters: Arc<WorkerCounters>,
+) {
+    loop {
+        if has_error(&error) {
+            break;
+        }
+
+        let task = {
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = match lock(queue_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            loop {
+                if let Some(task) = state.queue.pop_front() {
+                    break Some(task);
+                }
+                if state.closed {
+                    break None;
+                }
+                counters.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                let wait_start = Instant::now();
+                state = match wait_on_condvar(queue_cv, state) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+                counters
+                    .cpu_wait_for_task_ns
+                    .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        };
+
+        let Some(task) = task else {
+            counters.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            break;
+        };
+
+        let entry = match entries.get(task.index).copied() {
+            Some(value) => value,
+            None => {
+                set_error(
+                    &error,
+                    CozipDeflateError::Internal("decode worker task index out of range"),
+                );
+                break;
+            }
+        };
+
+        let decode_start = Instant::now();
+        let raw = match decode_single_indexed_chunk(&compressed, entry) {
+            Ok(value) => value,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        counters
+            .cpu_busy_ns
+            .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counters.cpu_chunks.fetch_add(1, Ordering::Relaxed);
+
+        let (ready_lock, ready_cv) = &*ready_state;
+        let mut ready = match lock(ready_lock) {
+            Ok(guard) => guard,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        let slot = match ready.slots.get_mut(task.index) {
+            Some(value) => value,
+            None => {
+                set_error(
+                    &error,
+                    CozipDeflateError::Internal("decoded chunk index out of range"),
+                );
+                break;
+            }
+        };
+        if slot.is_some() {
+            set_error(
+                &error,
+                CozipDeflateError::Internal("duplicate decoded chunk index"),
+            );
+            break;
+        }
+        *slot = Some(DecodedChunk {
+            index: task.index,
+            backend: ChunkBackend::Cpu,
+            raw,
+        });
+        ready.ready_count = ready.ready_count.saturating_add(1);
+        ready_cv.notify_all();
+    }
+}
+
+fn decode_task_is_gpu_eligible(
+    task_index: usize,
+    entries: &[DeflateChunkIndexEntry],
+    options: &HybridOptions,
+) -> bool {
+    if options.gpu_fraction <= 0.0 {
+        return false;
+    }
+    if options.gpu_fraction < 1.0 {
+        let gpu_target = (entries.len() as f32 * options.gpu_fraction).ceil() as usize;
+        if task_index >= gpu_target {
+            return false;
+        }
+    }
+    let Some(entry) = entries.get(task_index) else {
+        return false;
+    };
+    let raw_len = usize::try_from(entry.raw_len).unwrap_or(usize::MAX);
+    raw_len >= options.gpu_min_chunk_size && raw_len <= MAX_GPU_DECODE_BATCH_OUTPUT_BYTES
+}
+
+fn decode_gpu_indexed_worker(
+    queue_state: Arc<(Mutex<DecodeTaskQueueState>, Condvar)>,
+    ready_state: Arc<(Mutex<DecodeReadyState>, Condvar)>,
+    error: Arc<Mutex<Option<CozipDeflateError>>>,
+    compressed: Arc<[u8]>,
+    entries: Arc<[DeflateChunkIndexEntry]>,
+    options: &HybridOptions,
+    gpu: Arc<GpuAssist>,
+    total_tasks: Arc<AtomicUsize>,
+    counters: Arc<WorkerCounters>,
+) {
+    let default_batch_limit = options
+        .gpu_pipelined_submit_chunks
+        .clamp(1, MAX_GPU_BATCH_CHUNKS);
+    let batch_limit = if options.decode_gpu_batch_chunks == 0 {
+        default_batch_limit
+    } else {
+        options.decode_gpu_batch_chunks.max(1)
+    };
+    let target_batch_bytes = options
+        .chunk_size
+        .saturating_mul(batch_limit)
+        .max(options.chunk_size.max(1));
+    // Keep decode dispatches moderate: single GPU worker + batched submit.
+    // This avoids very long front-end stalls while still sending multiple chunks.
+    let batch_output_limit_bytes = target_batch_bytes
+        .min(MAX_GPU_DECODE_AUTO_BATCH_OUTPUT_BYTES.max(options.chunk_size))
+        .min(MAX_GPU_DECODE_BATCH_OUTPUT_BYTES)
+        .max(options.chunk_size.max(1));
+    let mut gpu_decode_disabled = false;
+    let mut gpu_attempted_total = 0usize;
+    let mut gpu_success_total = 0usize;
+    loop {
+        if has_error(&error) {
+            break;
+        }
+        let tasks = {
+            let (queue_lock, queue_cv) = &*queue_state;
+            let mut state = match lock(queue_lock) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&error, err);
+                    break;
+                }
+            };
+            loop {
+                let total = total_tasks.load(Ordering::Relaxed);
+                if state.closed
+                    && should_stop_gpu_tail_pop(
+                        total,
+                        state.queue.len(),
+                        options.gpu_tail_stop_ratio,
+                    )
+                {
+                    break Vec::new();
+                }
+
+                let mut tasks = Vec::with_capacity(batch_limit.min(state.queue.len().max(1)));
+                let mut batch_raw_bytes = 0usize;
+                while tasks.len() < batch_limit {
+                    let pos = state.queue.iter().position(|task| {
+                        decode_task_is_gpu_eligible(task.index, &entries, options)
+                    });
+                    if let Some(pos) = pos {
+                        let candidate_raw_len = state
+                            .queue
+                            .get(pos)
+                            .and_then(|task| entries.get(task.index))
+                            .and_then(|entry| usize::try_from(entry.raw_len).ok())
+                            .unwrap_or(0);
+                        let candidate_total = batch_raw_bytes.saturating_add(candidate_raw_len);
+                        if !tasks.is_empty() && candidate_total > batch_output_limit_bytes
+                        {
+                            break;
+                        }
+                        if let Some(task) = state.queue.remove(pos) {
+                            batch_raw_bytes = candidate_total;
+                            tasks.push(task);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if !tasks.is_empty() {
+                    break tasks;
+                }
+                if state.closed {
+                    break Vec::new();
+                }
+                counters.gpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                let wait_start = Instant::now();
+                state = match wait_on_condvar(queue_cv, state) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+                counters
+                    .gpu_wait_for_task_ns
+                    .fetch_add(wait_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        };
+
+        if tasks.is_empty() {
+            counters.gpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+
+        let start = Instant::now();
+        let prepare_start = Instant::now();
+        let mut prepared_batch = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let entry = match entries.get(task.index).copied() {
+                Some(value) => value,
+                None => {
+                    set_error(
+                        &error,
+                        CozipDeflateError::Internal("decode worker task index out of range"),
+                    );
+                    return;
+                }
+            };
+            let prepared = match prepare_indexed_chunk_for_decode(&compressed, entry) {
+                Ok(value) => value,
+                Err(err) => {
+                    set_error(&error, err);
+                    return;
+                }
+            };
+            prepared_batch.push((task.index, prepared));
+        }
+        counters
+            .decode_prepare_ns
+            .fetch_add(prepare_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let mut decoded_batch = Vec::with_capacity(prepared_batch.len());
+        if !prepared_batch.is_empty() {
+            if gpu_decode_disabled {
+                for (index, prepared) in prepared_batch {
+                    let raw = match decode_prepared_chunk_on_cpu(&prepared) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            set_error(&error, err);
+                            return;
+                        }
+                    };
+                    decoded_batch.push(DecodedChunk {
+                        index,
+                        backend: ChunkBackend::Cpu,
+                        raw,
+                    });
+                }
+            } else {
+                let gpu_inputs: Vec<(&[u8], usize)> = prepared_batch
+                    .iter()
+                    .map(|(_, prepared)| (prepared.chunk.as_slice(), prepared.expected_len))
+                    .collect();
+                let attempted_in_batch = gpu_inputs.len();
+                counters
+                    .decode_gpu_attempt_chunks
+                    .fetch_add(attempted_in_batch, Ordering::Relaxed);
+                let gpu_call_start = Instant::now();
+                let gpu_results = match gpu.inflate_deflate_blocks_batch(&gpu_inputs) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        set_error(&error, err);
+                        return;
+                    }
+                };
+                counters.decode_gpu_call_ns.fetch_add(
+                    gpu_call_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                if gpu_results.len() != prepared_batch.len() {
+                    set_error(
+                        &error,
+                        CozipDeflateError::Internal("gpu decode worker produced mismatched batch"),
+                    );
+                    return;
+                }
+                let mut fallback_count = 0usize;
+                let fallback_cpu_start = Instant::now();
+                for ((index, prepared), gpu_raw) in
+                    prepared_batch.into_iter().zip(gpu_results.into_iter())
+                {
+                    if let Some(raw) = gpu_raw {
+                        decoded_batch.push(DecodedChunk {
+                            index,
+                            backend: ChunkBackend::GpuAssisted,
+                            raw,
+                        });
+                        gpu_success_total = gpu_success_total.saturating_add(1);
+                    } else {
+                        fallback_count = fallback_count.saturating_add(1);
+                        let raw = match decode_prepared_chunk_on_cpu(&prepared) {
+                            Ok(value) => value,
+                            Err(err) => {
+                                set_error(&error, err);
+                                return;
+                            }
+                        };
+                        decoded_batch.push(DecodedChunk {
+                            index,
+                            backend: ChunkBackend::Cpu,
+                            raw,
+                        });
+                    }
+                }
+                counters.decode_gpu_fallback_cpu_ns.fetch_add(
+                    fallback_cpu_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+                counters
+                    .decode_gpu_fallback_chunks
+                    .fetch_add(fallback_count, Ordering::Relaxed);
+                gpu_attempted_total = gpu_attempted_total.saturating_add(attempted_in_batch);
+                if gpu_attempted_total >= 8
+                    && gpu_success_total.saturating_mul(2) < gpu_attempted_total
+                {
+                    gpu_decode_disabled = true;
+                }
+            }
+        }
+        counters
+            .gpu_busy_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counters.gpu_batches.fetch_add(1, Ordering::Relaxed);
+        let gpu_chunks = decoded_batch
+            .iter()
+            .filter(|decoded| decoded.backend == ChunkBackend::GpuAssisted)
+            .count();
+        counters.gpu_chunks.fetch_add(gpu_chunks, Ordering::Relaxed);
+        counters.cpu_chunks.fetch_add(
+            decoded_batch.len().saturating_sub(gpu_chunks),
+            Ordering::Relaxed,
+        );
+
+        let (ready_lock, ready_cv) = &*ready_state;
+        let mut ready = match lock(ready_lock) {
+            Ok(guard) => guard,
+            Err(err) => {
+                set_error(&error, err);
+                break;
+            }
+        };
+        for decoded in decoded_batch {
+            let slot = match ready.slots.get_mut(decoded.index) {
+                Some(value) => value,
+                None => {
+                    set_error(
+                        &error,
+                        CozipDeflateError::Internal("decoded chunk index out of range"),
+                    );
+                    return;
+                }
+            };
+            if slot.is_some() {
+                set_error(
+                    &error,
+                    CozipDeflateError::Internal("duplicate decoded chunk index"),
+                );
+                return;
+            }
+            *slot = Some(decoded);
+            ready.ready_count = ready.ready_count.saturating_add(1);
+        }
+        ready_cv.notify_all();
+    }
+}
+
+fn decode_single_indexed_chunk(
+    compressed: &[u8],
+    entry: DeflateChunkIndexEntry,
+) -> Result<Vec<u8>, CozipDeflateError> {
+    let prepared = prepare_indexed_chunk_for_decode(compressed, entry)?;
+    decode_prepared_chunk_on_cpu(&prepared)
+}
+
+#[derive(Debug)]
+struct PreparedIndexedChunk {
+    chunk: Vec<u8>,
+    expected_len: usize,
+}
+
+fn decode_prepared_chunk_on_cpu(
+    prepared: &PreparedIndexedChunk,
+) -> Result<Vec<u8>, CozipDeflateError> {
+    let decoded = deflate_decompress_on_cpu_with_capacity(&prepared.chunk, prepared.expected_len)?;
+    if decoded.len() != prepared.expected_len {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed chunk decoded length mismatch",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn prepare_indexed_chunk_for_decode(
+    compressed: &[u8],
+    entry: DeflateChunkIndexEntry,
+) -> Result<PreparedIndexedChunk, CozipDeflateError> {
+    if entry.comp_bit_len == 0 {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed chunk bit length is zero",
+        ));
+    }
+    let mut entry_start_bit =
+        usize::try_from(entry.comp_bit_off).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let mut entry_bit_len =
+        usize::try_from(entry.comp_bit_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let mut final_bit =
+        usize::try_from(entry.final_header_rel_bit).map_err(|_| CozipDeflateError::DataTooLarge)?;
+
+    if (entry_start_bit % 8) != 0 {
+        // Writer-side connector block is inserted when the previous chunk ends at a
+        // non-byte-aligned bit position. Its layout depends on the carry bit offset:
+        // 3 bits header + zero pad-to-byte + 32 bits LEN/NLEN.
+        let carry = entry_start_bit % 8;
+        let after_header = (carry + 3) % 8;
+        let pad_bits = (8 - after_header) % 8;
+        let connector_bits = 3 + pad_bits + 32;
+        if connector_bits >= entry_bit_len || final_bit < connector_bits {
+            return Err(CozipDeflateError::InvalidFrame(
+                "indexed connector metadata is invalid",
+            ));
+        }
+        entry_start_bit = entry_start_bit.saturating_add(connector_bits);
+        entry_bit_len = entry_bit_len.saturating_sub(connector_bits);
+        final_bit = final_bit.saturating_sub(connector_bits);
+    }
+
+    if final_bit >= entry_bit_len {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed chunk final bit is out of range",
+        ));
+    }
+    let expected_len =
+        usize::try_from(entry.raw_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let mut chunk = copy_bit_range(
+        compressed,
+        u64::try_from(entry_start_bit).map_err(|_| CozipDeflateError::DataTooLarge)?,
+        entry_bit_len,
+    )?;
+    let byte_index = final_bit / 8;
+    let bit_mask = 1_u8 << (final_bit % 8);
+    let byte = chunk
+        .get_mut(byte_index)
+        .ok_or(CozipDeflateError::InvalidFrame(
+            "indexed final bit location is invalid",
+        ))?;
+    *byte |= bit_mask;
+
+    // Non-final GPU chunks may contain an alignment-only trailing stored block.
+    // After forcing BFINAL=1 on the original chunk header, keep only the first
+    // finalized deflate stream to avoid decoding trailing auxiliary bits.
+    let patched_layout = parse_deflate_stream_layout(&chunk)?;
+    let logical_end_bit = patched_layout.end_bit;
+    if logical_end_bit == 0 {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed chunk resolved to empty deflate stream",
+        ));
+    }
+    let keep_bytes = logical_end_bit.div_ceil(8);
+    chunk.truncate(keep_bytes);
+    let tail_bits = logical_end_bit % 8;
+    if tail_bits != 0 {
+        let mask = (1_u8 << tail_bits) - 1;
+        if let Some(last) = chunk.last_mut() {
+            *last &= mask;
+        }
+    }
+
+    Ok(PreparedIndexedChunk {
+        chunk,
+        expected_len,
+    })
+}
+
+fn copy_bit_range(
+    src: &[u8],
+    start_bit_u64: u64,
+    bit_len: usize,
+) -> Result<Vec<u8>, CozipDeflateError> {
+    let start_bit = usize::try_from(start_bit_u64).map_err(|_| CozipDeflateError::DataTooLarge)?;
+    let total_bits = src.len().saturating_mul(8);
+    if start_bit > total_bits || bit_len > total_bits.saturating_sub(start_bit) {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed chunk bit range is out of bounds",
+        ));
+    }
+
+    if bit_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let out_len = bit_len.div_ceil(8);
+    let bit_shift = start_bit % 8;
+    let src_byte = start_bit / 8;
+    let full_bytes = bit_len / 8;
+    let tail_bits = bit_len % 8;
+
+    if bit_shift == 0 {
+        let mut out = Vec::with_capacity(out_len);
+        out.extend_from_slice(&src[src_byte..src_byte + full_bytes]);
+        if tail_bits != 0 {
+            let mask = (1_u8 << tail_bits) - 1;
+            out.push(src[src_byte + full_bytes] & mask);
+        }
+        return Ok(out);
+    }
+
+    let mut out = vec![0_u8; out_len];
+    let carry_shift = 8 - bit_shift;
+    for (i, out_byte) in out.iter_mut().enumerate() {
+        let lo = src[src_byte + i] >> bit_shift;
+        let hi = src
+            .get(src_byte + i + 1)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_shl(carry_shift as u32);
+        *out_byte = lo | hi;
+    }
+    if tail_bits != 0 {
+        let mask = (1_u8 << tail_bits) - 1;
+        if let Some(last) = out.last_mut() {
+            *last &= mask;
+        }
+    }
+    Ok(out)
+}
+
 const DEFLATE_MAX_HUFF_BITS: usize = 15;
 const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
@@ -597,6 +1679,7 @@ struct DeflateBitWriter<'a, W: Write> {
     byte: u8,
     used: u8,
     out_buf: Vec<u8>,
+    total_bits: u64,
     io_ns: u64,
     io_calls: usize,
     io_bytes: u64,
@@ -615,6 +1698,30 @@ struct StreamReadyChunk {
     prepared_non_final_end_bit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DecodeTask {
+    index: usize,
+}
+
+#[derive(Debug, Default)]
+struct DecodeTaskQueueState {
+    queue: VecDeque<DecodeTask>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct DecodeReadyState {
+    slots: Vec<Option<DecodedChunk>>,
+    ready_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedChunk {
+    index: usize,
+    backend: ChunkBackend,
+    raw: Vec<u8>,
+}
+
 impl<'a, W: Write> DeflateBitWriter<'a, W> {
     fn new(inner: &'a mut W) -> Self {
         Self {
@@ -622,6 +1729,7 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
             byte: 0,
             used: 0,
             out_buf: Vec::with_capacity(64 * 1024),
+            total_bits: 0,
             io_ns: 0,
             io_calls: 0,
             io_bytes: 0,
@@ -697,6 +1805,7 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
     fn write_bit(&mut self, bit: u8) -> Result<(), CozipDeflateError> {
         self.byte |= (bit & 1) << self.used;
         self.used += 1;
+        self.total_bits = self.total_bits.saturating_add(1);
         if self.used == 8 {
             self.emit_byte(self.byte)?;
             self.byte = 0;
@@ -708,12 +1817,14 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
     fn write_byte_bits(&mut self, value: u8) -> Result<(), CozipDeflateError> {
         if self.used == 0 {
             self.emit_byte(value)?;
+            self.total_bits = self.total_bits.saturating_add(8);
             return Ok(());
         }
 
         let merged = self.byte | (value << self.used);
         self.emit_byte(merged)?;
         self.byte = value >> (8 - self.used);
+        self.total_bits = self.total_bits.saturating_add(8);
         Ok(())
     }
 
@@ -733,6 +1844,9 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
                 let start = src_bit / 8;
                 let end = start + byte_count;
                 self.emit_bytes(&src[start..end])?;
+                let bulk_bits = u64::try_from(byte_count.saturating_mul(8))
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                self.total_bits = self.total_bits.saturating_add(bulk_bits);
                 src_bit += byte_count * 8;
                 bit_len -= byte_count * 8;
                 continue;
@@ -765,6 +1879,10 @@ impl<'a, W: Write> DeflateBitWriter<'a, W> {
 
     fn io_counters(&self) -> (u64, usize, u64) {
         (self.io_ns, self.io_calls, self.io_bytes)
+    }
+
+    fn total_bits(&self) -> u64 {
+        self.total_bits
     }
 }
 
@@ -1320,13 +2438,22 @@ pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
     writer: &mut W,
     level: u32,
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    let result = deflate_compress_stream_hybrid_zip_compatible_with_index(reader, writer, level)?;
+    Ok(result.stats)
+}
+
+pub fn deflate_compress_stream_hybrid_zip_compatible_with_index<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    level: u32,
+) -> Result<DeflateHybridCompressResult, CozipDeflateError> {
     let options = default_hybrid_options_for_stream(level);
     let gpu_context = if is_gpu_requested(&options) {
         GpuAssist::new(&options).ok().map(Arc::new)
     } else {
         None
     };
-    deflate_compress_stream_hybrid_zip_compatible_with_context(
+    deflate_compress_stream_hybrid_zip_compatible_with_index_and_context(
         reader,
         writer,
         &options,
@@ -1334,12 +2461,12 @@ pub fn deflate_compress_stream_hybrid_zip_compatible<R: Read, W: Write>(
     )
 }
 
-fn deflate_compress_stream_hybrid_zip_compatible_with_context<R: Read, W: Write>(
+fn deflate_compress_stream_hybrid_zip_compatible_with_index_and_context<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     options: &HybridOptions,
     gpu_context: Option<Arc<GpuAssist>>,
-) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+) -> Result<DeflateHybridCompressResult, CozipDeflateError> {
     validate_options(options)?;
     deflate_compress_stream_hybrid_zip_compatible_continuous_with_context(
         reader,
@@ -1354,9 +2481,10 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     writer: &mut W,
     options: &HybridOptions,
     gpu_context: Option<Arc<GpuAssist>>,
-) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+) -> Result<DeflateHybridCompressResult, CozipDeflateError> {
     let total_start = Instant::now();
     let mut stats = DeflateCpuStreamStats::default();
+    let mut chunk_index_entries = Vec::<DeflateChunkIndexEntry>::new();
     let mut input_crc = crc32fast::Hasher::new();
     let mut output = HashingCountWriter::new(writer);
     let mut bit_writer = DeflateBitWriter::new(&mut output);
@@ -1483,10 +2611,13 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
             progressed = true;
 
             let is_final_chunk = reached_eof && next_write_index + 1 == next_read_index;
+            let chunk_start_bit = bit_writer.total_bits();
+            let mut connector_bits = 0_u64;
             let io_before = bit_writer.io_counters();
             let write_start = Instant::now();
             if next_write_index > 0 && bit_writer.used != 0 {
                 append_empty_stored_block_non_final(&mut bit_writer)?;
+                connector_bits = bit_writer.total_bits().saturating_sub(chunk_start_bit);
             }
             if let Some(non_final_end_bit) = ready.prepared_non_final_end_bit {
                 if is_final_chunk {
@@ -1514,6 +2645,20 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
             let write_elapsed = elapsed_ms(write_start);
             let io_after = bit_writer.io_counters();
             accumulate_write_stage_metrics(&mut stats, write_elapsed, io_before, io_after);
+            let chunk_end_bit = bit_writer.total_bits();
+
+            let final_header_rel_bit = connector_bits
+                .checked_add(u64::try_from(ready.layout.final_header_bit).unwrap_or(u64::MAX))
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+            let comp_bit_len = chunk_end_bit.saturating_sub(chunk_start_bit);
+            chunk_index_entries.push(DeflateChunkIndexEntry {
+                comp_bit_off: chunk_start_bit,
+                comp_bit_len: u32::try_from(comp_bit_len)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                final_header_rel_bit: u32::try_from(final_header_rel_bit)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)?,
+                raw_len: ready.chunk.raw_len,
+            });
 
             stats.chunk_count = stats.chunk_count.saturating_add(1);
             match ready.chunk.backend {
@@ -1601,7 +2746,21 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<R: Read
     stats.output_crc32 = output.hasher.finalize();
     stats.gpu_available = gpu_enabled;
     stats.compress_stage_ms = (elapsed_ms(total_start) - stats.write_stage_ms).max(0.0);
-    Ok(stats)
+    let index = if chunk_index_entries.is_empty() {
+        None
+    } else {
+        Some(DeflateChunkIndex {
+            chunk_size: u32::try_from(options.chunk_size)
+                .map_err(|_| CozipDeflateError::DataTooLarge)?,
+            chunk_count: u32::try_from(chunk_index_entries.len())
+                .map_err(|_| CozipDeflateError::DataTooLarge)?,
+            uncompressed_size: stats.input_bytes,
+            compressed_size: stats.output_bytes,
+            entries: chunk_index_entries,
+        })
+    };
+
+    Ok(DeflateHybridCompressResult { stats, index })
 }
 
 fn stream_task_is_gpu_eligible(task: &ChunkTask, options: &HybridOptions) -> bool {
@@ -1929,6 +3088,15 @@ fn cpu_worker_count(has_gpu: bool) -> usize {
     // can underutilize CPU on CPU-heavy workloads (especially when GPU share is low).
     let _ = has_gpu;
     available.max(1)
+}
+
+fn decode_gpu_worker_count(options: &HybridOptions, task_count: usize) -> usize {
+    // Current wgpu decode path performs blocking poll/map per call.
+    // Running multiple decode GPU workers causes severe queue contention and
+    // desktop stalls on some drivers. Keep it single-worker until decode
+    // submission/collection is fully async.
+    let _ = options;
+    task_count.min(1)
 }
 
 fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {

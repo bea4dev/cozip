@@ -116,7 +116,11 @@ pub(super) struct GpuAssist {
     scan_blocks_pipeline: wgpu::ComputePipeline,
     scan_add_bind_group_layout: wgpu::BindGroupLayout,
     scan_add_pipeline: wgpu::ComputePipeline,
+    decode_bind_group_layout: wgpu::BindGroupLayout,
+    decode_pipeline: wgpu::ComputePipeline,
     deflate_slots: Mutex<Vec<DeflateSlot>>,
+    decode_scratch_pool: Mutex<Vec<DecodeScratch>>,
+    decode_scratch_pool_limit: usize,
     deflate_header_buffer: wgpu::Buffer,
     dump_bad_chunk_seq: AtomicUsize,
 }
@@ -160,6 +164,24 @@ struct DeflateSlot {
     dyn_map_bg: wgpu::BindGroup,
     dyn_finalize_bg: wgpu::BindGroup,
     bitpack_bg: wgpu::BindGroup,
+}
+
+#[derive(Debug)]
+struct DecodeScratch {
+    input_capacity: u64,
+    meta_capacity: u64,
+    output_capacity: u64,
+    lens_capacity: u64,
+    input_buffer: wgpu::Buffer,
+    meta_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    out_lens_buffer: wgpu::Buffer,
+    status_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    output_readback: wgpu::Buffer,
+    out_lens_readback: wgpu::Buffer,
+    status_readback: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 impl GpuAssist {
@@ -1026,6 +1048,93 @@ impl GpuAssist {
             entry_point: "main",
         });
 
+        let decode_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cozip-decode-deflate-bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let decode_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cozip-decode-deflate-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                "shaders/decode_stored.wgsl"
+            ))),
+        });
+
+        let decode_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cozip-decode-deflate-layout"),
+            bind_group_layouts: &[&decode_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let decode_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cozip-decode-deflate-pipeline"),
+            layout: Some(&decode_layout),
+            module: &decode_shader,
+            entry_point: "main",
+        });
+
         // run_start_positions*専用だったmatch/count/prefix/emitパイプラインは未使用のため
         // 初期化コスト削減のため生成しない。
 
@@ -1062,10 +1171,171 @@ impl GpuAssist {
             scan_blocks_pipeline,
             scan_add_bind_group_layout,
             scan_add_pipeline,
+            decode_bind_group_layout,
+            decode_pipeline,
             deflate_slots: Mutex::new(Vec::new()),
+            decode_scratch_pool: Mutex::new(Vec::new()),
+            decode_scratch_pool_limit: options.gpu_slot_count.max(1),
             deflate_header_buffer,
             dump_bad_chunk_seq: AtomicUsize::new(0),
         })
+    }
+
+    fn decode_capacity(required: u64) -> u64 {
+        let base = required.max(256);
+        base.checked_next_power_of_two().unwrap_or(base)
+    }
+
+    fn create_decode_scratch(
+        &self,
+        input_capacity: u64,
+        meta_capacity: u64,
+        output_capacity: u64,
+        lens_capacity: u64,
+    ) -> DecodeScratch {
+        let input_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-input"),
+            size: input_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let meta_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-meta"),
+            size: meta_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-output"),
+            size: output_capacity,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_lens_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-out-lens"),
+            size: lens_capacity,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let status_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-status"),
+            size: lens_capacity,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-output-rb"),
+            size: output_capacity,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let out_lens_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-out-lens-rb"),
+            size: lens_capacity,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let status_readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-decode-stored-status-rb"),
+            size: lens_capacity,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-decode-stored-bg"),
+            layout: &self.decode_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_lens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: status_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        DecodeScratch {
+            input_capacity,
+            meta_capacity,
+            output_capacity,
+            lens_capacity,
+            input_buffer,
+            meta_buffer,
+            output_buffer,
+            out_lens_buffer,
+            status_buffer,
+            params_buffer,
+            output_readback,
+            out_lens_readback,
+            status_readback,
+            bind_group,
+        }
+    }
+
+    fn acquire_decode_scratch(
+        &self,
+        input_size: u64,
+        meta_size: u64,
+        out_size: u64,
+        lens_size: u64,
+    ) -> Result<DecodeScratch, CozipDeflateError> {
+        let mut pool = lock(&self.decode_scratch_pool)?;
+        if let Some(pos) = pool.iter().position(|scratch| {
+            scratch.input_capacity >= input_size
+                && scratch.meta_capacity >= meta_size
+                && scratch.output_capacity >= out_size
+                && scratch.lens_capacity >= lens_size
+        }) {
+            return Ok(pool.swap_remove(pos));
+        }
+        drop(pool);
+        let input_capacity = Self::decode_capacity(input_size);
+        let meta_capacity = Self::decode_capacity(meta_size);
+        let output_capacity = Self::decode_capacity(out_size);
+        let lens_capacity = Self::decode_capacity(lens_size);
+        Ok(self.create_decode_scratch(
+            input_capacity,
+            meta_capacity,
+            output_capacity,
+            lens_capacity,
+        ))
+    }
+
+    fn release_decode_scratch(&self, scratch: DecodeScratch) -> Result<(), CozipDeflateError> {
+        let mut pool = lock(&self.decode_scratch_pool)?;
+        if pool.len() < self.decode_scratch_pool_limit.max(1) {
+            pool.push(scratch);
+        }
+        Ok(())
     }
 
     fn dispatch_parallel_prefix_scan(
@@ -1919,6 +2189,317 @@ impl GpuAssist {
         self.device.poll(wgpu::Maintain::Wait);
         Ok(elapsed_ms(start))
     }
+
+    pub(super) fn inflate_deflate_blocks_batch<'a>(
+        &self,
+        chunks: &[(&'a [u8], usize)],
+    ) -> Result<Vec<Option<Vec<u8>>>, CozipDeflateError> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timing_enabled = self.profile_timing;
+        let timing_detail_enabled = timing_enabled && self.profile_timing_detail;
+        let call_id = if timing_enabled {
+            GPU_TIMING_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let call_start = if timing_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut submit_ms = 0.0;
+        let mut wait_ms = 0.0;
+        let mut unpack_ms = 0.0;
+        let mut status_hist = [0usize; 16];
+        let mut status_other = 0usize;
+        let mut len_mismatch = 0usize;
+        let mut ok_chunks = 0usize;
+        let mut fail_chunks = 0usize;
+
+        let chunk_count = chunks.len();
+        let chunk_count_u32 =
+            u32::try_from(chunk_count).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let total_comp_bytes = chunks.iter().try_fold(0usize, |acc, (chunk, _)| {
+            acc.checked_add(chunk.len())
+                .ok_or(CozipDeflateError::DataTooLarge)
+        })?;
+        let total_out_bytes = chunks.iter().try_fold(0usize, |acc, (_, out_len)| {
+            acc.checked_add(*out_len)
+                .ok_or(CozipDeflateError::DataTooLarge)
+        })?;
+        let total_comp_bytes_u32 =
+            u32::try_from(total_comp_bytes).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let total_out_bytes_u32 =
+            u32::try_from(total_out_bytes).map_err(|_| CozipDeflateError::DataTooLarge)?;
+        let _ = total_comp_bytes_u32;
+        let _ = total_out_bytes_u32;
+
+        let comp_words = total_comp_bytes.div_ceil(std::mem::size_of::<u32>());
+        let out_words = total_out_bytes.div_ceil(std::mem::size_of::<u32>());
+        let input_size = bytes_len::<u32>(comp_words)?;
+        let meta_size = bytes_len::<u32>(
+            chunk_count
+                .checked_mul(4)
+                .ok_or(CozipDeflateError::DataTooLarge)?,
+        )?;
+        let out_size = bytes_len::<u32>(out_words)?;
+        let lens_size = bytes_len::<u32>(chunk_count)?;
+
+        let mut input_bytes =
+            vec![0_u8; usize::try_from(input_size).map_err(|_| CozipDeflateError::DataTooLarge)?];
+        let mut meta_words = vec![0_u32; chunk_count * 4];
+        let mut out_offsets = vec![0_u32; chunk_count];
+        let mut expected_lens = vec![0_u32; chunk_count];
+
+        let mut comp_cursor = 0usize;
+        let mut out_cursor = 0usize;
+        for (idx, (chunk, expected_len)) in chunks.iter().enumerate() {
+            let chunk_len_u32 =
+                u32::try_from(chunk.len()).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let expected_len_u32 =
+                u32::try_from(*expected_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            let next_comp = comp_cursor
+                .checked_add(chunk.len())
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+            input_bytes[comp_cursor..next_comp].copy_from_slice(chunk);
+            meta_words[idx * 4] =
+                u32::try_from(comp_cursor).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            meta_words[idx * 4 + 1] = chunk_len_u32
+                .checked_mul(8)
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+            meta_words[idx * 4 + 2] =
+                u32::try_from(out_cursor).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            meta_words[idx * 4 + 3] = expected_len_u32;
+            out_offsets[idx] =
+                u32::try_from(out_cursor).map_err(|_| CozipDeflateError::DataTooLarge)?;
+            expected_lens[idx] = expected_len_u32;
+
+            comp_cursor = next_comp;
+            out_cursor = out_cursor
+                .checked_add(*expected_len)
+                .ok_or(CozipDeflateError::DataTooLarge)?;
+        }
+
+        let params = [chunk_count_u32, 0, 0, 0];
+        let scratch = self.acquire_decode_scratch(input_size, meta_size, out_size, lens_size)?;
+
+        let result = (|| -> Result<Vec<Option<Vec<u8>>>, CozipDeflateError> {
+            let submit_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            self.queue
+                .write_buffer(&scratch.input_buffer, 0, &input_bytes);
+            self.queue
+                .write_buffer(&scratch.meta_buffer, 0, bytemuck::cast_slice(&meta_words));
+            self.queue
+                .write_buffer(&scratch.params_buffer, 0, bytemuck::cast_slice(&params));
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-decode-stored-encoder"),
+                });
+            encoder.clear_buffer(&scratch.output_buffer, 0, Some(out_size));
+            encoder.clear_buffer(&scratch.out_lens_buffer, 0, Some(lens_size));
+            encoder.clear_buffer(&scratch.status_buffer, 0, Some(lens_size));
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-decode-stored-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.decode_pipeline);
+                pass.set_bind_group(0, &scratch.bind_group, &[]);
+                pass.dispatch_workgroups(chunk_count_u32, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &scratch.output_buffer,
+                0,
+                &scratch.output_readback,
+                0,
+                out_size,
+            );
+            encoder.copy_buffer_to_buffer(
+                &scratch.out_lens_buffer,
+                0,
+                &scratch.out_lens_readback,
+                0,
+                lens_size,
+            );
+            encoder.copy_buffer_to_buffer(
+                &scratch.status_buffer,
+                0,
+                &scratch.status_readback,
+                0,
+                lens_size,
+            );
+            self.queue.submit(Some(encoder.finish()));
+            if let Some(start) = submit_start {
+                submit_ms += elapsed_ms(start);
+            }
+
+            let (status_tx, status_rx) = std::sync::mpsc::channel();
+            scratch
+                .status_readback
+                .slice(0..lens_size)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = status_tx.send(result);
+                });
+            let (len_tx, len_rx) = std::sync::mpsc::channel();
+            scratch
+                .out_lens_readback
+                .slice(0..lens_size)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = len_tx.send(result);
+                });
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            scratch
+                .output_readback
+                .slice(0..out_size)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = out_tx.send(result);
+                });
+            let wait_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            self.device.poll(wgpu::Maintain::Wait);
+            if let Some(start) = wait_start {
+                wait_ms += elapsed_ms(start);
+            }
+
+            match status_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            }
+            match len_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            }
+            match out_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+                Err(err) => return Err(CozipDeflateError::GpuExecution(err.to_string())),
+            }
+
+            let unpack_start = if timing_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let status_map = scratch.status_readback.slice(0..lens_size).get_mapped_range();
+            let lens_map = scratch
+                .out_lens_readback
+                .slice(0..lens_size)
+                .get_mapped_range();
+            let out_map = scratch.output_readback.slice(0..out_size).get_mapped_range();
+
+            let status_words: &[u32] = bytemuck::cast_slice(&status_map);
+            let lens_words: &[u32] = bytemuck::cast_slice(&lens_map);
+            let mut results = vec![None; chunk_count];
+            for idx in 0..chunk_count {
+                let status = status_words.get(idx).copied().unwrap_or(9);
+                let got_len = lens_words.get(idx).copied().unwrap_or(0);
+                let expected_len = expected_lens[idx];
+                if status == 0 && got_len == expected_len {
+                    ok_chunks = ok_chunks.saturating_add(1);
+                    let off = usize::try_from(out_offsets[idx])
+                        .map_err(|_| CozipDeflateError::DataTooLarge)?;
+                    let len =
+                        usize::try_from(got_len).map_err(|_| CozipDeflateError::DataTooLarge)?;
+                    let end = off
+                        .checked_add(len)
+                        .ok_or(CozipDeflateError::DataTooLarge)?;
+                    if end <= out_map.len() {
+                        let mut raw = Vec::with_capacity(len);
+                        raw.extend_from_slice(&out_map[off..end]);
+                        results[idx] = Some(raw);
+                    }
+                } else {
+                    fail_chunks = fail_chunks.saturating_add(1);
+                    if status == 0 {
+                        len_mismatch = len_mismatch.saturating_add(1);
+                    } else if let Ok(status_index) = usize::try_from(status) {
+                        if status_index < status_hist.len() {
+                            status_hist[status_index] = status_hist[status_index].saturating_add(1);
+                        } else {
+                            status_other = status_other.saturating_add(1);
+                        }
+                    } else {
+                        status_other = status_other.saturating_add(1);
+                    }
+                }
+            }
+            if let Some(start) = unpack_start {
+                unpack_ms += elapsed_ms(start);
+            }
+
+            drop(status_map);
+            drop(lens_map);
+            drop(out_map);
+            scratch.status_readback.unmap();
+            scratch.out_lens_readback.unmap();
+            scratch.output_readback.unmap();
+
+            Ok(results)
+        })();
+
+        let release_result = self.release_decode_scratch(scratch);
+        let final_result = match (result, release_result) {
+            (Ok(results), Ok(())) => Ok(results),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        };
+        if timing_enabled {
+            let total_ms = call_start.map(elapsed_ms).unwrap_or(0.0);
+            if timing_detail_enabled {
+                eprintln!(
+                    "[cozip][timing][gpu-decode] call={} chunks={} in_mib={:.2} out_mib={:.2} ok={} fail={} len_mismatch={} st1={} st2={} st3={} st4={} st5={} st6={} st7={} st8={} st9={} st_other={} t_submit_ms={:.3} t_wait_ms={:.3} t_unpack_ms={:.3} t_total_ms={:.3}",
+                    call_id,
+                    chunk_count,
+                    total_comp_bytes as f64 / (1024.0 * 1024.0),
+                    total_out_bytes as f64 / (1024.0 * 1024.0),
+                    ok_chunks,
+                    fail_chunks,
+                    len_mismatch,
+                    status_hist[1],
+                    status_hist[2],
+                    status_hist[3],
+                    status_hist[4],
+                    status_hist[5],
+                    status_hist[6],
+                    status_hist[7],
+                    status_hist[8],
+                    status_hist[9],
+                    status_other,
+                    submit_ms,
+                    wait_ms,
+                    unpack_ms,
+                    total_ms,
+                );
+            } else {
+                eprintln!(
+                    "[cozip][timing][gpu-decode] call={} chunks={} ok={} fail={} t_submit_ms={:.3} t_wait_ms={:.3} t_unpack_ms={:.3} t_total_ms={:.3}",
+                    call_id,
+                    chunk_count,
+                    ok_chunks,
+                    fail_chunks,
+                    submit_ms,
+                    wait_ms,
+                    unpack_ms,
+                    total_ms,
+                );
+            }
+        }
+        final_result
+    }
+
     pub(super) fn deflate_fixed_literals_batch(
         &self,
         chunks: &[&[u8]],

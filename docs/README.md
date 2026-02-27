@@ -16,6 +16,7 @@
 - `gpu-deflate-chunk-pipeline.md`: 独立チャンクをCPU/GPUでDeflateし連結する実装設計
 - `zip-gpu-compatibility.md`: ZIP互換を維持したGPU圧縮の制約と実装方針メモ
 - `zip-compatible-hybrid-deflate-design.md`: CZDF実装を活かしつつZIP互換を満たすハイブリッド圧縮の実装設計
+- `hybrid-decompress-with-zip-metadata-design.md`: CoZipDeflateのCPU+GPU解凍をZIPメタデータ連携で段階導入する設計
 - `context-log.md`: 作業ログ・決定事項・未決事項
 
 ## 運用ルール

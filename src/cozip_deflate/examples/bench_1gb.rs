@@ -17,6 +17,7 @@ struct BenchConfig {
     token_finalize_segment_size: usize,
     gpu_slots: usize,
     gpu_batch_chunks: usize,
+    decomp_gpu_batch_chunks: usize,
     gpu_submit_chunks: usize,
     stream_pipeline_depth: usize,
     stream_batch_chunks: usize,
@@ -42,6 +43,7 @@ impl Default for BenchConfig {
             token_finalize_segment_size: 4096,
             gpu_slots: 6,
             gpu_batch_chunks: 6,
+            decomp_gpu_batch_chunks: 0,
             gpu_submit_chunks: 3,
             stream_pipeline_depth: 3,
             stream_batch_chunks: 0,
@@ -145,6 +147,11 @@ impl BenchConfig {
                     cfg.gpu_batch_chunks = value
                         .parse::<usize>()
                         .map_err(|_| "invalid --gpu-batch-chunks".to_string())?;
+                }
+                "--decomp-gpu-batch-chunks" => {
+                    cfg.decomp_gpu_batch_chunks = value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --decomp-gpu-batch-chunks".to_string())?;
                 }
                 "--stream-pipeline-depth" => {
                     cfg.stream_pipeline_depth = value
@@ -251,6 +258,7 @@ fn help_text() -> String {
   --token-finalize-segment-size <N> token finalize segment size (default: 4096)
   --gpu-slots <N>          gpu slot/batch count (default: 6)
   --gpu-batch-chunks <N>   gpu dequeue batch size (default: 6)
+  --decomp-gpu-batch-chunks <N> decode-side gpu dequeue batch size (0: unlimited, default: 0)
   --gpu-submit-chunks <N>  gpu submit group size (default: 3)
   --stream-pipeline-depth <N>  stream prepare pipeline depth (default: 3)
   --stream-batch-chunks <N>    fixed to 0 (legacy batch mode removed)
@@ -350,17 +358,27 @@ fn run_case(input: &[u8], cozip: &CoZipDeflate, iters: usize) -> BenchAgg {
         let mut src = Cursor::new(input);
         let mut compressed = Vec::new();
         let t0 = Instant::now();
-        let compress_stats = cozip
-            .deflate_compress_stream_zip_compatible(&mut src, &mut compressed)
+        let compress_result = cozip
+            .deflate_compress_stream_zip_compatible_with_index(&mut src, &mut compressed)
             .expect("compress should succeed");
+        let compress_stats = compress_result.stats;
         let compress_elapsed = t0.elapsed();
 
         let mut compressed_reader = Cursor::new(&compressed);
         let mut restored = Vec::with_capacity(input.len());
         let t1 = Instant::now();
-        let decompress_stats =
+        let decompress_stats = if let Some(index) = compress_result.index.as_ref() {
+            cozip
+                .deflate_decompress_stream_zip_compatible_with_index(
+                    &mut compressed_reader,
+                    &mut restored,
+                    index,
+                )
+                .expect("indexed decompress should succeed")
+        } else {
             deflate_decompress_stream_on_cpu(&mut compressed_reader, &mut restored)
-                .expect("decompress should succeed");
+                .expect("stream decompress should succeed")
+        };
         let decompress_elapsed = t1.elapsed();
 
         assert_eq!(restored, input);
@@ -422,6 +440,7 @@ fn main() {
         stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
         scheduler_policy: cfg.scheduler_policy,
         gpu_batch_chunks: cfg.gpu_batch_chunks,
+        decode_gpu_batch_chunks: cfg.decomp_gpu_batch_chunks,
         gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
         token_finalize_segment_size: cfg.token_finalize_segment_size,
         compression_level: 6,
@@ -446,6 +465,7 @@ fn main() {
         stream_max_inflight_bytes: cfg.stream_max_inflight_mib * 1024 * 1024,
         scheduler_policy: cfg.scheduler_policy,
         gpu_batch_chunks: cfg.gpu_batch_chunks,
+        decode_gpu_batch_chunks: cfg.decomp_gpu_batch_chunks,
         gpu_pipelined_submit_chunks: cfg.gpu_submit_chunks,
         token_finalize_segment_size: cfg.token_finalize_segment_size,
         compression_level: 6,
@@ -466,12 +486,13 @@ fn main() {
         cfg.size_mib, cfg.iters, cfg.warmups, cfg.chunk_mib, cfg.gpu_subchunk_kib, cfg.mode
     );
     println!(
-        "gpu_fraction={:.2} gpu_tail_stop_ratio={:.2} token_finalize_segment_size={} gpu_slots={} gpu_batch_chunks={} gpu_submit_chunks={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} scheduler={:?} profile_timing={} profile_timing_detail={} profile_timing_deep={}",
+        "gpu_fraction={:.2} gpu_tail_stop_ratio={:.2} token_finalize_segment_size={} gpu_slots={} gpu_batch_chunks={} decomp_gpu_batch_chunks={} gpu_submit_chunks={} stream_pipeline_depth={} stream_batch_chunks={} stream_max_inflight_chunks={} stream_max_inflight_mib={} scheduler={:?} profile_timing={} profile_timing_detail={} profile_timing_deep={}",
         cfg.gpu_fraction,
         cfg.gpu_tail_stop_ratio,
         cfg.token_finalize_segment_size,
         cfg.gpu_slots,
         cfg.gpu_batch_chunks,
+        cfg.decomp_gpu_batch_chunks,
         cfg.gpu_submit_chunks,
         cfg.stream_pipeline_depth,
         cfg.stream_batch_chunks,
@@ -557,7 +578,7 @@ fn main() {
     };
 
     println!(
-        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU_ONLY: avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={} decomp_cpu_worker_busy_ms={:.1} decomp_gpu_worker_busy_ms={:.1} decomp_cpu_wait_for_task_ms={:.1} decomp_gpu_wait_for_task_ms={:.1} decomp_gpu_batches={} decomp_gpu_worker_chunks={} decomp_gpu_attempt_chunks={} decomp_gpu_fallback_chunks={} decomp_decode_prepare_ms={:.1} decomp_decode_gpu_call_ms={:.1} decomp_decode_gpu_fallback_cpu_ms={:.1}",
         cpu.avg_compress_ms(cfg.iters),
         cpu.avg_decompress_ms(cfg.iters),
         cpu.compress_mib_s(),
@@ -608,9 +629,20 @@ fn main() {
         cpu.last_decompress_stats.cpu_chunks,
         cpu.last_decompress_stats.gpu_chunks,
         cpu.last_decompress_stats.gpu_available,
+        cpu.last_decompress_stats.cpu_worker_busy_ms,
+        cpu.last_decompress_stats.gpu_worker_busy_ms,
+        cpu.last_decompress_stats.cpu_wait_for_task_ms,
+        cpu.last_decompress_stats.gpu_wait_for_task_ms,
+        cpu.last_decompress_stats.gpu_batch_count,
+        cpu.last_decompress_stats.gpu_worker_chunks,
+        cpu.last_decompress_stats.decode_gpu_attempt_chunks,
+        cpu.last_decompress_stats.decode_gpu_fallback_chunks,
+        cpu.last_decompress_stats.decode_prepare_ms,
+        cpu.last_decompress_stats.decode_gpu_call_ms,
+        cpu.last_decompress_stats.decode_gpu_fallback_cpu_ms,
     );
     println!(
-        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={}",
+        "CPU+GPU : avg_comp_ms={:.3} avg_decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4} chunks={} cpu_chunks={} gpu_chunks={} gpu_available={} comp_stage_ms={:.1} layout_parse_ms={:.1} write_stage_ms={:.1} write_pack_ms={:.1} write_io_ms={:.1} write_io_calls={} write_io_mib={:.2} cpu_worker_busy_ms={:.1} gpu_worker_busy_ms={:.1} cpu_queue_lock_wait_ms={:.1} gpu_queue_lock_wait_ms={:.1} cpu_wait_for_task_ms={:.1} gpu_wait_for_task_ms={:.1} writer_wait_ms={:.1} writer_wait_events={} writer_hol_wait_ms={:.1} writer_hol_wait_events={} writer_hol_ready_avg={:.2} writer_hol_ready_max={} inflight_chunks_max={} ready_chunks_max={} cpu_no_task_events={} gpu_no_task_events={} cpu_yield_events={} gpu_yield_events={} cpu_worker_parallelism={:.2} gpu_worker_parallelism={:.2} cpu_worker_chunks={} gpu_worker_chunks={} cpu_chunk_avg_ms={:.2} gpu_chunk_avg_ms={:.2} cpu_steal_chunks={} gpu_batches={} gpu_batch_avg_ms={:.2} gpu_initial_queue_chunks={} gpu_steal_reserve_chunks={} gpu_runtime_disabled={} decomp_chunks={} decomp_cpu_chunks={} decomp_gpu_tasks={} decomp_gpu_available={} decomp_cpu_worker_busy_ms={:.1} decomp_gpu_worker_busy_ms={:.1} decomp_cpu_wait_for_task_ms={:.1} decomp_gpu_wait_for_task_ms={:.1} decomp_gpu_batches={} decomp_gpu_worker_chunks={} decomp_gpu_attempt_chunks={} decomp_gpu_fallback_chunks={} decomp_decode_prepare_ms={:.1} decomp_decode_gpu_call_ms={:.1} decomp_decode_gpu_fallback_cpu_ms={:.1}",
         hybrid.avg_compress_ms(cfg.iters),
         hybrid.avg_decompress_ms(cfg.iters),
         hybrid.compress_mib_s(),
@@ -661,9 +693,20 @@ fn main() {
         hybrid.last_decompress_stats.cpu_chunks,
         hybrid.last_decompress_stats.gpu_chunks,
         hybrid.last_decompress_stats.gpu_available,
+        hybrid.last_decompress_stats.cpu_worker_busy_ms,
+        hybrid.last_decompress_stats.gpu_worker_busy_ms,
+        hybrid.last_decompress_stats.cpu_wait_for_task_ms,
+        hybrid.last_decompress_stats.gpu_wait_for_task_ms,
+        hybrid.last_decompress_stats.gpu_batch_count,
+        hybrid.last_decompress_stats.gpu_worker_chunks,
+        hybrid.last_decompress_stats.decode_gpu_attempt_chunks,
+        hybrid.last_decompress_stats.decode_gpu_fallback_chunks,
+        hybrid.last_decompress_stats.decode_prepare_ms,
+        hybrid.last_decompress_stats.decode_gpu_call_ms,
+        hybrid.last_decompress_stats.decode_gpu_fallback_cpu_ms,
     );
     println!(
-        "speedup(cpu/hybrid): compress={:.3}x ( >1.0 means CPU+GPU faster; decompress speedup omitted: CPU-only path )",
+        "speedup(cpu/hybrid): compress={:.3}x ( >1.0 means CPU+GPU faster )",
         comp_speedup
     );
 }
