@@ -803,13 +803,7 @@ pub fn deflate_decompress_stream_hybrid_indexed<R: Read, W: Write>(
     index: &DeflateChunkIndex,
     options: &HybridOptions,
 ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
-    deflate_decompress_stream_hybrid_indexed_with_context(
-        reader,
-        writer,
-        index,
-        options,
-        None,
-    )
+    deflate_decompress_stream_hybrid_indexed_with_context(reader, writer, index, options, None)
 }
 
 fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
@@ -1240,8 +1234,7 @@ fn decode_gpu_indexed_worker(
                             .and_then(|entry| usize::try_from(entry.raw_len).ok())
                             .unwrap_or(0);
                         let candidate_total = batch_raw_bytes.saturating_add(candidate_raw_len);
-                        if !tasks.is_empty() && candidate_total > batch_output_limit_bytes
-                        {
+                        if !tasks.is_empty() && candidate_total > batch_output_limit_bytes {
                             break;
                         }
                         if let Some(task) = state.queue.remove(pos) {

@@ -2342,26 +2342,26 @@ impl GpuAssist {
             }
 
             let (status_tx, status_rx) = std::sync::mpsc::channel();
-            scratch
-                .status_readback
-                .slice(0..lens_size)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            scratch.status_readback.slice(0..lens_size).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     let _ = status_tx.send(result);
-                });
+                },
+            );
             let (len_tx, len_rx) = std::sync::mpsc::channel();
-            scratch
-                .out_lens_readback
-                .slice(0..lens_size)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            scratch.out_lens_readback.slice(0..lens_size).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     let _ = len_tx.send(result);
-                });
+                },
+            );
             let (out_tx, out_rx) = std::sync::mpsc::channel();
-            scratch
-                .output_readback
-                .slice(0..out_size)
-                .map_async(wgpu::MapMode::Read, move |result| {
+            scratch.output_readback.slice(0..out_size).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
                     let _ = out_tx.send(result);
-                });
+                },
+            );
             let wait_start = if timing_enabled {
                 Some(Instant::now())
             } else {
@@ -2393,12 +2393,18 @@ impl GpuAssist {
             } else {
                 None
             };
-            let status_map = scratch.status_readback.slice(0..lens_size).get_mapped_range();
+            let status_map = scratch
+                .status_readback
+                .slice(0..lens_size)
+                .get_mapped_range();
             let lens_map = scratch
                 .out_lens_readback
                 .slice(0..lens_size)
                 .get_mapped_range();
-            let out_map = scratch.output_readback.slice(0..out_size).get_mapped_range();
+            let out_map = scratch
+                .output_readback
+                .slice(0..out_size)
+                .get_mapped_range();
 
             let status_words: &[u32] = bytemuck::cast_slice(&status_map);
             let lens_words: &[u32] = bytemuck::cast_slice(&lens_map);

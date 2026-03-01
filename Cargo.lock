@@ -221,6 +221,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cozip_gdeflate"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "thiserror 2.0.17",
+ "wgpu",
+]
+
+[[package]]
+name = "cozip_pdeflate"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

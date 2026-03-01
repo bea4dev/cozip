@@ -1,5 +1,5 @@
 [workspace]
-members = ["src/cozip_deflate", "src/cozip"]
+members = ["src/cozip_deflate", "src/cozip", "src/cozip_gdeflate", "src/cozip_pdeflate"]
 resolver = "2"
 
 [workspace.package]

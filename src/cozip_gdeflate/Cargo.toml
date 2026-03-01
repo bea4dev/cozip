@@ -1,0 +1,9 @@
+[package]
+name = "cozip_gdeflate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pollster = "=0.3.0"
+thiserror.workspace = true
+wgpu = "=0.19.4"

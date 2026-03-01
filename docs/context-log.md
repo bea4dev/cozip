@@ -1854,3 +1854,43 @@ mode別GPU品質パラメータ:
 
 補足:
 - 解凍ベンチが比較的安定していたのは、初期化ジッタの影響が主に圧縮側スケジューリングへ現れるためと整合する。
+
+## 2026-02-28 - 独自GDeflateハイブリッド設計（CPU+GPU実処理参加）を追加
+
+決定事項:
+- `docs/gdeflate-hybrid-cpu-gpu-design.md` を新規追加。
+- 当面は互換性後回しで、独自形式 `CGDF v0` を先行実装する方針。
+- CPUを管理専用にせず、CPU/GPUが同一キューから実処理タスクを消費する。
+- スケジューラーは `CoZipDeflate` の `GlobalQueueLocalBuffers` 準拠を維持する。
+
+補足:
+- 圧縮・解凍ともに同じ queue/ready/error の共有構造を採用する前提を明記。
+- 後続フェーズでMS互換対応を行う段階計画（G0-G4）を定義。
+
+## 2026-02-28 - cozip_gdeflate G1着手（Hybrid圧縮の最小実装）
+
+実装:
+- `src/cozip_gdeflate` に G1の最小構成を実装。
+- `CGDF v0` は維持したまま、圧縮経路に共有キュー方式を導入。
+  - CPUワーカー: `deflate_compress_chunk` を実行
+  - GPUワーカー: `CoZipDeflate` を利用したGPU支援圧縮を実行（失敗時はCPUフォールバック）
+  - Writer: index順に再整列してフレーム確定
+- `GdHybridStats` を追加し、CPU/GPUチャンク数・busy/wait・batch統計を収集。
+
+確認:
+- `cargo test -p cozip_gdeflate` 通過（6 tests）。
+- `cargo check -p cozip_gdeflate` 通過。
+
+## 2026-02-28 - cozip_gdeflate を純Rust GDeflate CPU encode/decode 初版へ切替
+
+実装:
+- `cozip_deflate` 依存を除去し、`src/cozip_gdeflate/src/lib.rs` を純Rust実装へ更新。
+- DirectStorage参照実装の TileStream ヘッダ形式（id/magic/numTiles/tile metadata）を採用。
+- CPU encode/decode を実装（現時点は stored-block ベース）。
+  - タイル(64KiB)分割
+  - 32 sub-stream への割当
+  - タイルストリームの offset テーブル生成
+  - 復号時の逆変換とサイズ検証
+
+確認:
+- `cargo test -p cozip_gdeflate` 通過（4 tests）。

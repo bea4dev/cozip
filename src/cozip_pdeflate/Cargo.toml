@@ -1,0 +1,10 @@
+[package]
+name = "cozip_pdeflate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+flate2 = { version = "=1.1.8", default-features = false, features = ["zlib-rs"] }

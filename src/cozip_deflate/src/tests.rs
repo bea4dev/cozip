@@ -278,13 +278,9 @@ fn indexed_hybrid_decode_is_cpu_only_even_if_gpu_requested() {
     let options = HybridOptions::default();
     let mut comp_reader = std::io::Cursor::new(compressed);
     let mut decoded = Vec::new();
-    let stats = deflate_decompress_stream_hybrid_indexed(
-        &mut comp_reader,
-        &mut decoded,
-        &index,
-        &options,
-    )
-    .expect("hybrid indexed decode should succeed on cpu");
+    let stats =
+        deflate_decompress_stream_hybrid_indexed(&mut comp_reader, &mut decoded, &index, &options)
+            .expect("hybrid indexed decode should succeed on cpu");
     assert_eq!(
         decoded.len(),
         usize::try_from(index.uncompressed_size).unwrap_or(0)
