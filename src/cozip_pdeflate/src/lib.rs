@@ -114,6 +114,11 @@ struct BuildScratch {
     used_seed_slot_indices: Vec<usize>,
     byte_scored: Vec<(u8, u64)>,
     scored_slot_indices: Vec<(usize, u64)>,
+    head: Vec<u32>,
+    touched_buckets: Vec<usize>,
+    prev: Vec<u32>,
+    keys: Vec<u32>,
+    positions: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -567,7 +572,12 @@ pub fn pdeflate_decompress_with_stats(
     let original_len = read_u64_le(stream, &mut cursor)? as usize;
     let chunk_count = read_u32_le(stream, &mut cursor)? as usize;
 
-    let mut output = vec![0u8; original_len];
+    // Decoder writes the full output span deterministically; avoid eager zero-fill
+    // to reduce allocator/memory-bandwidth overhead on multi-threaded decode.
+    let mut output = Vec::<u8>::with_capacity(original_len);
+    unsafe {
+        output.set_len(original_len);
+    }
     let mut stats = PDeflateStats {
         input_bytes: u64::try_from(stream.len()).map_err(|_| PDeflateError::NumericOverflow)?,
         chunk_count,
@@ -1114,7 +1124,9 @@ fn decode_section(
         if out_cursor + len > expected_out_len {
             return Err(PDeflateError::InvalidStream("section output overflow"));
         }
-        prof.cmd_count = prof.cmd_count.saturating_add(1);
+        if profile {
+            prof.cmd_count = prof.cmd_count.saturating_add(1);
+        }
 
         if tag == LITERAL_TAG as usize {
             let lit_end = cmd_cursor
@@ -1128,8 +1140,10 @@ fn decode_section(
             if let Some(start) = t0 {
                 prof.lit_copy_ms += elapsed_ms(start);
             }
-            prof.lit_cmds = prof.lit_cmds.saturating_add(1);
-            prof.lit_bytes = prof.lit_bytes.saturating_add(len as u64);
+            if profile {
+                prof.lit_cmds = prof.lit_cmds.saturating_add(1);
+                prof.lit_bytes = prof.lit_bytes.saturating_add(len as u64);
+            }
             cmd_cursor = lit_end;
             out_cursor += len;
             continue;
@@ -1150,8 +1164,10 @@ fn decode_section(
         if let Some(start) = t0 {
             prof.ref_copy_ms += elapsed_ms(start);
         }
-        prof.ref_cmds = prof.ref_cmds.saturating_add(1);
-        prof.ref_bytes = prof.ref_bytes.saturating_add(len as u64);
+        if profile {
+            prof.ref_cmds = prof.ref_cmds.saturating_add(1);
+            prof.ref_bytes = prof.ref_bytes.saturating_add(len as u64);
+        }
         out_cursor += len;
     }
 
@@ -1194,7 +1210,7 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
     let max_entries = options.max_table_entries.min(MAX_TABLE_ID);
     // Speed-biased sampling: keep external option semantics while reducing
     // probe volume for large chunks.
-    let sample_stride = options.table_sample_stride.max(1).saturating_mul(5);
+    let sample_stride = options.table_sample_stride.max(1).saturating_mul(8);
     // Table seeding is the dominant cost path. Keep probe fan-out tighter here.
     let probe_limit = options.match_probe_limit.min(1);
     let min_seed_match_len = options.min_ref_len.max(6);
@@ -1204,6 +1220,11 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
     let mut used_seed_slot_indices = Vec::<usize>::new();
     let mut byte_scored = Vec::<(u8, u64)>::new();
     let mut scored_slot_indices = Vec::<(usize, u64)>::new();
+    let mut head = Vec::<u32>::new();
+    let mut touched_buckets = Vec::<usize>::new();
+    let mut prev = Vec::<u32>::new();
+    let mut keys = Vec::<u32>::new();
+    let mut positions = Vec::<u32>::new();
     BUILD_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         std::mem::swap(&mut seed_slots, &mut scratch.seed_slots);
@@ -1216,6 +1237,11 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
             &mut scored_slot_indices,
             &mut scratch.scored_slot_indices,
         );
+        std::mem::swap(&mut head, &mut scratch.head);
+        std::mem::swap(&mut touched_buckets, &mut scratch.touched_buckets);
+        std::mem::swap(&mut prev, &mut scratch.prev);
+        std::mem::swap(&mut keys, &mut scratch.keys);
+        std::mem::swap(&mut positions, &mut scratch.positions);
     });
     for &idx in &used_seed_slot_indices {
         if let Some(slot) = seed_slots.get_mut(idx) {
@@ -1225,6 +1251,9 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
     used_seed_slot_indices.clear();
     byte_scored.clear();
     scored_slot_indices.clear();
+    prev.clear();
+    keys.clear();
+    positions.clear();
 
     let freq_t0 = Instant::now();
     let mut byte_freq = [0u32; 256];
@@ -1259,10 +1288,25 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
         hash_size <<= 1;
     }
     let hash_mask = hash_size - 1;
-    let mut head = vec![NO_POS; hash_size];
-    let mut prev = Vec::<u32>::with_capacity(sampled_count);
-    let mut keys = Vec::<u32>::with_capacity(sampled_count);
-    let mut positions = Vec::<u32>::with_capacity(sampled_count);
+    if head.len() < hash_size {
+        head.resize(hash_size, NO_POS);
+    }
+    // Clear only previously touched buckets instead of whole-head fill.
+    for &bucket in &touched_buckets {
+        if bucket < hash_size {
+            head[bucket] = NO_POS;
+        }
+    }
+    touched_buckets.clear();
+    if prev.capacity() < sampled_count {
+        prev.reserve(sampled_count - prev.capacity());
+    }
+    if keys.capacity() < sampled_count {
+        keys.reserve(sampled_count - keys.capacity());
+    }
+    if positions.capacity() < sampled_count {
+        positions.reserve(sampled_count - positions.capacity());
+    }
 
     let mut i = 0usize;
     while i + 2 < chunk.len() {
@@ -1277,6 +1321,9 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
         let mut chain = head[bucket];
         prev.push(chain);
         positions.push(i as u32);
+        if chain == NO_POS {
+            touched_buckets.push(bucket);
+        }
         head[bucket] = sample_idx as u32;
 
         let mut traversed = 0usize;
@@ -1472,6 +1519,11 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
             &mut scored_slot_indices,
             &mut scratch.scored_slot_indices,
         );
+        std::mem::swap(&mut head, &mut scratch.head);
+        std::mem::swap(&mut touched_buckets, &mut scratch.touched_buckets);
+        std::mem::swap(&mut prev, &mut scratch.prev);
+        std::mem::swap(&mut keys, &mut scratch.keys);
+        std::mem::swap(&mut positions, &mut scratch.positions);
     });
     (out, prof)
 }
@@ -1607,14 +1659,14 @@ fn encode_section_into(
                 // progressively reduce lookahead probe density as literal
                 // run grows to limit compare-heavy checks under high thread counts.
                 let lit_span = pos - lit_start;
-                let should_probe = if lit_span < 4 {
+                let should_probe = if lit_span < 8 {
                     true
-                } else if lit_span < 16 {
-                    (lit_span & 0x3) == 0
-                } else if lit_span < 64 {
-                    (lit_span & 0xF) == 0
-                } else {
+                } else if lit_span < 32 {
+                    (lit_span & 0x7) == 0
+                } else if lit_span < 128 {
                     (lit_span & 0x1F) == 0
+                } else {
+                    (lit_span & 0x3F) == 0
                 };
                 if !should_probe {
                     pos += 1;
