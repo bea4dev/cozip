@@ -94,7 +94,8 @@ impl EncodeScratch {
 
         for &k2 in &self.touched_prefix2 {
             let candidates = &mut self.by_prefix2[k2];
-            candidates.sort_by(|&a, &b| table[b].len().cmp(&table[a].len()).then_with(|| a.cmp(&b)));
+            candidates
+                .sort_by(|&a, &b| table[b].len().cmp(&table[a].len()).then_with(|| a.cmp(&b)));
         }
     }
 }
@@ -303,6 +304,10 @@ pub fn pdeflate_compress(
 
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
     pdeflate_decompress_with_stats(stream).map(|(out, _)| out)
+}
+
+pub fn pdeflate_decompress_into(stream: &[u8], output: &mut Vec<u8>) -> Result<(), PDeflateError> {
+    pdeflate_decompress_into_with_stats(stream, output).map(|_| ())
 }
 
 pub fn pdeflate_compress_with_stats(
@@ -557,6 +562,15 @@ pub fn pdeflate_compress_with_stats(
 pub fn pdeflate_decompress_with_stats(
     stream: &[u8],
 ) -> Result<(Vec<u8>, PDeflateStats), PDeflateError> {
+    let mut output = Vec::new();
+    let stats = pdeflate_decompress_into_with_stats(stream, &mut output)?;
+    Ok((output, stats))
+}
+
+pub fn pdeflate_decompress_into_with_stats(
+    stream: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<PDeflateStats, PDeflateError> {
     let mut cursor = 0usize;
     let magic = read_exact(stream, &mut cursor, 4)?;
     if magic != STREAM_MAGIC {
@@ -574,7 +588,10 @@ pub fn pdeflate_decompress_with_stats(
 
     // Decoder writes the full output span deterministically; avoid eager zero-fill
     // to reduce allocator/memory-bandwidth overhead on multi-threaded decode.
-    let mut output = Vec::<u8>::with_capacity(original_len);
+    output.clear();
+    if output.capacity() < original_len {
+        output.reserve_exact(original_len - output.capacity());
+    }
     unsafe {
         output.set_len(original_len);
     }
@@ -670,7 +687,7 @@ pub fn pdeflate_decompress_with_stats(
             prof_lit_copy_ms
         );
     }
-    Ok((output, stats))
+    Ok(stats)
 }
 
 fn validate_options(options: &PDeflateOptions) -> Result<(), PDeflateError> {
@@ -796,11 +813,12 @@ fn compress_chunk(
                 .saturating_add(sec_prof.best_tail_rejects);
             section_profile.ref_cmds = section_profile.ref_cmds.saturating_add(sec_prof.ref_cmds);
             section_profile.lit_cmds = section_profile.lit_cmds.saturating_add(sec_prof.lit_cmds);
-            section_profile.ref_bytes = section_profile.ref_bytes.saturating_add(sec_prof.ref_bytes);
-            section_profile.lit_bytes = section_profile.lit_bytes.saturating_add(sec_prof.lit_bytes);
-            section_cmd_lens.push(
-                u32::try_from(cmd_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            );
+            section_profile.ref_bytes =
+                section_profile.ref_bytes.saturating_add(sec_prof.ref_bytes);
+            section_profile.lit_bytes =
+                section_profile.lit_bytes.saturating_add(sec_prof.lit_bytes);
+            section_cmd_lens
+                .push(u32::try_from(cmd_len).map_err(|_| PDeflateError::NumericOverflow)?);
         }
         Ok(())
     })?;
@@ -1039,11 +1057,12 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
             let sec_cmd_end = cmd_cursor
                 .checked_add(sec_cmd_len)
                 .ok_or(PDeflateError::NumericOverflow)?;
-            let sec_cmd = section_cmd
-                .get(cmd_cursor..sec_cmd_end)
-                .ok_or(PDeflateError::InvalidStream(
-                    "section cmd range out of bounds",
-                ))?;
+            let sec_cmd =
+                section_cmd
+                    .get(cmd_cursor..sec_cmd_end)
+                    .ok_or(PDeflateError::InvalidStream(
+                        "section cmd range out of bounds",
+                    ))?;
             let out_start = section_start(sec, section_count, chunk_uncompressed_len);
             let out_end = section_start(sec + 1, section_count, chunk_uncompressed_len);
             let out_len = out_end - out_start;
@@ -1096,11 +1115,17 @@ fn decode_section(
     let mut cmd_cursor = 0usize;
     let mut out_cursor = 0usize;
 
+    let cmd_len = cmd_bytes.len();
     while out_cursor < expected_out_len {
         if cmd_cursor + 2 > cmd_bytes.len() {
             return Err(PDeflateError::InvalidStream("unexpected eof"));
         }
-        let cmd = u16::from_le_bytes([cmd_bytes[cmd_cursor], cmd_bytes[cmd_cursor + 1]]);
+        let cmd = unsafe {
+            u16::from_le_bytes([
+                *cmd_bytes.get_unchecked(cmd_cursor),
+                *cmd_bytes.get_unchecked(cmd_cursor + 1),
+            ])
+        };
         cmd_cursor += 2;
         let tag = (cmd & 0x0fff) as usize;
         let len4 = ((cmd >> 12) & 0x000f) as usize;
@@ -1110,7 +1135,7 @@ fn decode_section(
             if cmd_cursor >= cmd_bytes.len() {
                 return Err(PDeflateError::InvalidStream("missing ext len"));
             }
-            let ext = cmd_bytes[cmd_cursor] as usize;
+            let ext = unsafe { *cmd_bytes.get_unchecked(cmd_cursor) as usize };
             cmd_cursor += 1;
             EXT_LEN_BASE + ext
         };
@@ -1132,11 +1157,17 @@ fn decode_section(
             let lit_end = cmd_cursor
                 .checked_add(len)
                 .ok_or(PDeflateError::NumericOverflow)?;
-            let lit = cmd_bytes
-                .get(cmd_cursor..lit_end)
-                .ok_or(PDeflateError::InvalidStream("unexpected eof"))?;
+            if lit_end > cmd_len {
+                return Err(PDeflateError::InvalidStream("unexpected eof"));
+            }
             let t0 = if profile { Some(Instant::now()) } else { None };
-            out[out_cursor..out_cursor + len].copy_from_slice(lit);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    cmd_bytes.as_ptr().add(cmd_cursor),
+                    out.as_mut_ptr().add(out_cursor),
+                    len,
+                );
+            }
             if let Some(start) = t0 {
                 prof.lit_copy_ms += elapsed_ms(start);
             }
@@ -1160,7 +1191,9 @@ fn decode_section(
 
         let rep = &table_repeat[tag];
         let t0 = if profile { Some(Instant::now()) } else { None };
-        out[out_cursor..out_cursor + len].copy_from_slice(&rep[..len]);
+        unsafe {
+            ptr::copy_nonoverlapping(rep.as_ptr(), out.as_mut_ptr().add(out_cursor), len);
+        }
         if let Some(start) = t0 {
             prof.ref_copy_ms += elapsed_ms(start);
         }
@@ -1233,10 +1266,7 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
             &mut scratch.used_seed_slot_indices,
         );
         std::mem::swap(&mut byte_scored, &mut scratch.byte_scored);
-        std::mem::swap(
-            &mut scored_slot_indices,
-            &mut scratch.scored_slot_indices,
-        );
+        std::mem::swap(&mut scored_slot_indices, &mut scratch.scored_slot_indices);
         std::mem::swap(&mut head, &mut scratch.head);
         std::mem::swap(&mut touched_buckets, &mut scratch.touched_buckets);
         std::mem::swap(&mut prev, &mut scratch.prev);
@@ -1371,15 +1401,13 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
                         .min(max_entry_len)
                         .min(chunk.len().saturating_sub(i))
                         .min(chunk.len().saturating_sub(prev_pos));
-                    while anchored < anchor_cap
-                        && chunk[prev_pos + anchored] == chunk[i + anchored]
+                    while anchored < anchor_cap && chunk[prev_pos + anchored] == chunk[i + anchored]
                     {
                         anchored += 1;
                     }
                     if anchored < anchor_cap {
                         if detail_profile {
-                            prof.anchored_short_hits =
-                                prof.anchored_short_hits.saturating_add(1);
+                            prof.anchored_short_hits = prof.anchored_short_hits.saturating_add(1);
                         }
                         anchored
                     } else {
@@ -1515,10 +1543,7 @@ fn build_table(chunk: &[u8], options: &PDeflateOptions) -> (Vec<Vec<u8>>, BuildT
             &mut scratch.used_seed_slot_indices,
         );
         std::mem::swap(&mut byte_scored, &mut scratch.byte_scored);
-        std::mem::swap(
-            &mut scored_slot_indices,
-            &mut scratch.scored_slot_indices,
-        );
+        std::mem::swap(&mut scored_slot_indices, &mut scratch.scored_slot_indices);
         std::mem::swap(&mut head, &mut scratch.head);
         std::mem::swap(&mut touched_buckets, &mut scratch.touched_buckets);
         std::mem::swap(&mut prev, &mut scratch.prev);
@@ -2001,11 +2026,7 @@ fn find_best_match(
     }
 }
 
-fn select_candidates<'a>(
-    src: &'a [u8],
-    pos: usize,
-    by_prefix2: &'a [Vec<usize>],
-) -> &'a [usize] {
+fn select_candidates<'a>(src: &'a [u8], pos: usize, by_prefix2: &'a [Vec<usize>]) -> &'a [usize] {
     // zlib-style idea: strengthen the key used for candidate lookup so that
     // expensive match checks run on a shorter chain.
     if pos + 1 >= src.len() {
@@ -2096,7 +2117,12 @@ fn match_len_from(buf: &[u8], a: usize, b: usize, start: usize, max_len: usize) 
     let limit = max_len
         .min(buf.len().saturating_sub(a))
         .min(buf.len().saturating_sub(b));
-    start + fast_prefix_len(&buf[a + start..], &buf[b + start..], limit.saturating_sub(start))
+    start
+        + fast_prefix_len(
+            &buf[a + start..],
+            &buf[b + start..],
+            limit.saturating_sub(start),
+        )
 }
 
 #[inline]

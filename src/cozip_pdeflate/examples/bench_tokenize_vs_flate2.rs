@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
-use cozip_pdeflate::{PDeflateOptions, pdeflate_compress_with_stats, pdeflate_decompress};
+use cozip_pdeflate::{PDeflateOptions, pdeflate_compress_with_stats, pdeflate_decompress_into};
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
@@ -50,6 +50,8 @@ struct CompressResult {
 struct DecompressResult {
     ms: f64,
     mib_s: f64,
+    decode_ms: f64,
+    verify_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +133,12 @@ fn parse_args() -> Result<BenchConfig, String> {
                     _ => return Err(format!("invalid --verify-bytes: {v}")),
                 };
             }
+            "--verify" => {
+                cfg.verify_bytes = true;
+            }
+            "--no-verify" => {
+                cfg.verify_bytes = false;
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -173,6 +181,8 @@ options:\n\
   --sections <N>      pdeflate sections per chunk (default: 128)\n\
   --workers <N>       worker threads for both paths (default: hw threads)\n\
   --flate-level <N>   flate2 level 0..9 (default: 6)\n\
+  --verify            enable strict decoded-bytes check (default)\n\
+  --no-verify         disable decoded-bytes check\n\
   --verify-bytes <B>  strict decoded-bytes check (0/1, default: 1)\n\
   -h, --help          show help"
     );
@@ -230,43 +240,45 @@ fn run_parallel_compress(
     thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::with_capacity(cfg.workers);
         for _ in 0..cfg.workers {
-            handles.push(scope.spawn(|| -> Result<(usize, Vec<(usize, Vec<u8>)>), String> {
-                let mut local_out = 0usize;
-                let mut local_chunks = Vec::new();
-                loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= ranges.len() {
-                        break;
+            handles.push(
+                scope.spawn(|| -> Result<(usize, Vec<(usize, Vec<u8>)>), String> {
+                    let mut local_out = 0usize;
+                    let mut local_chunks = Vec::new();
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= ranges.len() {
+                            break;
+                        }
+                        let (start, end) = ranges[idx];
+                        let chunk = &input[start..end];
+                        let compressed = match algo {
+                            Algo::PDeflate => {
+                                let mut opts = PDeflateOptions::default();
+                                opts.chunk_size = chunk.len().max(1);
+                                opts.section_count = cfg.sections;
+                                let (compressed, _) = pdeflate_compress_with_stats(chunk, &opts)
+                                    .map_err(|e| format!("pdeflate chunk compress failed: {e}"))?;
+                                compressed
+                            }
+                            Algo::Flate2 => {
+                                let mut encoder = DeflateEncoder::new(
+                                    Vec::new(),
+                                    Compression::new(cfg.flate_level.clamp(0, 9)),
+                                );
+                                encoder
+                                    .write_all(chunk)
+                                    .map_err(|e| format!("flate2 write failed: {e}"))?;
+                                encoder
+                                    .finish()
+                                    .map_err(|e| format!("flate2 finish failed: {e}"))?
+                            }
+                        };
+                        local_out = local_out.saturating_add(compressed.len());
+                        local_chunks.push((idx, compressed));
                     }
-                    let (start, end) = ranges[idx];
-                    let chunk = &input[start..end];
-                    let compressed = match algo {
-                        Algo::PDeflate => {
-                            let mut opts = PDeflateOptions::default();
-                            opts.chunk_size = chunk.len().max(1);
-                            opts.section_count = cfg.sections;
-                            let (compressed, _) = pdeflate_compress_with_stats(chunk, &opts)
-                                .map_err(|e| format!("pdeflate chunk compress failed: {e}"))?;
-                            compressed
-                        }
-                        Algo::Flate2 => {
-                            let mut encoder = DeflateEncoder::new(
-                                Vec::new(),
-                                Compression::new(cfg.flate_level.clamp(0, 9)),
-                            );
-                            encoder
-                                .write_all(chunk)
-                                .map_err(|e| format!("flate2 write failed: {e}"))?;
-                            encoder
-                                .finish()
-                                .map_err(|e| format!("flate2 finish failed: {e}"))?
-                        }
-                    };
-                    local_out = local_out.saturating_add(compressed.len());
-                    local_chunks.push((idx, compressed));
-                }
-                Ok((local_out, local_chunks))
-            }));
+                    Ok((local_out, local_chunks))
+                }),
+            );
         }
 
         for handle in handles {
@@ -320,30 +332,39 @@ fn run_parallel_decompress(
     let next = AtomicUsize::new(0);
     let t0 = Instant::now();
     let mut total_out = 0usize;
+    let mut total_decode_ms = 0.0_f64;
+    let mut total_verify_ms = 0.0_f64;
 
     thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::with_capacity(cfg.workers);
         for _ in 0..cfg.workers {
-            handles.push(scope.spawn(|| -> Result<usize, String> {
+            handles.push(scope.spawn(|| -> Result<(usize, f64, f64), String> {
                 let mut local_out = 0usize;
+                let mut local_decode_ms = 0.0_f64;
+                let mut local_verify_ms = 0.0_f64;
+                let mut decode_buf = Vec::new();
                 loop {
                     let idx = next.fetch_add(1, Ordering::Relaxed);
                     if idx >= compressed_chunks.len() {
                         break;
                     }
                     let expected_len = ranges[idx].1.saturating_sub(ranges[idx].0);
-                    let decoded = match algo {
-                        Algo::PDeflate => pdeflate_decompress(&compressed_chunks[idx])
-                            .map_err(|e| format!("pdeflate chunk decompress failed: {e}"))?,
-                        Algo::Flate2 => {
-                            let mut decoder = DeflateDecoder::new(&compressed_chunks[idx][..]);
-                            let mut out = Vec::with_capacity(expected_len);
-                            decoder
-                                .read_to_end(&mut out)
-                                .map_err(|e| format!("flate2 read_to_end failed: {e}"))?;
-                            out
+                    let decode_t0 = Instant::now();
+                    match algo {
+                        Algo::PDeflate => {
+                            pdeflate_decompress_into(&compressed_chunks[idx], &mut decode_buf)
+                                .map_err(|e| format!("pdeflate chunk decompress failed: {e}"))?
                         }
-                    };
+                        Algo::Flate2 => {
+                            decode_buf.clear();
+                            let mut decoder = DeflateDecoder::new(&compressed_chunks[idx][..]);
+                            decoder
+                                .read_to_end(&mut decode_buf)
+                                .map_err(|e| format!("flate2 read_to_end failed: {e}"))?;
+                        }
+                    }
+                    local_decode_ms += decode_t0.elapsed().as_secs_f64() * 1000.0;
+                    let decoded = &decode_buf;
                     if decoded.len() != expected_len {
                         return Err(format!(
                             "decoded length mismatch at chunk {}: got {}, expected {}",
@@ -353,9 +374,10 @@ fn run_parallel_decompress(
                         ));
                     }
                     if cfg.verify_bytes {
+                        let verify_t0 = Instant::now();
                         let (s, e) = ranges[idx];
                         let expected = &input[s..e];
-                        if decoded != expected {
+                        if decoded.as_slice() != expected {
                             let mismatch = decoded
                                 .iter()
                                 .zip(expected.iter())
@@ -366,19 +388,21 @@ fn run_parallel_decompress(
                                 idx, mismatch
                             ));
                         }
+                        local_verify_ms += verify_t0.elapsed().as_secs_f64() * 1000.0;
                     }
                     local_out = local_out.saturating_add(decoded.len());
                 }
-                Ok(local_out)
+                Ok((local_out, local_decode_ms, local_verify_ms))
             }));
         }
 
         for handle in handles {
-            total_out = total_out.saturating_add(
-                handle
-                    .join()
-                    .map_err(|_| "decompression worker panicked".to_string())??,
-            );
+            let (local_out, local_decode_ms, local_verify_ms) = handle
+                .join()
+                .map_err(|_| "decompression worker panicked".to_string())??;
+            total_out = total_out.saturating_add(local_out);
+            total_decode_ms += local_decode_ms;
+            total_verify_ms += local_verify_ms;
         }
         Ok(())
     })?;
@@ -396,7 +420,12 @@ fn run_parallel_decompress(
     } else {
         0.0
     };
-    Ok(DecompressResult { ms, mib_s })
+    Ok(DecompressResult {
+        ms,
+        mib_s,
+        decode_ms: total_decode_ms,
+        verify_ms: total_verify_ms,
+    })
 }
 
 fn mean(v: &[f64]) -> f64 {
@@ -501,8 +530,7 @@ fn main() -> Result<(), String> {
         let _ =
             run_parallel_decompress(Algo::PDeflate, &p.compressed_chunks, &input, &ranges, &cfg)?;
         let f = run_parallel_compress(Algo::Flate2, &input, &ranges, &cfg)?;
-        let _ =
-            run_parallel_decompress(Algo::Flate2, &f.compressed_chunks, &input, &ranges, &cfg)?;
+        let _ = run_parallel_decompress(Algo::Flate2, &f.compressed_chunks, &input, &ranges, &cfg)?;
     }
 
     let mut p_ms = Vec::with_capacity(cfg.runs);
@@ -526,13 +554,17 @@ fn main() -> Result<(), String> {
         let speedup_comp = if p.ms > 0.0 { f.ms / p.ms } else { 0.0 };
         let speedup_decomp = if p_d.ms > 0.0 { f_d.ms / p_d.ms } else { 0.0 };
         println!(
-            "run {}/{}: pdeflate_comp_ms={:.3} flate2_comp_ms={:.3} pdeflate_decomp_ms={:.3} flate2_decomp_ms={:.3} pdeflate_comp_mib_s={:.2} flate2_comp_mib_s={:.2} pdeflate_decomp_mib_s={:.2} flate2_decomp_mib_s={:.2} pdeflate_ratio={:.4} flate2_ratio={:.4} speedup_comp(flate2/pdeflate)={:.3}x speedup_decomp(flate2/pdeflate)={:.3}x",
+            "run {}/{}: pdeflate_comp_ms={:.3} flate2_comp_ms={:.3} pdeflate_decomp_ms={:.3} flate2_decomp_ms={:.3} pdeflate_decomp_decode_ms={:.3} pdeflate_verify_ms={:.3} flate2_decomp_decode_ms={:.3} flate2_verify_ms={:.3} pdeflate_comp_mib_s={:.2} flate2_comp_mib_s={:.2} pdeflate_decomp_mib_s={:.2} flate2_decomp_mib_s={:.2} pdeflate_ratio={:.4} flate2_ratio={:.4} speedup_comp(flate2/pdeflate)={:.3}x speedup_decomp(flate2/pdeflate)={:.3}x",
             i + 1,
             cfg.runs,
             p.ms,
             f.ms,
             p_d.ms,
             f_d.ms,
+            p_d.decode_ms,
+            p_d.verify_ms,
+            f_d.decode_ms,
+            f_d.verify_ms,
             p.mib_s,
             f.mib_s,
             p_d.mib_s,

@@ -11,6 +11,7 @@ struct BenchConfig {
     warmups: usize,
     chunk_mib: usize,
     sections: usize,
+    verify_bytes: bool,
 }
 
 impl Default for BenchConfig {
@@ -21,6 +22,7 @@ impl Default for BenchConfig {
             warmups: 1,
             chunk_mib: 4,
             sections: 128,
+            verify_bytes: true,
         }
     }
 }
@@ -80,6 +82,23 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --sections: {e}"))?;
             }
+            "--verify" => {
+                cfg.verify_bytes = true;
+            }
+            "--no-verify" => {
+                cfg.verify_bytes = false;
+            }
+            "--verify-bytes" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--verify-bytes requires value (0|1|false|true)")?;
+                cfg.verify_bytes = match v.as_str() {
+                    "1" | "true" | "TRUE" | "True" => true,
+                    "0" | "false" | "FALSE" | "False" => false,
+                    _ => return Err(format!("invalid --verify-bytes: {v}")),
+                };
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -114,6 +133,9 @@ options:\n\
   --warmups <N>    warmup runs (default: 1)\n\
   --chunk-mib <N>  chunk size in MiB (default: 4)\n\
   --sections <N>   sections per chunk (default: 128)\n\
+  --verify         enable strict decoded-bytes check (default)\n\
+  --no-verify      disable decoded-bytes check\n\
+  --verify-bytes <B>  strict decoded-bytes check (0/1, default: 1)\n\
   -h, --help       show help"
     );
 }
@@ -169,7 +191,12 @@ fn max(v: &[f64]) -> f64 {
     v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
-fn run_once(input: &[u8], opts: &PDeflateOptions, size_mib: usize) -> Result<RunResult, String> {
+fn run_once(
+    input: &[u8],
+    opts: &PDeflateOptions,
+    size_mib: usize,
+    verify_bytes: bool,
+) -> Result<RunResult, String> {
     let c0 = Instant::now();
     let (compressed, cstats) =
         pdeflate_compress_with_stats(input, opts).map_err(|e| e.to_string())?;
@@ -180,7 +207,7 @@ fn run_once(input: &[u8], opts: &PDeflateOptions, size_mib: usize) -> Result<Run
         pdeflate_decompress_with_stats(&compressed).map_err(|e| e.to_string())?;
     let decomp_ms = d0.elapsed().as_secs_f64() * 1000.0;
 
-    if decoded != input {
+    if verify_bytes && decoded != input {
         return Err("roundtrip mismatch".to_string());
     }
 
@@ -219,12 +246,12 @@ fn main() -> Result<(), String> {
     };
 
     println!(
-        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={}",
-        cfg.size_mib, cfg.runs, cfg.warmups, cfg.chunk_mib, cfg.sections
+        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} verify_bytes={}",
+        cfg.size_mib, cfg.runs, cfg.warmups, cfg.chunk_mib, cfg.sections, cfg.verify_bytes
     );
 
     for _ in 0..cfg.warmups {
-        let _ = run_once(&input, &opts, cfg.size_mib)?;
+        let _ = run_once(&input, &opts, cfg.size_mib, cfg.verify_bytes)?;
     }
 
     let mut comp_ms = Vec::with_capacity(cfg.runs);
@@ -234,7 +261,7 @@ fn main() -> Result<(), String> {
     let mut decomp_mib_s = Vec::with_capacity(cfg.runs);
 
     for i in 0..cfg.runs {
-        let r = run_once(&input, &opts, cfg.size_mib)?;
+        let r = run_once(&input, &opts, cfg.size_mib, cfg.verify_bytes)?;
         println!(
             "run {}/{}: comp_ms={:.3} decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4}",
             i + 1,
