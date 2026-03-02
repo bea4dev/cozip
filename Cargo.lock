@@ -221,20 +221,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "cozip_gdeflate"
-version = "0.1.0"
-dependencies = [
- "pollster",
- "thiserror 2.0.17",
- "wgpu",
-]
-
-[[package]]
 name = "cozip_pdeflate"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "flate2",
+ "pollster",
  "thiserror 2.0.17",
+ "wgpu",
 ]
 
 [[package]]
