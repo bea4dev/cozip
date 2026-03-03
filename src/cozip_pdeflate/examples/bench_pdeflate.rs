@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use cozip_pdeflate::{
-    PDeflateHybridSchedulerPolicy, PDeflateOptions, pdeflate_compress_with_stats,
-    pdeflate_decompress_with_stats, pdeflate_gpu_init,
+    CoZipDeflate, CompressionMode, DeflateCpuStreamStats, HybridOptions, HybridSchedulerPolicy,
+    deflate_decompress_stream_on_cpu,
 };
 
 #[derive(Debug, Clone)]
@@ -13,6 +13,7 @@ struct BenchConfig {
     chunk_mib: usize,
     sections: usize,
     verify_bytes: bool,
+    skip_decompress: bool,
     gpu_compress: bool,
     compare_hybrid: bool,
     gpu_workers: usize,
@@ -20,8 +21,12 @@ struct BenchConfig {
     gpu_submit_chunks: usize,
     gpu_pipelined_submit_chunks: usize,
     gpu_min_chunk_kib: usize,
-    scheduler_policy: PDeflateHybridSchedulerPolicy,
+    scheduler_policy: HybridSchedulerPolicy,
     gpu_tail_stop_ratio: f32,
+    mode: CompressionMode,
+    profile_timing: bool,
+    profile_timing_detail: bool,
+    profile_timing_deep: bool,
 }
 
 impl Default for BenchConfig {
@@ -33,6 +38,7 @@ impl Default for BenchConfig {
             chunk_mib: 4,
             sections: 128,
             verify_bytes: true,
+            skip_decompress: true,
             gpu_compress: false,
             compare_hybrid: false,
             gpu_workers: 1,
@@ -40,8 +46,12 @@ impl Default for BenchConfig {
             gpu_submit_chunks: 4,
             gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_kib: 64,
-            scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
+            scheduler_policy: HybridSchedulerPolicy::GlobalQueueLocalBuffers,
             gpu_tail_stop_ratio: 1.0,
+            mode: CompressionMode::Balanced,
+            profile_timing: env_flag("COZIP_PROFILE_TIMING"),
+            profile_timing_detail: env_flag("COZIP_PROFILE_TIMING_DETAIL"),
+            profile_timing_deep: env_flag("COZIP_PROFILE_DEEP"),
         }
     }
 }
@@ -49,10 +59,21 @@ impl Default for BenchConfig {
 #[derive(Debug, Clone, Copy)]
 struct RunResult {
     comp_ms: f64,
-    decomp_ms: f64,
+    decomp_ms: Option<f64>,
     ratio: f64,
     comp_mib_s: f64,
-    decomp_mib_s: f64,
+    decomp_mib_s: Option<f64>,
+    compress_stats: DeflateCpuStreamStats,
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let lowered = value.trim().to_ascii_lowercase();
+            !(lowered.is_empty() || lowered == "0" || lowered == "false" || lowered == "off")
+        }
+        Err(_) => false,
+    }
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -109,23 +130,17 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --sections: {e}"))?;
             }
-            "--gpu-compress" => {
-                cfg.gpu_compress = true;
-            }
+            "--gpu-compress" => cfg.gpu_compress = true,
             "--gpu-compress-enabled" => {
                 i += 1;
                 let v = args.get(i).ok_or("--gpu-compress-enabled requires value")?;
-                cfg.gpu_compress =
-                    parse_bool(v).ok_or_else(|| format!("invalid --gpu-compress-enabled: {v}"))?;
+                cfg.gpu_compress = parse_bool(v)
+                    .ok_or_else(|| format!("invalid --gpu-compress-enabled: {v}"))?;
             }
-            "--compare-hybrid" => {
-                cfg.compare_hybrid = true;
-            }
+            "--compare-hybrid" => cfg.compare_hybrid = true,
             "--compare-hybrid-enabled" => {
                 i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or("--compare-hybrid-enabled requires value")?;
+                let v = args.get(i).ok_or("--compare-hybrid-enabled requires value")?;
                 cfg.compare_hybrid = parse_bool(v)
                     .ok_or_else(|| format!("invalid --compare-hybrid-enabled: {v}"))?;
             }
@@ -173,8 +188,7 @@ fn parse_args() -> Result<BenchConfig, String> {
                 i += 1;
                 let v = args.get(i).ok_or("--scheduler requires value")?;
                 cfg.scheduler_policy = match v.as_str() {
-                    "global" => PDeflateHybridSchedulerPolicy::GlobalQueue,
-                    "gpu-led" => PDeflateHybridSchedulerPolicy::GpuLedSplitQueue,
+                    "global" | "global-local" => HybridSchedulerPolicy::GlobalQueueLocalBuffers,
                     _ => return Err(format!("invalid --scheduler: {v}")),
                 };
             }
@@ -186,20 +200,26 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<f32>()
                     .map_err(|e| format!("invalid --gpu-tail-stop-ratio: {e}"))?;
             }
-            "--verify" => {
-                cfg.verify_bytes = true;
+            "--mode" => {
+                i += 1;
+                let v = args.get(i).ok_or("--mode requires value")?;
+                cfg.mode = match v.as_str() {
+                    "speed" => CompressionMode::Speed,
+                    "balanced" => CompressionMode::Balanced,
+                    "ratio" => CompressionMode::Ratio,
+                    _ => return Err("invalid --mode (expected speed|balanced|ratio)".to_string()),
+                };
             }
-            "--no-verify" => {
-                cfg.verify_bytes = false;
-            }
+            "--verify" => cfg.verify_bytes = true,
+            "--no-verify" => cfg.verify_bytes = false,
             "--verify-bytes" => {
                 i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or("--verify-bytes requires value (0|1|false|true)")?;
+                let v = args.get(i).ok_or("--verify-bytes requires value")?;
                 cfg.verify_bytes =
                     parse_bool(v).ok_or_else(|| format!("invalid --verify-bytes: {v}"))?;
             }
+            "--skip-decompress" => cfg.skip_decompress = true,
+            "--no-skip-decompress" => cfg.skip_decompress = false,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -209,35 +229,20 @@ fn parse_args() -> Result<BenchConfig, String> {
         i += 1;
     }
 
-    if cfg.size_mib == 0 {
-        return Err("--size-mib must be > 0".to_string());
+    if cfg.runs == 0 || cfg.size_mib == 0 || cfg.chunk_mib == 0 {
+        return Err("--size-mib/--runs/--chunk-mib must be > 0".to_string());
     }
-    if cfg.runs == 0 {
-        return Err("--runs must be > 0".to_string());
-    }
-    if cfg.chunk_mib == 0 {
-        return Err("--chunk-mib must be > 0".to_string());
-    }
-    if cfg.sections == 0 {
-        return Err("--sections must be > 0".to_string());
-    }
-    if cfg.gpu_workers == 0 {
-        return Err("--gpu-workers must be > 0".to_string());
-    }
-    if cfg.gpu_submit_chunks == 0 {
-        return Err("--gpu-submit-chunks must be > 0".to_string());
-    }
-    if cfg.gpu_slot_count == 0 {
-        return Err("--gpu-slot-count must be > 0".to_string());
-    }
-    if cfg.gpu_pipelined_submit_chunks == 0 {
-        return Err("--gpu-pipelined-submit-chunks must be > 0".to_string());
-    }
-    if cfg.gpu_min_chunk_kib == 0 {
-        return Err("--gpu-min-chunk-kib must be > 0".to_string());
+    if cfg.gpu_slot_count == 0 || cfg.gpu_submit_chunks == 0 || cfg.gpu_pipelined_submit_chunks == 0
+    {
+        return Err("gpu-slot-count/gpu-submit-chunks/gpu-pipelined-submit-chunks must be > 0"
+            .to_string());
     }
     if !(0.0..=1.0).contains(&cfg.gpu_tail_stop_ratio) {
         return Err("--gpu-tail-stop-ratio must be in range 0.0..=1.0".to_string());
+    }
+
+    if cfg.profile_timing_detail || cfg.profile_timing_deep {
+        cfg.profile_timing = true;
     }
 
     Ok(cfg)
@@ -247,26 +252,23 @@ fn print_help() {
     println!(
         "usage: cargo run --release -p cozip_pdeflate --example bench_pdeflate -- [options]\n\
 options:\n\
-  --size-mib <N>         input size in MiB (default: 1024)\n\
-  --runs <N>             measured runs (default: 3)\n\
-  --warmups <N>          warmup runs (default: 1)\n\
-  --chunk-mib <N>        chunk size in MiB (default: 4)\n\
-  --sections <N>         sections per chunk (default: 128)\n\
-  --gpu-compress         enable GPU compress path\n\
-  --gpu-compress-enabled <B>  GPU compress (0/1)\n\
-  --compare-hybrid       compare CPU_ONLY vs CPU+GPU\n\
-  --compare-hybrid-enabled <B> compare mode (0/1)\n\
-  --gpu-workers <N>      GPU worker count (default: 2)\n\
-  --gpu-slot-count <N>   GPU claim batch upper bound (default: 16)\n\
-  --gpu-submit-chunks <N> legacy GPU batch chunk limit (default: 4)\n\
-  --gpu-pipelined-submit-chunks <N> GPU submit group size (default: 4)\n\
-  --gpu-min-chunk-kib <N> GPU eligible chunk threshold in KiB (default: 64)\n\
-  --scheduler <S>        scheduler policy: global | gpu-led (default: global)\n\
-  --gpu-tail-stop-ratio <R> stop new GPU dequeues at tail ratio (0.0..=1.0, default: 1.0)\n\
-  --verify               enable strict decoded-bytes check (default)\n\
-  --no-verify            disable decoded-bytes check\n\
-  --verify-bytes <B>     strict decoded-bytes check (0/1, default: 1)\n\
-  -h, --help             show help"
+  --size-mib <N>\n\
+  --runs <N>\n\
+  --warmups <N>\n\
+  --chunk-mib <N>\n\
+  --sections <N>\n\
+  --gpu-compress\n\
+  --compare-hybrid\n\
+  --gpu-workers <N>\n\
+  --gpu-slot-count <N>\n\
+  --gpu-submit-chunks <N>\n\
+  --gpu-pipelined-submit-chunks <N>\n\
+  --gpu-min-chunk-kib <N>\n\
+  --scheduler <global|global-local>\n\
+  --gpu-tail-stop-ratio <R>\n\
+  --mode <speed|balanced|ratio> (default: balanced)\n\
+  --skip-decompress / --no-skip-decompress\n\
+  --verify / --no-verify / --verify-bytes <0|1>"
     );
 }
 
@@ -274,8 +276,8 @@ fn generate_input(size_bytes: usize) -> Vec<u8> {
     let mut out = vec![0u8; size_bytes];
     let text = b"ABABABABCCABCCD--cozip-pdeflate-bench--";
     let mut rng = 0x1234_5678_u32;
-    for i in 0..size_bytes {
-        out[i] = match (i / 8192) % 6 {
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = match (i / 8192) % 6 {
             0 => text[i % text.len()],
             1 => b'A' + ((i / 11) % 8) as u8,
             2 => {
@@ -285,9 +287,9 @@ fn generate_input(size_bytes: usize) -> Vec<u8> {
             3 => (i as u8).wrapping_mul(17).wrapping_add(31),
             4 => {
                 if (i / 64) % 2 == 0 {
-                    0x00
+                    0
                 } else {
-                    0xff
+                    255
                 }
             }
             _ => (i % 251) as u8,
@@ -323,42 +325,61 @@ fn max(v: &[f64]) -> f64 {
 
 fn run_once(
     input: &[u8],
-    opts: &PDeflateOptions,
+    cozip: &CoZipDeflate,
     size_mib: usize,
+    skip_decompress: bool,
     verify_bytes: bool,
 ) -> Result<RunResult, String> {
     let c0 = Instant::now();
-    let (compressed, _) = pdeflate_compress_with_stats(input, opts).map_err(|e| e.to_string())?;
+    let mut src = std::io::Cursor::new(input);
+    let mut compressed = Vec::new();
+    let compress = cozip
+        .deflate_compress_stream_zip_compatible_with_index(&mut src, &mut compressed)
+        .map_err(|e| e.to_string())?;
     let comp_ms = c0.elapsed().as_secs_f64() * 1000.0;
 
-    let d0 = Instant::now();
-    let (decoded, _) = pdeflate_decompress_with_stats(&compressed).map_err(|e| e.to_string())?;
-    let decomp_ms = d0.elapsed().as_secs_f64() * 1000.0;
-
-    if verify_bytes && decoded != input {
-        return Err("roundtrip mismatch".to_string());
+    let mut decomp_ms = None;
+    let mut decomp_mib_s = None;
+    if !skip_decompress {
+        let mut restored = Vec::with_capacity(input.len());
+        let mut reader = std::io::Cursor::new(&compressed);
+        let d0 = Instant::now();
+        if let Some(index) = compress.index.as_ref() {
+            cozip
+                .deflate_decompress_stream_zip_compatible_with_index(&mut reader, &mut restored, index)
+                .map_err(|e| e.to_string())?;
+        } else {
+            deflate_decompress_stream_on_cpu(&mut reader, &mut restored)
+                .map_err(|e| e.to_string())?;
+        }
+        let d_ms = d0.elapsed().as_secs_f64() * 1000.0;
+        if verify_bytes && restored != input {
+            return Err("roundtrip mismatch".to_string());
+        }
+        decomp_mib_s = Some(if d_ms > 0.0 {
+            size_mib as f64 * 1000.0 / d_ms
+        } else {
+            0.0
+        });
+        decomp_ms = Some(d_ms);
     }
-
-    let ratio = compressed.len() as f64 / input.len() as f64;
-    let size_mib_f = size_mib as f64;
-    let comp_mib_s = if comp_ms > 0.0 {
-        size_mib_f * 1000.0 / comp_ms
-    } else {
-        0.0
-    };
-    let decomp_mib_s = if decomp_ms > 0.0 {
-        size_mib_f * 1000.0 / decomp_ms
-    } else {
-        0.0
-    };
 
     Ok(RunResult {
         comp_ms,
         decomp_ms,
-        ratio,
-        comp_mib_s,
+        ratio: compressed.len() as f64 / input.len() as f64,
+        comp_mib_s: if comp_ms > 0.0 {
+            size_mib as f64 * 1000.0 / comp_ms
+        } else {
+            0.0
+        },
         decomp_mib_s,
+        compress_stats: compress.stats,
     })
+}
+
+fn format_opt(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "SKIP".to_string())
 }
 
 fn main() -> Result<(), String> {
@@ -366,21 +387,41 @@ fn main() -> Result<(), String> {
     let size_bytes = cfg.size_mib * 1024 * 1024;
     let input = generate_input(size_bytes);
 
-    let mut hybrid_opts = PDeflateOptions {
+    let cpu_opts = HybridOptions {
         chunk_size: cfg.chunk_mib * 1024 * 1024,
-        section_count: cfg.sections,
-        gpu_compress_enabled: cfg.gpu_compress,
-        gpu_workers: cfg.gpu_workers,
         gpu_slot_count: cfg.gpu_slot_count,
-        gpu_submit_chunks: cfg.gpu_submit_chunks,
+        gpu_batch_chunks: cfg.gpu_submit_chunks,
         gpu_pipelined_submit_chunks: cfg.gpu_pipelined_submit_chunks,
+        scheduler_policy: cfg.scheduler_policy,
+        compression_mode: cfg.mode,
+        prefer_gpu: false,
+        gpu_fraction: 0.0,
+        gpu_tail_stop_ratio: 1.0,
         gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
-        gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
-        hybrid_scheduler_policy: cfg.scheduler_policy,
-        ..PDeflateOptions::default()
+        profile_timing: cfg.profile_timing,
+        profile_timing_detail: cfg.profile_timing_detail,
+        profile_timing_deep: cfg.profile_timing_deep,
+        ..HybridOptions::default()
     };
-    let mut cpu_opts = hybrid_opts.clone();
-    cpu_opts.gpu_compress_enabled = false;
+    let hybrid_opts = HybridOptions {
+        chunk_size: cfg.chunk_mib * 1024 * 1024,
+        gpu_slot_count: cfg.gpu_slot_count,
+        gpu_batch_chunks: cfg.gpu_submit_chunks,
+        gpu_pipelined_submit_chunks: cfg.gpu_pipelined_submit_chunks,
+        scheduler_policy: cfg.scheduler_policy,
+        compression_mode: cfg.mode,
+        prefer_gpu: cfg.gpu_compress,
+        gpu_fraction: if cfg.gpu_compress { 1.0 } else { 0.0 },
+        gpu_tail_stop_ratio: cfg.gpu_tail_stop_ratio,
+        gpu_min_chunk_size: cfg.gpu_min_chunk_kib * 1024,
+        profile_timing: cfg.profile_timing,
+        profile_timing_detail: cfg.profile_timing_detail,
+        profile_timing_deep: cfg.profile_timing_deep,
+        ..HybridOptions::default()
+    };
+
+    let cpu = CoZipDeflate::init(cpu_opts).map_err(|e| e.to_string())?;
+    let hybrid = CoZipDeflate::init(hybrid_opts).map_err(|e| e.to_string())?;
 
     println!(
         "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} gpu_compress={} gpu_workers={} gpu_slot_count={} gpu_submit_chunks={} gpu_pipelined_submit_chunks={} gpu_min_chunk_kib={} scheduler={:?} gpu_tail_stop_ratio={:.2} compare_hybrid={} verify_bytes={}",
@@ -400,81 +441,109 @@ fn main() -> Result<(), String> {
         cfg.compare_hybrid,
         cfg.verify_bytes
     );
-
-    if cfg.gpu_compress {
-        // Keep GPU runtime/device/pipeline init outside timed runs.
-        let gpu_available = pdeflate_gpu_init();
-        println!("gpu_runtime_initialized={}", gpu_available);
+    println!("skip_decompress={}", cfg.skip_decompress);
+    if cfg.skip_decompress && cfg.verify_bytes {
+        println!("[bench] verify_bytes is ignored because decompression is skipped");
     }
 
     for _ in 0..cfg.warmups {
         if cfg.compare_hybrid {
-            let _ = run_once(&input, &cpu_opts, cfg.size_mib, cfg.verify_bytes)?;
+            let _ = run_once(&input, &cpu, cfg.size_mib, cfg.skip_decompress, cfg.verify_bytes)?;
         }
-        let _ = run_once(&input, &hybrid_opts, cfg.size_mib, cfg.verify_bytes)?;
+        let _ = run_once(
+            &input,
+            &hybrid,
+            cfg.size_mib,
+            cfg.skip_decompress,
+            cfg.verify_bytes,
+        )?;
     }
 
     let mut comp_ms = Vec::with_capacity(cfg.runs);
     let mut decomp_ms = Vec::with_capacity(cfg.runs);
-    let mut ratio = Vec::with_capacity(cfg.runs);
     let mut comp_mib_s = Vec::with_capacity(cfg.runs);
     let mut decomp_mib_s = Vec::with_capacity(cfg.runs);
-    let mut cpu_only_comp_ms = Vec::with_capacity(cfg.runs);
-    let mut cpu_only_decomp_ms = Vec::with_capacity(cfg.runs);
+    let mut ratio = Vec::with_capacity(cfg.runs);
+    let mut cpu_comp_ms = Vec::with_capacity(cfg.runs);
+    let mut cpu_decomp_ms = Vec::with_capacity(cfg.runs);
     let mut speedup_comp = Vec::with_capacity(cfg.runs);
     let mut speedup_decomp = Vec::with_capacity(cfg.runs);
+    let mut last_hybrid_stats = DeflateCpuStreamStats::default();
 
     for i in 0..cfg.runs {
         if cfg.compare_hybrid {
-            let cpu = run_once(&input, &cpu_opts, cfg.size_mib, cfg.verify_bytes)?;
-            let hyb = run_once(&input, &hybrid_opts, cfg.size_mib, cfg.verify_bytes)?;
-            let sp_comp = if hyb.comp_ms > 0.0 {
-                cpu.comp_ms / hyb.comp_ms
-            } else {
-                0.0
-            };
-            let sp_decomp = if hyb.decomp_ms > 0.0 {
-                cpu.decomp_ms / hyb.decomp_ms
-            } else {
-                0.0
+            let c = run_once(&input, &cpu, cfg.size_mib, cfg.skip_decompress, cfg.verify_bytes)?;
+            let h = run_once(
+                &input,
+                &hybrid,
+                cfg.size_mib,
+                cfg.skip_decompress,
+                cfg.verify_bytes,
+            )?;
+            last_hybrid_stats = h.compress_stats;
+            let spc = if h.comp_ms > 0.0 { c.comp_ms / h.comp_ms } else { 0.0 };
+            let spd = match (c.decomp_ms, h.decomp_ms) {
+                (Some(a), Some(b)) if b > 0.0 => a / b,
+                _ => 0.0,
             };
             println!(
-                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp_ms={:.3} | CPU+GPU comp_ms={:.3} decomp_ms={:.3} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
+                "run {}/{}: CPU_ONLY comp_ms={:.3} decomp={} | CPU+GPU comp_ms={:.3} decomp={} ratio={:.4} speedup_comp={:.3}x speedup_decomp={:.3}x",
                 i + 1,
                 cfg.runs,
-                cpu.comp_ms,
-                cpu.decomp_ms,
-                hyb.comp_ms,
-                hyb.decomp_ms,
-                hyb.ratio,
-                sp_comp,
-                sp_decomp
+                c.comp_ms,
+                format_opt(c.decomp_ms),
+                h.comp_ms,
+                format_opt(h.decomp_ms),
+                h.ratio,
+                spc,
+                spd
             );
-            cpu_only_comp_ms.push(cpu.comp_ms);
-            cpu_only_decomp_ms.push(cpu.decomp_ms);
-            speedup_comp.push(sp_comp);
-            speedup_decomp.push(sp_decomp);
-            comp_ms.push(hyb.comp_ms);
-            decomp_ms.push(hyb.decomp_ms);
-            comp_mib_s.push(hyb.comp_mib_s);
-            decomp_mib_s.push(hyb.decomp_mib_s);
-            ratio.push(hyb.ratio);
+            cpu_comp_ms.push(c.comp_ms);
+            if let Some(v) = c.decomp_ms {
+                cpu_decomp_ms.push(v);
+            }
+            speedup_comp.push(spc);
+            if h.decomp_ms.is_some() {
+                speedup_decomp.push(spd);
+            }
+            comp_ms.push(h.comp_ms);
+            if let Some(v) = h.decomp_ms {
+                decomp_ms.push(v);
+            }
+            comp_mib_s.push(h.comp_mib_s);
+            if let Some(v) = h.decomp_mib_s {
+                decomp_mib_s.push(v);
+            }
+            ratio.push(h.ratio);
         } else {
-            let r = run_once(&input, &hybrid_opts, cfg.size_mib, cfg.verify_bytes)?;
+            let r = run_once(
+                &input,
+                &hybrid,
+                cfg.size_mib,
+                cfg.skip_decompress,
+                cfg.verify_bytes,
+            )?;
+            last_hybrid_stats = r.compress_stats;
             println!(
-                "run {}/{}: comp_ms={:.3} decomp_ms={:.3} comp_mib_s={:.2} decomp_mib_s={:.2} ratio={:.4}",
+                "run {}/{}: comp_ms={:.3} decomp={} comp_mib_s={:.2} decomp_mib_s={} ratio={:.4}",
                 i + 1,
                 cfg.runs,
                 r.comp_ms,
-                r.decomp_ms,
+                format_opt(r.decomp_ms),
                 r.comp_mib_s,
-                r.decomp_mib_s,
-                r.ratio,
+                r.decomp_mib_s
+                    .map(|x| format!("{x:.2}"))
+                    .unwrap_or_else(|| "SKIP".to_string()),
+                r.ratio
             );
             comp_ms.push(r.comp_ms);
-            decomp_ms.push(r.decomp_ms);
+            if let Some(v) = r.decomp_ms {
+                decomp_ms.push(v);
+            }
             comp_mib_s.push(r.comp_mib_s);
-            decomp_mib_s.push(r.decomp_mib_s);
+            if let Some(v) = r.decomp_mib_s {
+                decomp_mib_s.push(v);
+            }
             ratio.push(r.ratio);
         }
     }
@@ -488,14 +557,18 @@ fn main() -> Result<(), String> {
         min(&comp_ms),
         max(&comp_ms)
     );
-    println!(
-        "decomp_ms: n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
-        decomp_ms.len(),
-        mean(&decomp_ms),
-        median(&decomp_ms),
-        min(&decomp_ms),
-        max(&decomp_ms)
-    );
+    if decomp_ms.is_empty() {
+        println!("decomp_ms: skipped");
+    } else {
+        println!(
+            "decomp_ms: n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
+            decomp_ms.len(),
+            mean(&decomp_ms),
+            median(&decomp_ms),
+            min(&decomp_ms),
+            max(&decomp_ms)
+        );
+    }
     println!(
         "comp_mib_s: n={} mean={:.2} median={:.2} min={:.2} max={:.2}",
         comp_mib_s.len(),
@@ -504,14 +577,18 @@ fn main() -> Result<(), String> {
         min(&comp_mib_s),
         max(&comp_mib_s)
     );
-    println!(
-        "decomp_mib_s: n={} mean={:.2} median={:.2} min={:.2} max={:.2}",
-        decomp_mib_s.len(),
-        mean(&decomp_mib_s),
-        median(&decomp_mib_s),
-        min(&decomp_mib_s),
-        max(&decomp_mib_s)
-    );
+    if decomp_mib_s.is_empty() {
+        println!("decomp_mib_s: skipped");
+    } else {
+        println!(
+            "decomp_mib_s: n={} mean={:.2} median={:.2} min={:.2} max={:.2}",
+            decomp_mib_s.len(),
+            mean(&decomp_mib_s),
+            median(&decomp_mib_s),
+            min(&decomp_mib_s),
+            max(&decomp_mib_s)
+        );
+    }
     println!(
         "ratio: n={} mean={:.4} median={:.4} min={:.4} max={:.4}",
         ratio.len(),
@@ -520,24 +597,27 @@ fn main() -> Result<(), String> {
         min(&ratio),
         max(&ratio)
     );
-
     if cfg.compare_hybrid {
         println!(
             "cpu_only_comp_ms: n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
-            cpu_only_comp_ms.len(),
-            mean(&cpu_only_comp_ms),
-            median(&cpu_only_comp_ms),
-            min(&cpu_only_comp_ms),
-            max(&cpu_only_comp_ms)
+            cpu_comp_ms.len(),
+            mean(&cpu_comp_ms),
+            median(&cpu_comp_ms),
+            min(&cpu_comp_ms),
+            max(&cpu_comp_ms)
         );
-        println!(
-            "cpu_only_decomp_ms: n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
-            cpu_only_decomp_ms.len(),
-            mean(&cpu_only_decomp_ms),
-            median(&cpu_only_decomp_ms),
-            min(&cpu_only_decomp_ms),
-            max(&cpu_only_decomp_ms)
-        );
+        if cpu_decomp_ms.is_empty() {
+            println!("cpu_only_decomp_ms: skipped");
+        } else {
+            println!(
+                "cpu_only_decomp_ms: n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
+                cpu_decomp_ms.len(),
+                mean(&cpu_decomp_ms),
+                median(&cpu_decomp_ms),
+                min(&cpu_decomp_ms),
+                max(&cpu_decomp_ms)
+            );
+        }
         println!(
             "speedup_comp(cpu/hybrid): n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
             speedup_comp.len(),
@@ -546,18 +626,36 @@ fn main() -> Result<(), String> {
             min(&speedup_comp),
             max(&speedup_comp)
         );
-        println!(
-            "speedup_decomp(cpu/hybrid): n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
-            speedup_decomp.len(),
-            mean(&speedup_decomp),
-            median(&speedup_decomp),
-            min(&speedup_decomp),
-            max(&speedup_decomp)
-        );
+        if speedup_decomp.is_empty() {
+            println!("speedup_decomp(cpu/hybrid): skipped");
+        } else {
+            println!(
+                "speedup_decomp(cpu/hybrid): n={} mean={:.3} median={:.3} min={:.3} max={:.3}",
+                speedup_decomp.len(),
+                mean(&speedup_decomp),
+                median(&speedup_decomp),
+                min(&speedup_decomp),
+                max(&speedup_decomp)
+            );
+        }
     }
 
-    // keep mutable use to satisfy clippy under feature toggles where opts may be tweaked later
-    hybrid_opts.gpu_submit_chunks = hybrid_opts.gpu_submit_chunks.max(1);
+    println!("gpu_runtime_initialized={}", last_hybrid_stats.gpu_available);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-summary] cpu_chunks={} gpu_assigned_chunks={} cpu_chunk_avg_ms={:.3} gpu_chunk_avg_ms_assigned={:.3}",
+        last_hybrid_stats.cpu_chunks,
+        last_hybrid_stats.gpu_chunks,
+        if last_hybrid_stats.cpu_worker_chunks > 0 {
+            last_hybrid_stats.cpu_worker_busy_ms / last_hybrid_stats.cpu_worker_chunks as f64
+        } else {
+            0.0
+        },
+        if last_hybrid_stats.gpu_worker_chunks > 0 {
+            last_hybrid_stats.gpu_worker_busy_ms / last_hybrid_stats.gpu_worker_chunks as f64
+        } else {
+            0.0
+        }
+    );
 
     Ok(())
 }

@@ -225,9 +225,11 @@ name = "cozip_pdeflate"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crc32fast",
  "flate2",
  "pollster",
  "thiserror 2.0.17",
+ "tokio",
  "wgpu",
 ]
 
