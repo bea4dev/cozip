@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use cozip_pdeflate::{
     CoZipDeflate, CompressionMode, DeflateCpuStreamStats, HybridOptions, HybridSchedulerPolicy,
-    deflate_decompress_stream_on_cpu,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -192,13 +191,15 @@ fn parse_args() -> Result<BenchConfig, String> {
             "--gpu-compress-enabled" => {
                 i += 1;
                 let v = args.get(i).ok_or("--gpu-compress-enabled requires value")?;
-                cfg.gpu_compress = parse_bool(v)
-                    .ok_or_else(|| format!("invalid --gpu-compress-enabled: {v}"))?;
+                cfg.gpu_compress =
+                    parse_bool(v).ok_or_else(|| format!("invalid --gpu-compress-enabled: {v}"))?;
             }
             "--compare-hybrid" => cfg.compare_hybrid = true,
             "--compare-hybrid-enabled" => {
                 i += 1;
-                let v = args.get(i).ok_or("--compare-hybrid-enabled requires value")?;
+                let v = args
+                    .get(i)
+                    .ok_or("--compare-hybrid-enabled requires value")?;
                 cfg.compare_hybrid = parse_bool(v)
                     .ok_or_else(|| format!("invalid --compare-hybrid-enabled: {v}"))?;
             }
@@ -364,7 +365,9 @@ fn parse_args() -> Result<BenchConfig, String> {
         return Err("gpu-slot-count/gpu-batch-chunks/gpu-submit-chunks/gpu-subchunk-kib/token-finalize-segment-size/stream-pipeline-depth must be > 0".to_string());
     }
     if cfg.stream_batch_chunks != 0 {
-        return Err("--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)".to_string());
+        return Err(
+            "--stream-batch-chunks is fixed to 0 (legacy batch mode was removed)".to_string(),
+        );
     }
     if !(0.0..=1.0).contains(&cfg.gpu_fraction) {
         return Err("--gpu-fraction must be in range 0.0..=1.0".to_string());
@@ -529,10 +532,15 @@ fn run_once(
         let d0 = Instant::now();
         if let Some(index) = compress.index.as_ref() {
             cozip
-                .deflate_decompress_stream_zip_compatible_with_index(&mut reader, &mut restored, index)
+                .deflate_decompress_stream_zip_compatible_with_index(
+                    &mut reader,
+                    &mut restored,
+                    index,
+                )
                 .map_err(|e| e.to_string())?;
         } else {
-            deflate_decompress_stream_on_cpu(&mut reader, &mut restored)
+            cozip
+                .pdeflate_decompress_stream(&mut reader, &mut restored)
                 .map_err(|e| e.to_string())?;
         }
         let d_ms = d0.elapsed().as_secs_f64() * 1000.0;
@@ -552,10 +560,15 @@ fn run_once(
         let mut reader = std::io::Cursor::new(&compressed);
         if let Some(index) = compress.index.as_ref() {
             cozip
-                .deflate_decompress_stream_zip_compatible_with_index(&mut reader, &mut restored, index)
+                .deflate_decompress_stream_zip_compatible_with_index(
+                    &mut reader,
+                    &mut restored,
+                    index,
+                )
                 .map_err(|e| e.to_string())?;
         } else {
-            deflate_decompress_stream_on_cpu(&mut reader, &mut restored)
+            cozip
+                .pdeflate_decompress_stream(&mut reader, &mut restored)
                 .map_err(|e| e.to_string())?;
         }
         if restored != input {
@@ -578,7 +591,8 @@ fn run_once(
 }
 
 fn format_opt(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "SKIP".to_string())
+    v.map(|x| format!("{x:.3}"))
+        .unwrap_or_else(|| "SKIP".to_string())
 }
 
 fn cpu_parallelism_estimate(stats: &DeflateCpuStreamStats, comp_ms: f64) -> f64 {
@@ -655,7 +669,11 @@ fn main() -> Result<(), String> {
     let mut hybrid_opts = base_opts;
     hybrid_opts.prefer_gpu = cfg.gpu_compress;
     hybrid_opts.gpu_only = cfg.gpu_only && cfg.gpu_compress;
-    hybrid_opts.gpu_fraction = if cfg.gpu_compress { cfg.gpu_fraction } else { 0.0 };
+    hybrid_opts.gpu_fraction = if cfg.gpu_compress {
+        cfg.gpu_fraction
+    } else {
+        0.0
+    };
 
     ensure_scheduler_equivalence(&cpu_opts, &hybrid_opts)?;
 
@@ -696,7 +714,13 @@ fn main() -> Result<(), String> {
 
     for _ in 0..cfg.warmups {
         if cfg.compare_hybrid {
-            let _ = run_once(&input, &cpu, cfg.size_mib, cfg.skip_decompress, cfg.verify_bytes)?;
+            let _ = run_once(
+                &input,
+                &cpu,
+                cfg.size_mib,
+                cfg.skip_decompress,
+                cfg.verify_bytes,
+            )?;
         }
         let _ = run_once(
             &input,
@@ -723,7 +747,13 @@ fn main() -> Result<(), String> {
 
     for i in 0..cfg.runs {
         if cfg.compare_hybrid {
-            let c = run_once(&input, &cpu, cfg.size_mib, cfg.skip_decompress, cfg.verify_bytes)?;
+            let c = run_once(
+                &input,
+                &cpu,
+                cfg.size_mib,
+                cfg.skip_decompress,
+                cfg.verify_bytes,
+            )?;
             let h = run_once(
                 &input,
                 &hybrid,
@@ -735,7 +765,11 @@ fn main() -> Result<(), String> {
             last_hybrid_comp_ms = h.comp_ms;
             last_cpu_stats = c.compress_stats;
             last_cpu_comp_ms = c.comp_ms;
-            let spc = if h.comp_ms > 0.0 { c.comp_ms / h.comp_ms } else { 0.0 };
+            let spc = if h.comp_ms > 0.0 {
+                c.comp_ms / h.comp_ms
+            } else {
+                0.0
+            };
             let spd = match (c.decomp_ms, h.decomp_ms) {
                 (Some(a), Some(b)) if b > 0.0 => a / b,
                 _ => 0.0,
@@ -897,7 +931,10 @@ fn main() -> Result<(), String> {
         }
     }
 
-    println!("gpu_runtime_initialized={}", last_hybrid_stats.gpu_available);
+    println!(
+        "gpu_runtime_initialized={}",
+        last_hybrid_stats.gpu_available
+    );
     println!(
         "[cozip_pdeflate][timing][hybrid-summary] cpu_chunks={} gpu_assigned_chunks={} cpu_chunk_avg_ms={:.3} gpu_chunk_avg_ms_assigned={:.3}",
         last_hybrid_stats.cpu_chunks,
@@ -949,6 +986,34 @@ fn main() -> Result<(), String> {
         last_hybrid_stats.writer_wait_ms,
         last_hybrid_stats.writer_hol_wait_ms,
         last_hybrid_stats.write_stage_ms
+    );
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-stage] gpu_batch_count={} t_batch_call_ms={:.3} t_prepare_ms={:.3} t_profile_gpu_call_ms={:.3} t_finalize_ms={:.3} t_profile_gpu_total_ms={:.3} t_profile_gpu_wait_ms={:.3} t_profile_gpu_upload_ms={:.3} t_profile_gpu_map_copy_ms={:.3} t_table_build_ms={:.3} t_section_encode_ms={:.3} t_header_pack_ms={:.3} t_fallback_cpu_ms={:.3} t_batch_unaccounted_ms={:.3} t_profile_unaccounted_ms={:.3} gpu_profile_total_ms_per_assigned_chunk={:.3}",
+        last_hybrid_stats.gpu_batch_count,
+        last_hybrid_stats.legacy_gpu_batch_call_ms,
+        last_hybrid_stats.legacy_gpu_prepare_ms,
+        last_hybrid_stats.legacy_gpu_profile_call_ms,
+        last_hybrid_stats.legacy_gpu_finalize_ms,
+        last_hybrid_stats.legacy_gpu_total_ms,
+        last_hybrid_stats.legacy_gpu_wait_ms,
+        last_hybrid_stats.legacy_gpu_upload_ms,
+        last_hybrid_stats.legacy_gpu_map_copy_ms,
+        last_hybrid_stats.legacy_gpu_table_build_ms,
+        last_hybrid_stats.legacy_gpu_section_encode_ms,
+        last_hybrid_stats.legacy_gpu_header_pack_ms,
+        last_hybrid_stats.legacy_gpu_fallback_cpu_ms,
+        (last_hybrid_stats.legacy_gpu_batch_call_ms
+            - (last_hybrid_stats.legacy_gpu_prepare_ms
+                + last_hybrid_stats.legacy_gpu_profile_call_ms
+                + last_hybrid_stats.legacy_gpu_finalize_ms))
+            .max(0.0),
+        (last_hybrid_stats.legacy_gpu_profile_call_ms - last_hybrid_stats.legacy_gpu_total_ms)
+            .max(0.0),
+        if last_hybrid_stats.gpu_chunks > 0 {
+            last_hybrid_stats.legacy_gpu_total_ms / last_hybrid_stats.gpu_chunks as f64
+        } else {
+            0.0
+        }
     );
 
     Ok(())

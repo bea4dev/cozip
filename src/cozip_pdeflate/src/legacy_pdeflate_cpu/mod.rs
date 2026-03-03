@@ -629,6 +629,27 @@ pub fn pdeflate_gpu_init() -> bool {
 pub struct PDeflateChunkPayload {
     pub payload: Vec<u8>,
     pub gpu_used: bool,
+    pub gpu_upload_ms: f64,
+    pub gpu_wait_ms: f64,
+    pub gpu_map_copy_ms: f64,
+    pub gpu_total_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PDeflateGpuBatchBreakdown {
+    pub chunks_total: usize,
+    pub gpu_used_chunks: usize,
+    pub prepare_ms: f64,
+    pub gpu_call_ms: f64,
+    pub finalize_ms: f64,
+    pub total_ms: f64,
+    pub gpu_upload_ms: f64,
+    pub gpu_wait_ms: f64,
+    pub gpu_map_copy_ms: f64,
+    pub gpu_total_ms: f64,
+    pub table_build_ms: f64,
+    pub header_pack_ms: f64,
+    pub section_encode_ms: f64,
 }
 
 pub(crate) fn pdeflate_compress_chunk_payload_cpu(
@@ -642,6 +663,10 @@ pub(crate) fn pdeflate_compress_chunk_payload_cpu(
     Ok(PDeflateChunkPayload {
         payload: compressed.payload,
         gpu_used: false,
+        gpu_upload_ms: 0.0,
+        gpu_wait_ms: 0.0,
+        gpu_map_copy_ms: 0.0,
+        gpu_total_ms: 0.0,
     })
 }
 
@@ -649,9 +674,17 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch(
     chunks: &[&[u8]],
     options: &PDeflateOptions,
 ) -> Result<Vec<PDeflateChunkPayload>, PDeflateError> {
+    let (payloads, _) = pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(chunks, options)?;
+    Ok(payloads)
+}
+
+pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(
+    chunks: &[&[u8]],
+    options: &PDeflateOptions,
+) -> Result<(Vec<PDeflateChunkPayload>, PDeflateGpuBatchBreakdown), PDeflateError> {
     validate_options(options)?;
     if chunks.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), PDeflateGpuBatchBreakdown::default()));
     }
 
     let same_len = chunks
@@ -666,13 +699,34 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch(
             input.extend_from_slice(chunk);
         }
         let indices: Vec<usize> = (0..chunks.len()).collect();
-        let (batch, _profile) = compress_chunk_gpu_batch(&input, chunk_size, &indices, options)?;
+        let (batch, profile) = compress_chunk_gpu_batch(&input, chunk_size, &indices, options)?;
+        let mut breakdown = PDeflateGpuBatchBreakdown {
+            chunks_total: profile.chunks_total,
+            gpu_used_chunks: profile.gpu_used_chunks,
+            prepare_ms: profile.prepare_ms,
+            gpu_call_ms: profile.gpu_call_ms,
+            finalize_ms: profile.finalize_ms,
+            total_ms: profile.total_ms,
+            gpu_upload_ms: profile.gpu_upload_ms,
+            gpu_wait_ms: profile.gpu_wait_ms,
+            gpu_map_copy_ms: profile.gpu_map_copy_ms,
+            gpu_total_ms: 0.0,
+            ..PDeflateGpuBatchBreakdown::default()
+        };
         let mut out = vec![None; chunks.len()];
         for (idx, encoded) in batch {
             if idx < out.len() {
+                breakdown.table_build_ms += encoded.profile.table_build_ms;
+                breakdown.header_pack_ms += encoded.profile.header_pack_ms;
+                breakdown.section_encode_ms += encoded.profile.section_encode_ms;
+                breakdown.gpu_total_ms += encoded.profile.gpu_total_ms;
                 out[idx] = Some(PDeflateChunkPayload {
                     payload: encoded.payload,
                     gpu_used: encoded.profile.gpu_used,
+                    gpu_upload_ms: encoded.profile.gpu_upload_ms,
+                    gpu_wait_ms: encoded.profile.gpu_wait_ms,
+                    gpu_map_copy_ms: encoded.profile.gpu_map_copy_ms,
+                    gpu_total_ms: encoded.profile.gpu_total_ms,
                 });
             }
         }
@@ -682,24 +736,48 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch(
                 finalized.push(value);
             } else {
                 let fallback = compress_chunk(chunks[idx], options)?;
+                breakdown.table_build_ms += fallback.profile.table_build_ms;
+                breakdown.header_pack_ms += fallback.profile.header_pack_ms;
+                breakdown.section_encode_ms += fallback.profile.section_encode_ms;
+                breakdown.gpu_total_ms += fallback.profile.gpu_total_ms;
                 finalized.push(PDeflateChunkPayload {
                     payload: fallback.payload,
                     gpu_used: fallback.profile.gpu_used,
+                    gpu_upload_ms: fallback.profile.gpu_upload_ms,
+                    gpu_wait_ms: fallback.profile.gpu_wait_ms,
+                    gpu_map_copy_ms: fallback.profile.gpu_map_copy_ms,
+                    gpu_total_ms: fallback.profile.gpu_total_ms,
                 });
             }
         }
-        return Ok(finalized);
+        return Ok((finalized, breakdown));
     }
 
     let mut out = Vec::with_capacity(chunks.len());
+    let mut breakdown = PDeflateGpuBatchBreakdown::default();
+    breakdown.chunks_total = chunks.len();
     for &chunk in chunks {
         let encoded = compress_chunk(chunk, options)?;
+        if encoded.profile.gpu_used {
+            breakdown.gpu_used_chunks = breakdown.gpu_used_chunks.saturating_add(1);
+        }
+        breakdown.gpu_upload_ms += encoded.profile.gpu_upload_ms;
+        breakdown.gpu_wait_ms += encoded.profile.gpu_wait_ms;
+        breakdown.gpu_map_copy_ms += encoded.profile.gpu_map_copy_ms;
+        breakdown.gpu_total_ms += encoded.profile.gpu_total_ms;
+        breakdown.table_build_ms += encoded.profile.table_build_ms;
+        breakdown.header_pack_ms += encoded.profile.header_pack_ms;
+        breakdown.section_encode_ms += encoded.profile.section_encode_ms;
         out.push(PDeflateChunkPayload {
             payload: encoded.payload,
             gpu_used: encoded.profile.gpu_used,
+            gpu_upload_ms: encoded.profile.gpu_upload_ms,
+            gpu_wait_ms: encoded.profile.gpu_wait_ms,
+            gpu_map_copy_ms: encoded.profile.gpu_map_copy_ms,
+            gpu_total_ms: encoded.profile.gpu_total_ms,
         });
     }
-    Ok(out)
+    Ok((out, breakdown))
 }
 
 pub(crate) fn pdeflate_pack_stream_from_chunk_payloads(
@@ -1707,12 +1785,25 @@ fn compress_chunk_gpu_batch(
             .ok_or(PDeflateError::NumericOverflow)?;
         let end = (start + chunk_size).min(input.len());
         let chunk = &input[start..end];
-        // Batch hybrid path currently performs better by keeping table build on CPU.
-        // GPU table build has high fixed per-chunk overhead at 4MiB chunk sizes.
-        let built = build_table_dispatch(chunk, options, false)?;
+        let mut built = build_table_dispatch(
+            chunk,
+            options,
+            should_use_gpu_table_build(options, chunk.len()),
+        )?;
+        if built.table_count == 0 && built.table_index.is_empty() {
+            if let Some(table_gpu) = built.gpu_table.as_ref() {
+                let packed_table = gpu::readback_packed_table_device(table_gpu).map_err(|err| {
+                    PDeflateError::Gpu(format!(
+                        "gpu table readback failed during batch prepare: {err}"
+                    ))
+                })?;
+                built.table_count = packed_table.table_count;
+                built.table_index = packed_table.table_index;
+                built.table_data = packed_table.table_data;
+            }
+        }
         let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
-        let gpu_eligible = max_ref_len >= options.min_ref_len
-            && (built.table_count > 0 || built.gpu_table.is_some());
+        let gpu_eligible = max_ref_len >= options.min_ref_len && built.table_count > 0;
         prepared.push(GpuPreparedChunk {
             index: chunk_idx,
             chunk,
@@ -2030,6 +2121,15 @@ fn compress_chunk_gpu_batch(
                         .map(|p| prepared[p.prep_idx].chunk.len())
                         .sum();
                     for (p, host_chunk) in pending.into_iter().zip(host_sections.into_iter()) {
+                        if prepared[p.prep_idx].table_count == 0
+                            || prepared[p.prep_idx].table_index.is_empty()
+                        {
+                            return Err(PDeflateError::Gpu(format!(
+                                "gpu produced section commands without host table metadata (chunks={} gpu_jobs={})",
+                                indices.len(),
+                                prep_indices.len()
+                            )));
+                        }
                         let pack_scale = if total_pack_bytes == 0 {
                             0.0
                         } else {
@@ -2241,6 +2341,27 @@ fn compress_chunk_gpu_batch(
             out.push((p.index, chunk));
             continue;
         }
+        let packed_matches = packed_matches_by_chunk[idx].as_deref();
+
+        // When match/section were computed against device-resident table entries,
+        // serialize the exact same table to keep table-id space consistent.
+        if packed_matches.is_some() && p.table_index.is_empty() {
+            if let Some(table_gpu) = p.gpu_table.as_ref() {
+                match gpu::readback_packed_table_device(table_gpu) {
+                    Ok(packed_table) => {
+                        p.table_count = packed_table.table_count;
+                        p.table_index = packed_table.table_index;
+                        p.table_data = packed_table.table_data;
+                    }
+                    Err(err) => {
+                        return Err(PDeflateError::Gpu(format!(
+                            "gpu table readback failed during finalize: {err}"
+                        )));
+                    }
+                }
+            }
+        }
+
         if p.table.is_none() {
             if p.table_index.is_empty() {
                 let (cpu_table, cpu_index, cpu_data) =
@@ -2249,11 +2370,10 @@ fn compress_chunk_gpu_batch(
                 p.table_index = cpu_index;
                 p.table_data = cpu_data;
                 p.table = Some(cpu_table);
-            } else if p.table_count > 0 {
+            } else if p.table_count > 0 && packed_matches.is_none() {
                 p.table = Some(materialize_table_entries(&p.table_index, &p.table_data)?);
             }
         }
-        let packed_matches = packed_matches_by_chunk[idx].as_deref();
         let chunk = finalize_chunk_from_table(
             p.chunk,
             options,
@@ -2989,7 +3109,23 @@ fn compress_chunk(
     chunk: &[u8],
     options: &PDeflateOptions,
 ) -> Result<ChunkCompressed, PDeflateError> {
-    let built = build_table_dispatch(chunk, options, false)?;
+    let mut built = build_table_dispatch(
+        chunk,
+        options,
+        should_use_gpu_table_build(options, chunk.len()),
+    )?;
+    if built.table_count == 0 && built.table_index.is_empty() {
+        if let Some(table_gpu) = built.gpu_table.as_ref() {
+            let packed_table = gpu::readback_packed_table_device(table_gpu).map_err(|err| {
+                PDeflateError::Gpu(format!(
+                    "gpu table readback failed during single-chunk prepare: {err}"
+                ))
+            })?;
+            built.table_count = packed_table.table_count;
+            built.table_index = packed_table.table_index;
+            built.table_data = packed_table.table_data;
+        }
+    }
     let mut table_index = built.table_index;
     let mut table_data = built.table_data;
     let mut table_count = built.table_count;
@@ -3489,6 +3625,12 @@ fn build_table_dispatch(
         profile: prof,
         build_ms: elapsed_ms(t0),
     })
+}
+
+fn should_use_gpu_table_build(options: &PDeflateOptions, chunk_len: usize) -> bool {
+    options.gpu_compress_enabled
+        && chunk_len >= options.gpu_min_chunk_size
+        && gpu_table_build_enabled()
 }
 
 fn rebuild_table_cpu_for_fallback(
@@ -4554,6 +4696,17 @@ fn profile_enabled() -> bool {
             !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
         }
         Err(_) => false,
+    })
+}
+
+fn gpu_table_build_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("COZIP_PDEFLATE_GPU_TABLE_BUILD") {
+        Ok(v) => {
+            let s = v.trim();
+            !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => true,
     })
 }
 
