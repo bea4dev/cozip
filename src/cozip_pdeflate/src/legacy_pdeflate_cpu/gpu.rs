@@ -12,6 +12,8 @@ const PACK_CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const PACK_CHUNK_VERSION: u16 = 0;
 const BUILD_TABLE_STAGE_COUNT: usize = 7;
 const BUILD_TABLE_STAGE_QUERY_COUNT: u32 = (BUILD_TABLE_STAGE_COUNT as u32) * 2;
+const SPARSE_KERNEL_STAGE_COUNT: usize = 2;
+const SPARSE_KERNEL_STAGE_QUERY_COUNT: u32 = (SPARSE_KERNEL_STAGE_COUNT as u32) * 2;
 
 const MATCH_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> src_words: array<u32>;
@@ -722,12 +724,13 @@ const MATCH_PREPARE_TABLE_SHADER: &str = r#"
 @group(0) @binding(1) var<storage, read> table_chunk_counts: array<u32>;
 @group(0) @binding(2) var<storage, read> table_chunk_index_offsets: array<u32>;
 @group(0) @binding(3) var<storage, read> table_chunk_data_offsets: array<u32>;
-@group(0) @binding(4) var<storage, read> table_index_words_in: array<u32>;
-@group(0) @binding(5) var<storage, read> table_data_words_in: array<u32>;
-@group(0) @binding(6) var<storage, read> params: array<u32>;
-@group(0) @binding(7) var<storage, read_write> prefix2_first_ids: array<u32>;
-@group(0) @binding(8) var<storage, read_write> table_entry_lens: array<u32>;
-@group(0) @binding(9) var<storage, read_write> table_entry_offsets: array<u32>;
+@group(0) @binding(4) var<storage, read> table_chunk_meta_words: array<u32>;
+@group(0) @binding(5) var<storage, read> table_index_words_in: array<u32>;
+@group(0) @binding(6) var<storage, read> table_data_words_in: array<u32>;
+@group(0) @binding(7) var<storage, read> params: array<u32>;
+@group(0) @binding(8) var<storage, read_write> prefix2_first_ids: array<u32>;
+@group(0) @binding(9) var<storage, read_write> table_entry_lens: array<u32>;
+@group(0) @binding(10) var<storage, read_write> table_entry_offsets: array<u32>;
 
 fn load_table_index_byte(idx: u32) -> u32 {
     let w = table_index_words_in[idx >> 2u];
@@ -754,7 +757,13 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
             break;
         }
         let chunk_base = table_chunk_bases[chunk];
-        let chunk_entries = table_chunk_counts[chunk];
+        let chunk_entries_hint = table_chunk_counts[chunk];
+        let meta_base = chunk * 2u;
+        let meta_count = table_chunk_meta_words[meta_base];
+        var chunk_entries = chunk_entries_hint;
+        if (meta_count != 0u) {
+            chunk_entries = min(chunk_entries_hint, meta_count);
+        }
         let table_index_base = table_chunk_index_offsets[chunk];
         let mut_data_base = table_chunk_data_offsets[chunk];
         let prefix_base = chunk << 16u;
@@ -766,6 +775,9 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
                 break;
             }
             let len = load_table_index_byte(table_index_base + local_id);
+            if (len == 0u) {
+                break;
+            }
             let global_id = chunk_base + local_id;
             table_entry_lens[global_id] = len;
             table_entry_offsets[global_id] = data_cursor;
@@ -1562,6 +1574,36 @@ fn load_section_cmd_sparse_byte(idx: u32) -> u32 {
     return (w >> shift) & 0xffu;
 }
 
+fn find_section_for_local(local: u32, section_count: u32) -> u32 {
+    if (section_count == 0u) {
+        sparse_stat_add(7u, 1u);
+        return 0xffffffffu;
+    }
+    var lo = 0u;
+    var hi = section_count;
+    loop {
+        sparse_stat_add(5u, 1u);
+        if (lo >= hi) {
+            break;
+        }
+        let mid = (lo + hi) >> 1u;
+        let start = section_prefix_words[mid];
+        let end = start + section_lens_words[mid];
+        if (local < start) {
+            hi = mid;
+            continue;
+        }
+        if (local >= end) {
+            lo = mid + 1u;
+            continue;
+        }
+        sparse_stat_add(6u, 1u);
+        return mid;
+    }
+    sparse_stat_add(7u, 1u);
+    return 0xffffffffu;
+}
+
 fn load_section_cmd_compact_byte(local: u32, section_count: u32) -> u32 {
     if (section_count == 0u) {
         sparse_stat_add(7u, 1u);
@@ -1592,6 +1634,111 @@ fn load_section_cmd_compact_byte(local: u32, section_count: u32) -> u32 {
     }
     sparse_stat_add(7u, 1u);
     return 0u;
+}
+
+fn load_section_cmd_compact_word(local_base: u32, section_count: u32, remaining: u32) -> u32 {
+    var sec_idx = find_section_for_local(local_base, section_count);
+    var sec_start = 0u;
+    var sec_end = 0u;
+    if (sec_idx != 0xffffffffu) {
+        sec_start = section_prefix_words[sec_idx];
+        sec_end = sec_start + section_lens_words[sec_idx];
+    }
+
+    var b0 = 0u;
+    var b1 = 0u;
+    var b2 = 0u;
+    var b3 = 0u;
+
+    if (remaining > 0u) {
+        let local0 = local_base;
+        loop {
+            if (sec_idx == 0xffffffffu || local0 < sec_end) {
+                break;
+            }
+            if (sec_idx + 1u >= section_count) {
+                sec_idx = 0xffffffffu;
+                break;
+            }
+            sec_idx = sec_idx + 1u;
+            sec_start = section_prefix_words[sec_idx];
+            sec_end = sec_start + section_lens_words[sec_idx];
+        }
+        if (sec_idx != 0xffffffffu && local0 >= sec_start && local0 < sec_end) {
+            sparse_stat_add(4u, 1u);
+            b0 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local0 - sec_start));
+        } else {
+            sparse_stat_add(7u, 1u);
+        }
+    }
+
+    if (remaining > 1u) {
+        let local1 = local_base + 1u;
+        loop {
+            if (sec_idx == 0xffffffffu || local1 < sec_end) {
+                break;
+            }
+            if (sec_idx + 1u >= section_count) {
+                sec_idx = 0xffffffffu;
+                break;
+            }
+            sec_idx = sec_idx + 1u;
+            sec_start = section_prefix_words[sec_idx];
+            sec_end = sec_start + section_lens_words[sec_idx];
+        }
+        if (sec_idx != 0xffffffffu && local1 >= sec_start && local1 < sec_end) {
+            sparse_stat_add(4u, 1u);
+            b1 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local1 - sec_start));
+        } else {
+            sparse_stat_add(7u, 1u);
+        }
+    }
+
+    if (remaining > 2u) {
+        let local2 = local_base + 2u;
+        loop {
+            if (sec_idx == 0xffffffffu || local2 < sec_end) {
+                break;
+            }
+            if (sec_idx + 1u >= section_count) {
+                sec_idx = 0xffffffffu;
+                break;
+            }
+            sec_idx = sec_idx + 1u;
+            sec_start = section_prefix_words[sec_idx];
+            sec_end = sec_start + section_lens_words[sec_idx];
+        }
+        if (sec_idx != 0xffffffffu && local2 >= sec_start && local2 < sec_end) {
+            sparse_stat_add(4u, 1u);
+            b2 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local2 - sec_start));
+        } else {
+            sparse_stat_add(7u, 1u);
+        }
+    }
+
+    if (remaining > 3u) {
+        let local3 = local_base + 3u;
+        loop {
+            if (sec_idx == 0xffffffffu || local3 < sec_end) {
+                break;
+            }
+            if (sec_idx + 1u >= section_count) {
+                sec_idx = 0xffffffffu;
+                break;
+            }
+            sec_idx = sec_idx + 1u;
+            sec_start = section_prefix_words[sec_idx];
+            sec_end = sec_start + section_lens_words[sec_idx];
+        }
+        if (sec_idx != 0xffffffffu && local3 >= sec_start && local3 < sec_end) {
+            sparse_stat_add(4u, 1u);
+            b3 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local3 - sec_start));
+        } else {
+            sparse_stat_add(7u, 1u);
+        }
+    }
+
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
 }
 
 fn read_output_byte(pos: u32) -> u32 {
@@ -1638,6 +1785,43 @@ fn read_output_byte(pos: u32) -> u32 {
     return 0u;
 }
 
+fn read_output_word(base: u32) -> u32 {
+    let section_cmd_len = section_meta_words[0];
+    let section_index_len = section_meta_words[1];
+    let overflow = section_meta_words[2];
+    let section_count = params[2];
+    let section_index_off = params[7];
+    let section_cmd_off = section_index_off + section_index_len;
+    let section_cmd_end = section_cmd_off + section_cmd_len;
+    let total_len = section_cmd_end;
+
+    if (overflow == 0u
+        && section_cmd_len != 0xffffffffu
+        && section_index_len != 0xffffffffu
+        && base >= section_cmd_off
+        && base < section_cmd_end
+        && section_count > 0u) {
+        let local_base = base - section_cmd_off;
+        let remaining = section_cmd_end - base;
+        return load_section_cmd_compact_word(local_base, section_count, remaining);
+    }
+
+    var b0 = read_output_byte(base);
+    var b1 = 0u;
+    var b2 = 0u;
+    var b3 = 0u;
+    if (base + 1u < total_len) {
+        b1 = read_output_byte(base + 1u);
+    }
+    if (base + 2u < total_len) {
+        b2 = read_output_byte(base + 2u);
+    }
+    if (base + 3u < total_len) {
+        b3 = read_output_byte(base + 3u);
+    }
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
 @compute
 @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
@@ -1647,11 +1831,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         return;
     }
     let base = word_idx * 4u;
-    let b0 = read_output_byte(base);
-    let b1 = read_output_byte(base + 1u);
-    let b2 = read_output_byte(base + 2u);
-    let b3 = read_output_byte(base + 3u);
-    out_words[word_idx] = b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    out_words[word_idx] = read_output_word(base);
 }
 "#;
 
@@ -1659,6 +1839,7 @@ const PACK_CHUNK_SPARSE_PREPARE_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read_write> params: array<u32>;
 @group(0) @binding(1) var<storage, read> section_meta_words: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dispatch_words: array<u32>;
+@group(0) @binding(3) var<storage, read> table_meta_words: array<u32>;
 
 fn align_up4(v: u32) -> u32 {
     return (v + 3u) & 0xfffffffcu;
@@ -1667,10 +1848,30 @@ fn align_up4(v: u32) -> u32 {
 @compute
 @workgroup_size(1, 1, 1)
 fn main() {
-    let section_index_off = params[7];
+    let table_count_hint = params[1];
+    let table_index_off = params[3];
+    var table_index_len = params[4];
+    var table_data_len = params[6];
+    if (table_count_hint != 0u) {
+        let meta_count = table_meta_words[0];
+        let meta_data_total_idx = 1u + table_count_hint * 2u;
+        let meta_data_total = table_meta_words[meta_data_total_idx];
+        if (meta_count != 0u || meta_data_total != 0u) {
+            let capped_count = min(meta_count, table_count_hint);
+            table_index_len = min(table_index_len, capped_count);
+            table_data_len = min(table_data_len, meta_data_total);
+            params[1] = capped_count;
+            params[4] = table_index_len;
+            params[6] = table_data_len;
+        }
+    }
+
+    let table_data_off = table_index_off + table_index_len;
+    let section_index_off = table_data_off + table_data_len;
     let section_index_cap_len = params[8];
     let section_cmd_cap_len = params[9];
-    let total_len_cap = section_index_off + section_index_cap_len + section_cmd_cap_len;
+    let section_cmd_off_cap = section_index_off + section_index_cap_len;
+    let total_len_cap = section_cmd_off_cap + section_cmd_cap_len;
 
     let section_cmd_len = section_meta_words[0];
     let section_index_len = section_meta_words[1];
@@ -1688,6 +1889,8 @@ fn main() {
     let total_words = select(max(1u, align_up4(total_len) >> 2u), 1u, total_len == 0xffffffffu);
     let groups_x = max(1u, (total_words + 255u) / 256u);
 
+    params[5] = table_data_off;
+    params[7] = section_index_off;
     params[10] = total_len;
     params[11] = total_words;
     dispatch_words[0] = groups_x;
@@ -2027,6 +2230,7 @@ struct GpuBatchScratch {
     table_count_cap_bytes: u64,
     table_index_offsets_cap_bytes: u64,
     table_data_offsets_cap_bytes: u64,
+    table_meta_cap_bytes: u64,
     table_index_cap_bytes: u64,
     prefix_first_cap_bytes: u64,
     table_lens_cap_bytes: u64,
@@ -2041,6 +2245,7 @@ struct GpuBatchScratch {
     table_count_buffer: wgpu::Buffer,
     table_index_offsets_buffer: wgpu::Buffer,
     table_data_offsets_buffer: wgpu::Buffer,
+    table_meta_buffer: wgpu::Buffer,
     table_index_buffer: wgpu::Buffer,
     prefix_first_buffer: wgpu::Buffer,
     table_lens_buffer: wgpu::Buffer,
@@ -2109,6 +2314,7 @@ struct GpuBatchScratchCaps {
     table_count_bytes: u64,
     table_index_offsets_bytes: u64,
     table_data_offsets_bytes: u64,
+    table_meta_bytes: u64,
     table_index_bytes: u64,
     prefix_first_bytes: u64,
     table_lens_bytes: u64,
@@ -2131,8 +2337,11 @@ static GPU_RUNTIME: OnceLock<Result<GpuMatchRuntime, String>> = OnceLock::new();
 static GPU_SUBMIT_STREAM_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 static BUILD_TABLE_STAGE_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 static BUILD_TABLE_STAGE_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
+static SPARSE_KERNEL_TS_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static SPARSE_KERNEL_TS_PROBE_UNSUPPORTED_LOGGED: OnceLock<()> = OnceLock::new();
 static BUILD_TABLE_BREAKDOWN_SEQ: AtomicUsize = AtomicUsize::new(0);
 static RESOLVE_MAP_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
+static SPARSE_LENS_WAIT_PROBE_SEQ: AtomicUsize = AtomicUsize::new(0);
 static BUILD_TABLE_DEVICE_SEQ: AtomicU64 = AtomicU64::new(0);
 static GPU_SUBMIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -2198,6 +2407,52 @@ fn resolve_map_wait_probe_enabled() -> bool {
 fn resolve_wait_attribution_probe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_RESOLVE_WAIT_ATTRIBUTION"))
+}
+
+fn sparse_lens_wait_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_PROFILE_SPARSE_LENS_WAIT_PROBE") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        },
+    )
+}
+
+fn sparse_wait_attribution_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag_enabled("COZIP_PDEFLATE_PROFILE_SPARSE_WAIT_ATTRIBUTION"))
+}
+
+fn sparse_kernel_ts_probe_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("COZIP_PDEFLATE_PROFILE_SPARSE_KERNEL_TS") {
+            Ok(v) => {
+                let s = v.trim();
+                !(s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => env_flag_enabled("COZIP_PDEFLATE_PROFILE"),
+        },
+    )
+}
+
+fn sparse_inflight_submit_chunks() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        match std::env::var("COZIP_PDEFLATE_SPARSE_INFLIGHT_SUBMIT_CHUNKS") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(usize::MAX),
+            Err(_) => 4,
+        }
+    })
 }
 
 fn table_stage_probe_should_log(seq: usize) -> bool {
@@ -2334,6 +2589,7 @@ impl GpuBatchScratch {
             && self.table_count_cap_bytes >= caps.table_count_bytes
             && self.table_index_offsets_cap_bytes >= caps.table_index_offsets_bytes
             && self.table_data_offsets_cap_bytes >= caps.table_data_offsets_bytes
+            && self.table_meta_cap_bytes >= caps.table_meta_bytes
             && self.table_index_cap_bytes >= caps.table_index_bytes
             && self.prefix_first_cap_bytes >= caps.prefix_first_bytes
             && self.table_lens_cap_bytes >= caps.table_lens_bytes
@@ -2351,6 +2607,7 @@ impl GpuBatchScratch {
             && self.table_count_cap_bytes >= other.table_count_cap_bytes
             && self.table_index_offsets_cap_bytes >= other.table_index_offsets_cap_bytes
             && self.table_data_offsets_cap_bytes >= other.table_data_offsets_cap_bytes
+            && self.table_meta_cap_bytes >= other.table_meta_cap_bytes
             && self.table_index_cap_bytes >= other.table_index_cap_bytes
             && self.prefix_first_cap_bytes >= other.prefix_first_cap_bytes
             && self.table_lens_cap_bytes >= other.table_lens_cap_bytes
@@ -2369,6 +2626,7 @@ impl GpuBatchScratch {
         let table_index_offsets_cap_bytes =
             round_capacity_bytes(required.table_index_offsets_bytes);
         let table_data_offsets_cap_bytes = round_capacity_bytes(required.table_data_offsets_bytes);
+        let table_meta_cap_bytes = round_capacity_bytes(required.table_meta_bytes);
         let table_index_cap_bytes = round_capacity_bytes(required.table_index_bytes);
         let prefix_first_cap_bytes = round_capacity_bytes(required.prefix_first_bytes);
         let table_lens_cap_bytes = round_capacity_bytes(required.table_lens_bytes);
@@ -2404,6 +2662,11 @@ impl GpuBatchScratch {
             &runtime.device,
             "cozip-pdeflate-table-data-offsets",
             table_data_offsets_cap_bytes,
+        );
+        let table_meta_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-table-meta",
+            table_meta_cap_bytes,
         );
         let table_index_buffer = storage_upload_buffer(
             &runtime.device,
@@ -2521,26 +2784,30 @@ impl GpuBatchScratch {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: table_index_buffer.as_entire_binding(),
+                        resource: table_meta_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: table_data_buffer.as_entire_binding(),
+                        resource: table_index_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: prep_params_buffer.as_entire_binding(),
+                        resource: table_data_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: prefix_first_buffer.as_entire_binding(),
+                        resource: prep_params_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 8,
-                        resource: table_lens_buffer.as_entire_binding(),
+                        resource: prefix_first_buffer.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 9,
+                        resource: table_lens_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
                         resource: table_offsets_buffer.as_entire_binding(),
                     },
                 ],
@@ -2553,6 +2820,7 @@ impl GpuBatchScratch {
             table_count_cap_bytes,
             table_index_offsets_cap_bytes,
             table_data_offsets_cap_bytes,
+            table_meta_cap_bytes,
             table_index_cap_bytes,
             prefix_first_cap_bytes,
             table_lens_cap_bytes,
@@ -2567,6 +2835,7 @@ impl GpuBatchScratch {
             table_count_buffer,
             table_index_offsets_buffer,
             table_data_offsets_buffer,
+            table_meta_buffer,
             table_index_buffer,
             prefix_first_buffer,
             table_lens_buffer,
@@ -3299,6 +3568,16 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -4530,7 +4809,7 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                     binding: 7,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -4548,6 +4827,16 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -5166,7 +5455,6 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     }
 
     struct SparsePackDispatchJob {
-        table_count: usize,
         scratch: GpuSparsePackScratch,
     }
 
@@ -5187,13 +5475,26 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let lens_copy_ms;
 
     let t_prepare = Instant::now();
-    let mut table_size_resolve_ms = 0.0_f64;
+    let table_size_resolve_ms = 0.0_f64;
     let mut prepared = Vec::<SparsePackPrepared>::with_capacity(inputs.len());
     for input in inputs {
-        let t_resolve = Instant::now();
-        let (table_count, table_index_len, table_data_len) =
-            resolve_packed_table_sizes(input.table)?;
-        table_size_resolve_ms += elapsed_ms(t_resolve);
+        let (table_count, table_index_len, table_data_len) = if input.table.sizes_known
+            || input.table.table_count > 0
+            || input.table.table_index_len > 0
+            || input.table.table_data_len > 0
+        {
+            (
+                input.table.table_count,
+                input.table.table_index_len,
+                input.table.table_data_len,
+            )
+        } else {
+            (
+                input.table.max_entries,
+                input.table.max_entries,
+                input.table.table_data_bytes_cap,
+            )
+        };
         let table_index_offset = PACK_CHUNK_HEADER_SIZE;
         let table_data_offset = table_index_offset
             .checked_add(table_index_len)
@@ -5252,6 +5553,46 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let scratch_acquire_ms = elapsed_ms(t_scratch_acquire);
 
     let sparse_probe = sparse_probe_enabled();
+    let sparse_lens_wait_probe = sparse_lens_wait_probe_enabled();
+    let sparse_wait_attr_probe = sparse_wait_attribution_probe_enabled();
+    let sparse_kernel_ts_probe = sparse_kernel_ts_probe_enabled() && r.supports_timestamp_query;
+    if sparse_kernel_ts_probe_enabled() && !r.supports_timestamp_query {
+        let _ = SPARSE_KERNEL_TS_PROBE_UNSUPPORTED_LOGGED.get_or_init(|| {
+            eprintln!(
+                "[cozip_pdeflate][timing][sparse-kernel-ts] status=disabled reason=timestamp_query_not_supported"
+            );
+        });
+    }
+    let mut sparse_prebuild_build_id_min = u64::MAX;
+    let mut sparse_prebuild_build_id_max = 0u64;
+    let mut sparse_prebuild_submit_seq_min = u64::MAX;
+    let mut sparse_prebuild_submit_seq_max = 0u64;
+    let mut sparse_latest_build_submit: Option<(u64, u64, wgpu::SubmissionIndex)> = None;
+    let mut sparse_build_ids = Vec::<u64>::with_capacity(inputs.len());
+    for input in inputs {
+        let table = input.table;
+        if table.build_id != 0 {
+            sparse_prebuild_build_id_min = sparse_prebuild_build_id_min.min(table.build_id);
+            sparse_prebuild_build_id_max = sparse_prebuild_build_id_max.max(table.build_id);
+            sparse_build_ids.push(table.build_id);
+        }
+        if table.build_submit_seq != 0 {
+            sparse_prebuild_submit_seq_min =
+                sparse_prebuild_submit_seq_min.min(table.build_submit_seq);
+            sparse_prebuild_submit_seq_max =
+                sparse_prebuild_submit_seq_max.max(table.build_submit_seq);
+        }
+        if let Some(submit_index) = table.build_submit_index.clone() {
+            let should_replace = sparse_latest_build_submit
+                .as_ref()
+                .map(|(seq, _, _)| table.build_submit_seq > *seq)
+                .unwrap_or(true);
+            if should_replace {
+                sparse_latest_build_submit =
+                    Some((table.build_submit_seq, table.build_id, submit_index));
+            }
+        }
+    }
     let sparse_stats_buffer = if sparse_probe {
         let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cozip-pdeflate-pack-sparse-stats"),
@@ -5277,17 +5618,65 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     } else {
         None
     };
+    let sparse_ts_query_count = u32::try_from(inputs.len())
+        .ok()
+        .and_then(|n| n.checked_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT))
+        .unwrap_or(0);
+    let mut sparse_ts_prepare_kernel_ms = 0.0_f64;
+    let mut sparse_ts_kernel_ms = 0.0_f64;
+    let mut sparse_ts_parse_ms = 0.0_f64;
+    let mut sparse_ts_map_status: Option<String> = None;
+    let mut sparse_ts_query_set = None;
+    let mut sparse_ts_resolve_buffer = None;
+    let mut sparse_ts_readback_buffer = None;
+    if sparse_kernel_ts_probe && sparse_ts_query_count > 0 {
+        let ts_bytes = u64::from(sparse_ts_query_count).saturating_mul(8).max(8);
+        sparse_ts_query_set = Some(r.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-ts-qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: sparse_ts_query_count,
+        }));
+        sparse_ts_resolve_buffer = Some(r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-ts-resolve"),
+            size: ts_bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        sparse_ts_readback_buffer = Some(r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-ts-readback"),
+            size: ts_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
 
     let t_upload = Instant::now();
+    let sparse_submit_chunk = sparse_inflight_submit_chunks().max(1);
     let mut encoder = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cozip-pdeflate-pack-sparse-batch-encoder"),
         });
+    let mut encoder_has_work = false;
+    let mut chunk_encoded = 0usize;
     let mut dispatch_jobs = Vec::<SparsePackDispatchJob>::with_capacity(inputs.len());
-    for ((input, prep), scratch) in inputs
+    let mut sparse_submit_seq = 0u64;
+    let mut sparse_submit_seq_last = 0u64;
+    let mut sparse_submit_count = 0usize;
+    let mut submit_ms = 0.0_f64;
+    let mut pre_wait_latest_build_submit_ms = 0.0_f64;
+    if sparse_wait_attr_probe {
+        if let Some((_, _, latest_submit_idx)) = sparse_latest_build_submit.as_ref() {
+            let t_pre_wait = Instant::now();
+            r.device
+                .poll(wgpu::Maintain::wait_for(latest_submit_idx.clone()));
+            pre_wait_latest_build_submit_ms = elapsed_ms(t_pre_wait);
+        }
+    }
+    for ((dispatch_idx, (input, prep)), scratch) in inputs
         .iter()
         .zip(prepared.iter())
+        .enumerate()
         .zip(acquired_scratch.into_iter())
     {
         let section_index_cap_len = usize::try_from(input.section.section_index_cap_bytes)
@@ -5327,6 +5716,10 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: scratch.dispatch_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: input.table.table_meta_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -5388,6 +5781,15 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         r.queue
             .write_buffer(&scratch.params_buffer, 0, bytemuck::cast_slice(&params_cap));
 
+        let stage_base = u32::try_from(dispatch_idx)
+            .ok()
+            .and_then(|v| v.checked_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT))
+            .unwrap_or(0);
+        if let Some(query_set) = sparse_ts_query_set.as_ref() {
+            if stage_base.saturating_add(3) < sparse_ts_query_count {
+                encoder.write_timestamp(query_set, stage_base);
+            }
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-pdeflate-pack-sparse-prepare-pass"),
@@ -5396,6 +5798,12 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             pass.set_pipeline(&r.pack_sparse_prepare_pipeline);
             pass.set_bind_group(0, &prepare_bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
+        }
+        if let Some(query_set) = sparse_ts_query_set.as_ref() {
+            if stage_base.saturating_add(3) < sparse_ts_query_count {
+                encoder.write_timestamp(query_set, stage_base + 1);
+                encoder.write_timestamp(query_set, stage_base + 2);
+            }
         }
         encoder.copy_buffer_to_buffer(
             &scratch.params_buffer,
@@ -5413,41 +5821,102 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups_indirect(&scratch.dispatch_buffer, 0);
         }
-        encoder.copy_buffer_to_buffer(
-            &scratch.out_buffer,
-            0,
-            &scratch.readback_buffer,
-            0,
-            prep.total_bytes_cap,
-        );
-        dispatch_jobs.push(SparsePackDispatchJob {
-            table_count: prep.table_count,
-            scratch,
-        });
+        if let Some(query_set) = sparse_ts_query_set.as_ref() {
+            if stage_base.saturating_add(3) < sparse_ts_query_count {
+                encoder.write_timestamp(query_set, stage_base + 3);
+            }
+        }
+        dispatch_jobs.push(SparsePackDispatchJob { scratch });
+        encoder_has_work = true;
+        chunk_encoded = chunk_encoded.saturating_add(1);
+        if chunk_encoded >= sparse_submit_chunk {
+            let t_submit_chunk = Instant::now();
+            let submit_seq = next_gpu_submit_seq();
+            if sparse_submit_seq == 0 {
+                sparse_submit_seq = submit_seq;
+            }
+            sparse_submit_seq_last = submit_seq;
+            r.queue.submit(Some(encoder.finish()));
+            submit_ms += elapsed_ms(t_submit_chunk);
+            sparse_submit_count = sparse_submit_count.saturating_add(1);
+            encoder = r
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-pdeflate-pack-sparse-batch-encoder"),
+                });
+            encoder_has_work = false;
+            chunk_encoded = 0;
+        }
     }
+    if encoder_has_work {
+        let t_submit_chunk = Instant::now();
+        let submit_seq = next_gpu_submit_seq();
+        if sparse_submit_seq == 0 {
+            sparse_submit_seq = submit_seq;
+        }
+        sparse_submit_seq_last = submit_seq;
+        r.queue.submit(Some(encoder.finish()));
+        submit_ms += elapsed_ms(t_submit_chunk);
+        sparse_submit_count = sparse_submit_count.saturating_add(1);
+    }
+
+    let mut post_encoder = r
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-post-encoder"),
+        });
+    let mut post_encoder_has_work = false;
     if let (Some(stats_buffer), Some(stats_readback)) = (
         sparse_stats_buffer.as_ref(),
         sparse_stats_readback_buffer.as_ref(),
     ) {
-        encoder.copy_buffer_to_buffer(stats_buffer, 0, stats_readback, 0, 32);
+        post_encoder.copy_buffer_to_buffer(stats_buffer, 0, stats_readback, 0, 32);
+        post_encoder_has_work = true;
     }
-    let t_submit = Instant::now();
-    r.queue.submit(Some(encoder.finish()));
-    let submit_ms = elapsed_ms(t_submit);
-    let upload_dispatch_ms = (elapsed_ms(t_upload) - submit_ms).max(0.0);
+    if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+        sparse_ts_query_set.as_ref(),
+        sparse_ts_resolve_buffer.as_ref(),
+        sparse_ts_readback_buffer.as_ref(),
+    ) {
+        let ts_bytes = u64::from(sparse_ts_query_count).saturating_mul(8).max(8);
+        post_encoder.resolve_query_set(query_set, 0..sparse_ts_query_count, resolve_buffer, 0);
+        post_encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, ts_bytes);
+        post_encoder_has_work = true;
+    }
+    if post_encoder_has_work {
+        let t_submit_post = Instant::now();
+        let submit_seq = next_gpu_submit_seq();
+        if sparse_submit_seq == 0 {
+            sparse_submit_seq = submit_seq;
+        }
+        sparse_submit_seq_last = submit_seq;
+        r.queue.submit(Some(post_encoder.finish()));
+        submit_ms += elapsed_ms(t_submit_post);
+        sparse_submit_count = sparse_submit_count.saturating_add(1);
+    }
+    if sparse_submit_seq == 0 {
+        sparse_submit_seq = sparse_submit_seq_last;
+    }
+    let mut upload_dispatch_ms = (elapsed_ms(t_upload) - submit_ms).max(0.0);
     upload_ms += upload_dispatch_ms;
 
-    let t_lens_wait = Instant::now();
-    let lens_submit_done_wait_ms = 0.0_f64;
+    let mut lens_submit_done_wait_ms = 0.0_f64;
     let mut lens_poll_calls = 0u64;
     let lens_yield_calls = 0u64;
+    let mut phase1_wait_calls = 0u64;
+    let mut phase2_wait_calls = 0u64;
+    let mut phase1_wait_max_ms = 0.0_f64;
+    let mut phase2_wait_max_ms = 0.0_f64;
+    let mut phase1_wait_ready_total = 0usize;
+    let mut phase2_wait_ready_total = 0usize;
     let mut size_slices = Vec::with_capacity(dispatch_jobs.len());
     let mut size_receivers = Vec::with_capacity(dispatch_jobs.len());
-    let mut out_slices = Vec::with_capacity(dispatch_jobs.len());
-    let mut out_receivers = Vec::with_capacity(dispatch_jobs.len());
     let mut sparse_stats_slice = None;
     let mut sparse_stats_receiver = None;
     let mut sparse_stats_pending = false;
+    let mut sparse_ts_slice = None;
+    let mut sparse_ts_receiver = None;
+    let mut sparse_ts_pending = false;
     if let Some(stats_readback) = sparse_stats_readback_buffer.as_ref() {
         let stats_slice = stats_readback.slice(..32);
         let (stats_tx, stats_rx) = mpsc::channel();
@@ -5458,6 +5927,17 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         sparse_stats_receiver = Some(stats_rx);
         sparse_stats_pending = true;
     }
+    if let Some(ts_readback) = sparse_ts_readback_buffer.as_ref() {
+        let ts_size = u64::from(sparse_ts_query_count).saturating_mul(8).max(8);
+        let ts_slice = ts_readback.slice(..ts_size);
+        let (ts_tx, ts_rx) = mpsc::channel();
+        ts_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = ts_tx.send(res);
+        });
+        sparse_ts_slice = Some(ts_slice);
+        sparse_ts_receiver = Some(ts_rx);
+        sparse_ts_pending = true;
+    }
     for dispatch in &dispatch_jobs {
         let size_slice = dispatch.scratch.params_readback_buffer.slice(..48);
         let (tx, rx) = mpsc::channel();
@@ -5466,25 +5946,15 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         });
         size_slices.push(size_slice);
         size_receivers.push(rx);
-
-        let out_slice = dispatch
-            .scratch
-            .readback_buffer
-            .slice(..dispatch.scratch.out_cap_bytes.max(4));
-        let (out_tx, out_rx) = mpsc::channel();
-        out_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = out_tx.send(res);
-        });
-        out_slices.push(out_slice);
-        out_receivers.push(out_rx);
     }
+    let t_lens_wait_phase1 = Instant::now();
+    let mut phase1_submit_done_wait_ms = 0.0_f64;
     let mut pending_sizes = vec![true; size_receivers.len()];
     let mut remaining_sizes = size_receivers.len();
-    let mut pending_out = vec![true; out_receivers.len()];
-    let mut remaining_out = out_receivers.len();
-    while remaining_sizes > 0 || remaining_out > 0 || sparse_stats_pending {
-        r.device.poll(wgpu::Maintain::Wait);
+    while remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending {
+        r.device.poll(wgpu::Maintain::Poll);
         lens_poll_calls = lens_poll_calls.saturating_add(1);
+        let mut collected = 0usize;
         for (i, rx) in size_receivers.iter().enumerate() {
             if pending_sizes[i] {
                 match rx.try_recv() {
@@ -5494,30 +5964,12 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                         })?;
                         pending_sizes[i] = false;
                         remaining_sizes = remaining_sizes.saturating_sub(1);
+                        collected = collected.saturating_add(1);
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         return Err(PDeflateError::Gpu(
                             "gpu sparse size map channel closed".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        for (i, rx) in out_receivers.iter().enumerate() {
-            if pending_out[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
-                        })?;
-                        pending_out[i] = false;
-                        remaining_out = remaining_out.saturating_sub(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse chunk pack map channel closed".to_string(),
                         ));
                     }
                 }
@@ -5531,6 +5983,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                             PDeflateError::Gpu(format!("gpu sparse stats map failed: {e}"))
                         })?;
                         sparse_stats_pending = false;
+                        collected = collected.saturating_add(1);
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -5541,9 +5994,135 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                 }
             }
         }
+        if sparse_ts_pending {
+            if let Some(rx) = sparse_ts_receiver.as_ref() {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        if let Err(e) = res {
+                            sparse_ts_map_status = Some(format!("map failed: {e}"));
+                        }
+                        sparse_ts_pending = false;
+                        collected = collected.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        sparse_ts_map_status = Some("map channel closed".to_string());
+                        sparse_ts_pending = false;
+                    }
+                }
+            }
+        }
+        if collected > 0 {
+            continue;
+        }
+        let t_wait = Instant::now();
+        r.device.poll(wgpu::Maintain::Wait);
+        let wait_ms = elapsed_ms(t_wait);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        phase1_wait_calls = phase1_wait_calls.saturating_add(1);
+        phase1_wait_max_ms = phase1_wait_max_ms.max(wait_ms);
+        phase1_submit_done_wait_ms += wait_ms;
+        let mut collected_after_wait = 0usize;
+        for (i, rx) in size_receivers.iter().enumerate() {
+            if pending_sizes[i] {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        res.map_err(|e| {
+                            PDeflateError::Gpu(format!("gpu sparse size map failed: {e}"))
+                        })?;
+                        pending_sizes[i] = false;
+                        remaining_sizes = remaining_sizes.saturating_sub(1);
+                        collected_after_wait = collected_after_wait.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse size map channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        if sparse_stats_pending {
+            if let Some(rx) = sparse_stats_receiver.as_ref() {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        res.map_err(|e| {
+                            PDeflateError::Gpu(format!("gpu sparse stats map failed: {e}"))
+                        })?;
+                        sparse_stats_pending = false;
+                        collected_after_wait = collected_after_wait.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse stats map channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        if sparse_ts_pending {
+            if let Some(rx) = sparse_ts_receiver.as_ref() {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        if let Err(e) = res {
+                            sparse_ts_map_status = Some(format!("map failed: {e}"));
+                        }
+                        sparse_ts_pending = false;
+                        collected_after_wait = collected_after_wait.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        sparse_ts_map_status = Some("map channel closed".to_string());
+                        sparse_ts_pending = false;
+                    }
+                }
+            }
+        }
+        phase1_wait_ready_total = phase1_wait_ready_total.saturating_add(collected_after_wait);
+        if collected_after_wait == 0 && (remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending) {
+            return Err(PDeflateError::Gpu(
+                "gpu sparse size/stats pending stalled after wait".to_string(),
+            ));
+        }
     }
-    lens_wait_ms = elapsed_ms(t_lens_wait);
-    let lens_map_after_done_ms = 0.0_f64;
+    lens_submit_done_wait_ms += phase1_submit_done_wait_ms;
+    let phase1_wait_ms = elapsed_ms(t_lens_wait_phase1);
+    let phase1_map_after_done_ms = (phase1_wait_ms - phase1_submit_done_wait_ms).max(0.0);
+    let mut lens_map_after_done_ms = phase1_map_after_done_ms;
+
+    if let Some(ts_slice) = sparse_ts_slice {
+        if sparse_ts_map_status.is_none() {
+            let t_parse = Instant::now();
+            let mapped = ts_slice.get_mapped_range();
+            let ticks: &[u64] = bytemuck::cast_slice(&mapped);
+            let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
+            for dispatch_idx in 0..inputs.len() {
+                let stage_base = dispatch_idx.saturating_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT as usize);
+                if stage_base + 3 < ticks.len() {
+                    let t0 = ticks[stage_base];
+                    let t1 = ticks[stage_base + 1];
+                    let t2 = ticks[stage_base + 2];
+                    let t3 = ticks[stage_base + 3];
+                    if t1 >= t0 {
+                        sparse_ts_prepare_kernel_ms += (t1 - t0) as f64 * period_ms;
+                    }
+                    if t3 >= t2 {
+                        sparse_ts_kernel_ms += (t3 - t2) as f64 * period_ms;
+                    }
+                }
+            }
+            drop(mapped);
+            sparse_ts_parse_ms = elapsed_ms(t_parse);
+        }
+        if let Some(ts_readback) = sparse_ts_readback_buffer.as_ref() {
+            ts_readback.unmap();
+        }
+    }
+    let sparse_ts_kernel_total_ms = sparse_ts_prepare_kernel_ms + sparse_ts_kernel_ms;
+    let sparse_ts_queue_stall_est_ms =
+        (phase1_submit_done_wait_ms - sparse_ts_kernel_total_ms).max(0.0);
 
     let mut sparse_probe_counters = [0u64; 8];
     if let Some(stats_slice) = sparse_stats_slice {
@@ -5560,13 +6139,19 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
 
     let t_lens_copy = Instant::now();
     let mut payload_lens = Vec::<usize>::with_capacity(dispatch_jobs.len());
+    let mut payload_copy_bytes = Vec::<u64>::with_capacity(dispatch_jobs.len());
+    let mut payload_table_counts = Vec::<usize>::with_capacity(dispatch_jobs.len());
     for (idx, prep) in prepared.iter().enumerate() {
         let size_mapped = size_slices[idx].get_mapped_range();
         let size_words: &[u32] = bytemuck::cast_slice(&size_mapped);
+        let table_count_u32 = *size_words.get(1).unwrap_or(&0);
         let total_len_u32 = *size_words.get(10).unwrap_or(&0xffff_ffff);
         let total_words_u32 = *size_words.get(11).unwrap_or(&0);
         drop(size_mapped);
         dispatch_jobs[idx].scratch.params_readback_buffer.unmap();
+        payload_table_counts.push(
+            usize::try_from(table_count_u32).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
 
         if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
             return Err(PDeflateError::Gpu(
@@ -5585,8 +6170,250 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             ));
         }
         payload_lens.push(total_len);
+        payload_copy_bytes.push(total_copy_bytes.max(4));
     }
     lens_copy_ms = elapsed_ms(t_lens_copy);
+
+    let t_payload_submit_all = Instant::now();
+    let mut payload_encoder = r
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-payload-readback-encoder"),
+        });
+    for (idx, dispatch) in dispatch_jobs.iter().enumerate() {
+        payload_encoder.copy_buffer_to_buffer(
+            &dispatch.scratch.out_buffer,
+            0,
+            &dispatch.scratch.readback_buffer,
+            0,
+            payload_copy_bytes[idx],
+        );
+    }
+    let t_payload_submit = Instant::now();
+    let payload_readback_submit_seq = next_gpu_submit_seq();
+    r.queue.submit(Some(payload_encoder.finish()));
+    let payload_submit_ms = elapsed_ms(t_payload_submit);
+    submit_ms += payload_submit_ms;
+    let payload_upload_dispatch_ms = (elapsed_ms(t_payload_submit_all) - payload_submit_ms).max(0.0);
+    upload_ms += payload_upload_dispatch_ms;
+    upload_dispatch_ms += payload_upload_dispatch_ms;
+
+    let t_lens_wait_phase2 = Instant::now();
+    let mut phase2_submit_done_wait_ms = 0.0_f64;
+    let mut out_slices = Vec::with_capacity(dispatch_jobs.len());
+    let mut out_receivers = Vec::with_capacity(dispatch_jobs.len());
+    for (idx, dispatch) in dispatch_jobs.iter().enumerate() {
+        let out_slice = dispatch
+            .scratch
+            .readback_buffer
+            .slice(..payload_copy_bytes[idx]);
+        let (out_tx, out_rx) = mpsc::channel();
+        out_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = out_tx.send(res);
+        });
+        out_slices.push(out_slice);
+        out_receivers.push(out_rx);
+    }
+    let mut pending_out = vec![true; out_receivers.len()];
+    let mut remaining_out = out_receivers.len();
+    while remaining_out > 0 {
+        r.device.poll(wgpu::Maintain::Poll);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        let mut collected = 0usize;
+        for (i, rx) in out_receivers.iter().enumerate() {
+            if pending_out[i] {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        res.map_err(|e| {
+                            PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
+                        })?;
+                        pending_out[i] = false;
+                        remaining_out = remaining_out.saturating_sub(1);
+                        collected = collected.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse chunk pack map channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        if collected > 0 {
+            continue;
+        }
+        let t_wait = Instant::now();
+        r.device.poll(wgpu::Maintain::Wait);
+        let wait_ms = elapsed_ms(t_wait);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        phase2_wait_calls = phase2_wait_calls.saturating_add(1);
+        phase2_wait_max_ms = phase2_wait_max_ms.max(wait_ms);
+        phase2_submit_done_wait_ms += wait_ms;
+        let mut collected_after_wait = 0usize;
+        for (i, rx) in out_receivers.iter().enumerate() {
+            if pending_out[i] {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        res.map_err(|e| {
+                            PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
+                        })?;
+                        pending_out[i] = false;
+                        remaining_out = remaining_out.saturating_sub(1);
+                        collected_after_wait = collected_after_wait.saturating_add(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse chunk pack map channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        phase2_wait_ready_total = phase2_wait_ready_total.saturating_add(collected_after_wait);
+        if collected_after_wait == 0 && remaining_out > 0 {
+            return Err(PDeflateError::Gpu(
+                "gpu sparse payload pending stalled after wait".to_string(),
+            ));
+        }
+    }
+    lens_submit_done_wait_ms += phase2_submit_done_wait_ms;
+    let phase2_wait_ms = elapsed_ms(t_lens_wait_phase2);
+    let phase2_map_after_done_ms = (phase2_wait_ms - phase2_submit_done_wait_ms).max(0.0);
+    lens_map_after_done_ms += phase2_map_after_done_ms;
+    lens_wait_ms = phase1_wait_ms + phase2_wait_ms;
+
+    if sparse_lens_wait_probe {
+        let seq = SPARSE_LENS_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+        if table_stage_probe_should_log(seq) {
+            let size_readback_bytes = (dispatch_jobs.len() as u64).saturating_mul(48);
+            let stats_readback_bytes = if sparse_probe { 32u64 } else { 0u64 };
+            let ts_readback_bytes = if sparse_kernel_ts_probe {
+                u64::from(sparse_ts_query_count).saturating_mul(8)
+            } else {
+                0u64
+            };
+            let payload_readback_bytes =
+                payload_copy_bytes.iter().fold(0u64, |acc, v| acc.saturating_add(*v));
+            let readback_bytes = size_readback_bytes
+                .saturating_add(stats_readback_bytes)
+                .saturating_add(ts_readback_bytes)
+                .saturating_add(payload_readback_bytes);
+            let build_id_range = if sparse_prebuild_build_id_min != u64::MAX {
+                format!(
+                    "{}..{}",
+                    sparse_prebuild_build_id_min, sparse_prebuild_build_id_max
+                )
+            } else {
+                "none".to_string()
+            };
+            let submit_seq_range = if sparse_prebuild_submit_seq_min != u64::MAX {
+                format!(
+                    "{}..{}",
+                    sparse_prebuild_submit_seq_min, sparse_prebuild_submit_seq_max
+                )
+            } else {
+                "none".to_string()
+            };
+            let build_ids = if sparse_build_ids.is_empty() {
+                "none".to_string()
+            } else {
+                sparse_build_ids
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let (latest_build_submit_seq, latest_build_id) = sparse_latest_build_submit
+                .as_ref()
+                .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
+                .unwrap_or((0, 0));
+            let sparse_ts_status = if !sparse_kernel_ts_probe {
+                "off".to_string()
+            } else {
+                sparse_ts_map_status
+                    .clone()
+                    .unwrap_or_else(|| "ok".to_string())
+            };
+            eprintln!(
+                "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq={} sparse_submit_seq_last={} sparse_submit_count={} payload_submit_seq={} pre_wait_latest_build_submit_ms={:.3} submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms={:.3} map_callback_wait_payload_ms={:.3} map_callback_wait_ms={:.3} sparse_wait_calls={} payload_wait_calls={} sparse_wait_max_ms={:.3} payload_wait_max_ms={:.3} sparse_wait_ready={} payload_wait_ready={} sparse_ts_prepare_kernel_ms={:.3} sparse_ts_kernel_ms={:.3} sparse_ts_kernel_total_ms={:.3} sparse_ts_parse_ms={:.3} sparse_ts_queue_stall_est_ms={:.3} sparse_ts_status={} lens_wait_ms={:.3}",
+                seq,
+                inputs.len(),
+                dispatch_jobs
+                    .len()
+                    .saturating_add(if sparse_probe { 1 } else { 0 })
+                    .saturating_add(dispatch_jobs.len()),
+                (readback_bytes as f64) / 1024.0,
+                (payload_readback_bytes as f64) / 1024.0,
+                build_id_range,
+                submit_seq_range,
+                build_ids,
+                latest_build_submit_seq,
+                latest_build_id,
+                sparse_submit_seq,
+                sparse_submit_seq_last,
+                sparse_submit_count,
+                payload_readback_submit_seq,
+                pre_wait_latest_build_submit_ms,
+                phase1_submit_done_wait_ms,
+                phase2_submit_done_wait_ms,
+                lens_submit_done_wait_ms,
+                phase1_map_after_done_ms,
+                phase2_map_after_done_ms,
+                lens_map_after_done_ms,
+                phase1_wait_calls,
+                phase2_wait_calls,
+                phase1_wait_max_ms,
+                phase2_wait_max_ms,
+                phase1_wait_ready_total,
+                phase2_wait_ready_total,
+                sparse_ts_prepare_kernel_ms,
+                sparse_ts_kernel_ms,
+                sparse_ts_kernel_total_ms,
+                sparse_ts_parse_ms,
+                sparse_ts_queue_stall_est_ms,
+                sparse_ts_status,
+                lens_wait_ms,
+            );
+            if sparse_kernel_ts_probe {
+                let ts_seq = SPARSE_KERNEL_TS_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+                if table_stage_probe_should_log(ts_seq) {
+                    eprintln!(
+                        "[cozip_pdeflate][timing][sparse-kernel-ts] seq={} chunks={} prepare_kernel_ms={:.3} sparse_kernel_ms={:.3} kernel_total_ms={:.3} submit_done_wait_sparse_ms={:.3} queue_stall_est_ms={:.3} parse_ms={:.3} status={}",
+                        ts_seq,
+                        inputs.len(),
+                        sparse_ts_prepare_kernel_ms,
+                        sparse_ts_kernel_ms,
+                        sparse_ts_kernel_total_ms,
+                        phase1_submit_done_wait_ms,
+                        sparse_ts_queue_stall_est_ms,
+                        sparse_ts_parse_ms,
+                        sparse_ts_map_status
+                            .as_deref()
+                            .unwrap_or("ok"),
+                    );
+                }
+            }
+            if sparse_wait_attr_probe {
+                eprintln!(
+                    "[cozip_pdeflate][timing][sparse-wait-attribution] seq={} chunks={} sparse_submit_seq={} sparse_submit_seq_last={} sparse_submit_count={} pre_wait_latest_build_submit_ms={:.3} submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_ms={:.3} lens_wait_ms={:.3} note=\"pre_wait captures known table-build completion; submit_done_wait includes residual queue+own sparse+payload submissions\"",
+                    seq,
+                    inputs.len(),
+                    sparse_submit_seq,
+                    sparse_submit_seq_last,
+                    sparse_submit_count,
+                    pre_wait_latest_build_submit_ms,
+                    phase1_submit_done_wait_ms,
+                    phase2_submit_done_wait_ms,
+                    lens_submit_done_wait_ms,
+                    lens_map_after_done_ms,
+                    lens_wait_ms,
+                );
+            }
+        }
+    }
+
     let sparse_wait_ms = 0.0_f64;
     wait_ms += sparse_wait_ms;
 
@@ -5601,7 +6428,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         dispatch.scratch.readback_buffer.unmap();
         out.push(GpuSparsePackChunkOutput {
             payload,
-            table_count: dispatch.table_count,
+            table_count: payload_table_counts[idx],
         });
     }
     let sparse_copy_ms = elapsed_ms(t_copy);
@@ -7365,11 +8192,13 @@ struct PackedBatchInputs<'a> {
     table_chunk_counts: Vec<u32>,
     table_chunk_index_offsets: Vec<u32>,
     table_chunk_data_offsets: Vec<u32>,
+    table_chunk_meta_words: Vec<u32>,
     table_index_words: Vec<u32>,
     table_data_words: Vec<u32>,
     table_index_words_len: usize,
     table_data_words_len: usize,
     table_device_copies: Vec<PackedTableDeviceCopy<'a>>,
+    table_meta_device_copies: Vec<PackedTableMetaDeviceCopy<'a>>,
     chunk_lens: Vec<usize>,
     total_src_len: usize,
     total_table_entries: usize,
@@ -7385,6 +8214,13 @@ struct PackedTableDeviceCopy<'a> {
     data_dst_offset: u64,
     index_len: usize,
     data_len: usize,
+}
+
+struct PackedTableMetaDeviceCopy<'a> {
+    meta_src: &'a wgpu::Buffer,
+    dst_count_offset: u64,
+    dst_data_total_offset: u64,
+    src_data_total_offset: u64,
 }
 
 struct PackedTableUpload<'a> {
@@ -7435,7 +8271,9 @@ fn pack_match_batch_inputs<'a>(
     let mut table_chunk_counts = Vec::<u32>::with_capacity(inputs.len());
     let mut table_chunk_index_offsets = Vec::<u32>::with_capacity(inputs.len());
     let mut table_chunk_data_offsets = Vec::<u32>::with_capacity(inputs.len());
+    let mut table_chunk_meta_words = Vec::<u32>::with_capacity(inputs.len().saturating_mul(2));
     let mut table_uploads = Vec::<PackedTableUpload<'a>>::with_capacity(inputs.len());
+    let mut table_meta_device_copies = Vec::<PackedTableMetaDeviceCopy<'a>>::new();
     let mut table_index_packer =
         ByteWordPacker::with_capacity_bytes(inputs.len().saturating_mul(256));
     let mut table_data_packer =
@@ -7443,25 +8281,8 @@ fn pack_match_batch_inputs<'a>(
     let mut chunk_lens = Vec::<usize>::with_capacity(inputs.len());
     let mut global_table_base = 0usize;
     let alloc_setup_ms = elapsed_ms(t_alloc_setup);
-    let t_resolve = Instant::now();
-    let unresolved_tables: Vec<&GpuPackedTableDevice> = inputs
-        .iter()
-        .filter_map(|input| input.table_gpu)
-        .filter(|table_gpu| !table_gpu.sizes_known && table_gpu.max_entries > 0)
-        .collect();
-    let (unresolved_sizes, resolve_profile) = if unresolved_tables.is_empty() {
-        (
-            Vec::new(),
-            ResolvePackedTableSizesBatchProfile {
-                total_ms: 0.0,
-                ..ResolvePackedTableSizesBatchProfile::default()
-            },
-        )
-    } else {
-        resolve_packed_table_sizes_batch(&unresolved_tables)?
-    };
-    let resolve_sizes_ms = elapsed_ms(t_resolve);
-    let mut unresolved_cursor = 0usize;
+    let resolve_profile = ResolvePackedTableSizesBatchProfile::default();
+    let resolve_sizes_ms = 0.0_f64;
     chunk_starts.push(0);
     let mut src_len = 0usize;
     let mut src_copy_ms = 0.0_f64;
@@ -7500,10 +8321,14 @@ fn pack_match_batch_inputs<'a>(
                 u32::try_from(table_data_packer.len_bytes())
                     .map_err(|_| PDeflateError::NumericOverflow)?,
             );
+            let meta_word_base = table_chunk_meta_words.len();
+            table_chunk_meta_words.push(0);
+            table_chunk_meta_words.push(0);
             let mut local_count = 0usize;
             let (index_len, data_len, kind) = if let Some(table_gpu) = input.table_gpu {
-                let (resolved_count, resolved_index_len, resolved_data_len) =
-                    if table_gpu.table_count > 0
+                let (count_hint, index_len_hint, data_len_hint, unresolved_gpu_sizes) =
+                    if table_gpu.sizes_known
+                        || table_gpu.table_count > 0
                         || table_gpu.table_index_len > 0
                         || table_gpu.table_data_len > 0
                     {
@@ -7511,18 +8336,50 @@ fn pack_match_batch_inputs<'a>(
                             table_gpu.table_count,
                             table_gpu.table_index_len,
                             table_gpu.table_data_len,
+                            false,
                         )
                     } else {
-                        let sizes = *unresolved_sizes
-                            .get(unresolved_cursor)
-                            .ok_or(PDeflateError::NumericOverflow)?;
-                        unresolved_cursor = unresolved_cursor.saturating_add(1);
-                        sizes
+                        (
+                            table_gpu.max_entries,
+                            table_gpu.max_entries,
+                            table_gpu.table_data_bytes_cap,
+                            true,
+                        )
                     };
-                local_count = resolved_count;
+                local_count = count_hint;
+                if !unresolved_gpu_sizes {
+                    table_chunk_meta_words[meta_word_base] =
+                        u32::try_from(count_hint).map_err(|_| PDeflateError::NumericOverflow)?;
+                    table_chunk_meta_words[meta_word_base + 1] =
+                        u32::try_from(data_len_hint).map_err(|_| PDeflateError::NumericOverflow)?;
+                } else {
+                    let dst_count_offset = u64::try_from(meta_word_base)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .saturating_mul(4);
+                    let dst_data_total_offset = u64::try_from(meta_word_base + 1)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .saturating_mul(4);
+                    let src_data_total_offset_words = 1usize
+                        .checked_add(
+                            table_gpu
+                                .max_entries
+                                .checked_mul(2)
+                                .ok_or(PDeflateError::NumericOverflow)?,
+                        )
+                        .ok_or(PDeflateError::NumericOverflow)?;
+                    let src_data_total_offset = u64::try_from(src_data_total_offset_words)
+                        .map_err(|_| PDeflateError::NumericOverflow)?
+                        .saturating_mul(4);
+                    table_meta_device_copies.push(PackedTableMetaDeviceCopy {
+                        meta_src: &table_gpu.table_meta_buffer,
+                        dst_count_offset,
+                        dst_data_total_offset,
+                        src_data_total_offset,
+                    });
+                }
                 (
-                    resolved_index_len,
-                    resolved_data_len,
+                    index_len_hint,
+                    data_len_hint,
                     PackedTableUploadKind::Device {
                         index_buffer: &table_gpu.table_index_buffer,
                         data_buffer: &table_gpu.table_data_buffer,
@@ -7542,6 +8399,10 @@ fn pack_match_batch_inputs<'a>(
                     ));
                 }
                 local_count = index_bytes.len();
+                table_chunk_meta_words[meta_word_base] =
+                    u32::try_from(local_count).map_err(|_| PDeflateError::NumericOverflow)?;
+                table_chunk_meta_words[meta_word_base + 1] =
+                    u32::try_from(data_bytes.len()).map_err(|_| PDeflateError::NumericOverflow)?;
                 (
                     index_bytes.len(),
                     data_bytes.len(),
@@ -7563,6 +8424,10 @@ fn pack_match_batch_inputs<'a>(
                     data_bytes.extend_from_slice(entry);
                     local_count = local_count.saturating_add(1);
                 }
+                table_chunk_meta_words[meta_word_base] =
+                    u32::try_from(local_count).map_err(|_| PDeflateError::NumericOverflow)?;
+                table_chunk_meta_words[meta_word_base + 1] =
+                    u32::try_from(data_bytes.len()).map_err(|_| PDeflateError::NumericOverflow)?;
                 (
                     index_bytes.len(),
                     data_bytes.len(),
@@ -7662,11 +8527,13 @@ fn pack_match_batch_inputs<'a>(
         table_chunk_counts,
         table_chunk_index_offsets,
         table_chunk_data_offsets,
+        table_chunk_meta_words,
         table_index_words_len,
         table_data_words_len,
         table_index_words,
         table_data_words,
         table_device_copies,
+        table_meta_device_copies,
         chunk_lens,
         total_src_len: total_src_bytes,
         total_table_entries: global_table_base,
@@ -7696,6 +8563,7 @@ fn encode_table_device_copies(
     encoder: &mut wgpu::CommandEncoder,
     scratch: &GpuBatchScratch,
     copies: &[PackedTableDeviceCopy<'_>],
+    meta_copies: &[PackedTableMetaDeviceCopy<'_>],
 ) -> Result<(), PDeflateError> {
     for copy in copies {
         let index_copy_bytes = u64::try_from(copy.index_len.div_ceil(4))
@@ -7722,6 +8590,22 @@ fn encode_table_device_copies(
                 data_copy_bytes,
             );
         }
+    }
+    for meta in meta_copies {
+        encoder.copy_buffer_to_buffer(
+            meta.meta_src,
+            0,
+            &scratch.table_meta_buffer,
+            meta.dst_count_offset,
+            4,
+        );
+        encoder.copy_buffer_to_buffer(
+            meta.meta_src,
+            meta.src_data_total_offset,
+            &scratch.table_meta_buffer,
+            meta.dst_data_total_offset,
+            4,
+        );
     }
     Ok(())
 }
@@ -7773,6 +8657,9 @@ pub(crate) fn compute_matches_batch(
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
         table_data_offsets_bytes: u64::try_from(packed.table_chunk_data_offsets.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_meta_bytes: u64::try_from(packed.table_chunk_meta_words.len())
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
         table_index_bytes: u64::try_from(packed.table_index_words_len)
@@ -7831,6 +8718,13 @@ pub(crate) fn compute_matches_batch(
             0,
             bytemuck::cast_slice(&packed.table_chunk_data_offsets),
         );
+        if !packed.table_chunk_meta_words.is_empty() {
+            r.queue.write_buffer(
+                &scratch.table_meta_buffer,
+                0,
+                bytemuck::cast_slice(&packed.table_chunk_meta_words),
+            );
+        }
         if !packed.table_index_words.is_empty() {
             r.queue.write_buffer(
                 &scratch.table_index_buffer,
@@ -7861,7 +8755,12 @@ pub(crate) fn compute_matches_batch(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cozip-pdeflate-match-encoder"),
             });
-        encode_table_device_copies(&mut encoder, &scratch, &packed.table_device_copies)?;
+        encode_table_device_copies(
+            &mut encoder,
+            &scratch,
+            &packed.table_device_copies,
+            &packed.table_meta_device_copies,
+        )?;
         encoder.clear_buffer(&scratch.prefix_first_buffer, 0, None);
         encoder.clear_buffer(&scratch.table_lens_buffer, 0, None);
         encoder.clear_buffer(&scratch.table_offsets_buffer, 0, None);
@@ -8010,6 +8909,9 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
         table_data_offsets_bytes: u64::try_from(packed.table_chunk_data_offsets.len())
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
+        table_meta_bytes: u64::try_from(packed.table_chunk_meta_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
         table_index_bytes: u64::try_from(packed.table_index_words_len)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
@@ -8078,6 +8980,13 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
             0,
             bytemuck::cast_slice(&packed.table_chunk_data_offsets),
         );
+        if !packed.table_chunk_meta_words.is_empty() {
+            r.queue.write_buffer(
+                &scratch.table_meta_buffer,
+                0,
+                bytemuck::cast_slice(&packed.table_chunk_meta_words),
+            );
+        }
         if !packed.table_index_words.is_empty() {
             r.queue.write_buffer(
                 &scratch.table_index_buffer,
@@ -8124,7 +9033,12 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
                 label: Some("cozip-pdeflate-match-section-encoder"),
             });
         let t_table_copy = Instant::now();
-        encode_table_device_copies(&mut match_encoder, &scratch, &packed.table_device_copies)?;
+        encode_table_device_copies(
+            &mut match_encoder,
+            &scratch,
+            &packed.table_device_copies,
+            &packed.table_meta_device_copies,
+        )?;
         let match_table_copy_ms = elapsed_ms(t_table_copy);
         match_encoder.clear_buffer(&scratch.prefix_first_buffer, 0, None);
         match_encoder.clear_buffer(&scratch.table_lens_buffer, 0, None);
