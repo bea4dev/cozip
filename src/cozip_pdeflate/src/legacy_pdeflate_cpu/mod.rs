@@ -5300,9 +5300,16 @@ fn section_start(index: usize, section_count: usize, total_len: usize) -> usize 
     if section_count == 0 || total_len == 0 {
         return 0;
     }
+    if index == 0 {
+        return 0;
+    }
+    if index >= section_count {
+        return total_len;
+    }
     let num = (index as u128) * (total_len as u128);
     let den = section_count as u128;
-    (num / den) as usize
+    let raw = (num / den) as usize;
+    raw & !3usize
 }
 
 fn read_exact<'a>(
@@ -5723,6 +5730,13 @@ mod tests {
                     sec.out_offset, prev_out_end,
                     "section out must be contiguous"
                 );
+                if sec.out_offset != 0 && sec.out_offset != input_len {
+                    assert_eq!(
+                        sec.out_offset & 3,
+                        0,
+                        "internal section boundary must be 4-byte aligned"
+                    );
+                }
                 total_out = total_out.saturating_add(sec.out_len);
                 total_cmd = total_cmd.saturating_add(sec.cmd_len);
                 prev_out_end = sec.out_offset.saturating_add(sec.out_len);
@@ -5733,8 +5747,8 @@ mod tests {
             assert_eq!(prev_out_end, input_len);
             assert_eq!(total_cmd, chunk_section_cmd_len(&payload));
             assert!(
-                out_len_max.saturating_sub(out_len_min) <= 1,
-                "section out len balance must be <=1"
+                out_len_max.saturating_sub(out_len_min) <= 8,
+                "section out len balance must be <=8 with 4-byte-aligned section boundaries"
             );
             if section_count == 1 {
                 assert_eq!(preprocess.section_meta[0].out_offset, 0);

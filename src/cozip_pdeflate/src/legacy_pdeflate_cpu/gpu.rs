@@ -71,6 +71,42 @@ fn load_rep(table_id: u32, idx: u32) -> u32 {
     return load_table_data(off + rel);
 }
 
+fn section_start(sec: u32, section_count: u32, total_len: u32) -> u32 {
+    if (section_count == 0u || total_len == 0u) {
+        return 0u;
+    }
+    if (sec == 0u) {
+        return 0u;
+    }
+    if (sec >= section_count) {
+        return total_len;
+    }
+    let raw = (sec * total_len) / section_count;
+    return raw & 0xfffffffcu;
+}
+
+fn section_index_for_local_pos(local_pos: u32, section_count: u32, total_len: u32) -> u32 {
+    var sec = (local_pos * section_count) / total_len;
+    if (sec >= section_count) {
+        sec = section_count - 1u;
+    }
+    loop {
+        let s0 = section_start(sec, section_count, total_len);
+        if (local_pos >= s0 || sec == 0u) {
+            break;
+        }
+        sec = sec - 1u;
+    }
+    loop {
+        let s1 = section_start(sec + 1u, section_count, total_len);
+        if (local_pos < s1 || (sec + 1u) >= section_count) {
+            break;
+        }
+        sec = sec + 1u;
+    }
+    return sec;
+}
+
 @compute
 @workgroup_size(128, 1, 1)
 fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
@@ -97,8 +133,8 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         return;
     }
     let local_pos = gid - chunk_start;
-    let sec = (local_pos * section_count) / chunk_len;
-    let sec_end = chunk_start + (((sec + 1u) * chunk_len) / section_count);
+    let sec = section_index_for_local_pos(local_pos, section_count, chunk_len);
+    let sec_end = chunk_start + section_start(sec + 1u, section_count, chunk_len);
     if (gid + min_ref_len > sec_end) {
         out_matches[gid] = 0u;
         return;
@@ -817,7 +853,17 @@ fn load_src(idx: u32) -> u32 {
 }
 
 fn section_start(sec: u32, section_count: u32, total_len: u32) -> u32 {
-    return (sec * total_len) / section_count;
+    if (section_count == 0u || total_len == 0u) {
+        return 0u;
+    }
+    if (sec == 0u) {
+        return 0u;
+    }
+    if (sec >= section_count) {
+        return total_len;
+    }
+    let raw = (sec * total_len) / section_count;
+    return raw & 0xfffffffcu;
 }
 
 fn match_len_or_zero(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> u32 {
@@ -964,7 +1010,17 @@ const SECTION_TOKENIZE_SHADER: &str = r#"
 @group(0) @binding(7) var<storage, read_write> token_pos: array<u32>;
 
 fn section_start(sec: u32, section_count: u32, total_len: u32) -> u32 {
-    return (sec * total_len) / section_count;
+    if (section_count == 0u || total_len == 0u) {
+        return 0u;
+    }
+    if (sec == 0u) {
+        return 0u;
+    }
+    if (sec >= section_count) {
+        return total_len;
+    }
+    let raw = (sec * total_len) / section_count;
+    return raw & 0xfffffffcu;
 }
 
 fn match_len_or_zero(word: u32, remaining: u32, min_ref_len: u32, max_ref_len: u32) -> u32 {
@@ -11350,10 +11406,17 @@ pub(crate) fn compute_matches(input: &GpuMatchInput<'_>) -> Result<GpuMatchOutpu
 
 #[inline]
 fn section_start(sec: usize, section_count: usize, len: usize) -> usize {
-    if section_count == 0 {
+    if section_count == 0 || len == 0 {
         return 0;
     }
-    sec.saturating_mul(len) / section_count
+    if sec == 0 {
+        return 0;
+    }
+    if sec >= section_count {
+        return len;
+    }
+    let raw = sec.saturating_mul(len) / section_count;
+    raw & !3usize
 }
 
 #[allow(dead_code)]
@@ -11639,7 +11702,14 @@ fn host_section_start(sec: usize, section_count: usize, len: usize) -> usize {
     if section_count == 0 || len == 0 {
         return 0;
     }
-    ((sec as u128) * (len as u128) / (section_count as u128)) as usize
+    if sec == 0 {
+        return 0;
+    }
+    if sec >= section_count {
+        return len;
+    }
+    let raw = ((sec as u128) * (len as u128) / (section_count as u128)) as usize;
+    raw & !3usize
 }
 
 fn validate_section_commands(

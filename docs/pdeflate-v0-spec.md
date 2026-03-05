@@ -66,8 +66,16 @@
 - 解凍時に前処理として:
   - `cmd_offset`: `cmd_len` の累積和で生成
   - `out_offset` / `out_len`: `chunk_uncompressed_len` と `section_count` から決定的に生成
-    - `out_offset(i) = floor(i * chunk_uncompressed_len / section_count)`
+    - `raw_offset(i) = floor(i * chunk_uncompressed_len / section_count)`
+    - `align_down4(x) = x & ~3`
+    - `out_offset(0) = 0`
+    - `out_offset(i) = align_down4(raw_offset(i))`（`1 <= i < section_count`）
+    - `out_offset(section_count) = chunk_uncompressed_len`
     - `out_len(i) = out_offset(i+1) - out_offset(i)`
+  - 注意:
+    - 内部セクション境界（`i in [1, section_count-1]`）は必ず4-byte境界となる。
+    - 末尾境界 `out_offset(section_count)` は `chunk_uncompressed_len` を優先し、4-byte境界でなくてもよい。
+    - 端数（0..3 byte）は末尾側セクション長に集約される。
 
 この前処理で各セクションをランダムアクセスし、独立解凍できる。
 
@@ -128,6 +136,7 @@ GPU実行モデル:
 - `entry_len in [1, 254]`
 - `sum(entry_len)` が `table_data` 実長と一致すること
 - `section_count > 0`
+- 内部セクション境界 `out_offset(i)`（`1 <= i < section_count`）が4-byte境界であること
 - `sum(section_cmd_len)` が `section_cmd` 実長と一致すること
 - `section_cmd_len` の varint 列が正しく終端し、過長/オーバーフローしないこと
 - 解凍時:
@@ -148,7 +157,7 @@ GPU実行モデル:
 - 命令デコードは分岐を減らすため `TABLE_REF` と `LITERAL_RUN` の2命令に限定。
 - テーブルオフセットは解凍前処理で再構築する（prefix-sum）。
 - セクションの `cmd_offset` は varint `cmd_len` の prefix-sum で再構築する。
-- セクションの `out_offset/out_len` は `chunk_uncompressed_len` と `section_count` から算出する。
+- セクションの `out_offset/out_len` は `chunk_uncompressed_len` と `section_count` から算出し、内部境界は4-byte整列にする。
 - まず CPU 実装でフォーマット妥当性を固定し、その後 GPU 解凍へ展開する。
 - 将来拡張:
   - 長さの多段拡張（varint）
