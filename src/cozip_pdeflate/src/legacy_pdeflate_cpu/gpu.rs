@@ -2908,6 +2908,7 @@ struct GpuMatchRuntime {
     scratch_hot: Mutex<Option<GpuBatchScratch>>,
     sparse_pack_pool: Mutex<Vec<GpuSparsePackScratch>>,
     sparse_pack_hot: Mutex<Option<GpuSparsePackScratch>>,
+    decode_v2_true_batch_pool: Mutex<Vec<GpuDecodeV2TrueBatchScratch>>,
     decode_slot_pool: Mutex<GpuDecodeSlotPool>,
 }
 
@@ -2986,6 +2987,47 @@ struct GpuSparsePackScratch {
     out_buffer: wgpu::Buffer,
     dispatch_buffer: wgpu::Buffer,
     readback_buffer: wgpu::Buffer,
+}
+
+#[derive(Clone, Copy)]
+struct GpuDecodeV2TrueBatchScratchCaps {
+    desc_bytes: u64,
+    section_meta_bytes: u64,
+    cmd_bytes: u64,
+    table_bytes: u64,
+    out_bytes: u64,
+    error_bytes: u64,
+}
+
+impl GpuDecodeV2TrueBatchScratchCaps {
+    fn fits(&self, req: GpuDecodeV2TrueBatchScratchCaps) -> bool {
+        self.desc_bytes >= req.desc_bytes
+            && self.section_meta_bytes >= req.section_meta_bytes
+            && self.cmd_bytes >= req.cmd_bytes
+            && self.table_bytes >= req.table_bytes
+            && self.out_bytes >= req.out_bytes
+            && self.error_bytes >= req.error_bytes
+    }
+
+    fn covers(&self, other: &GpuDecodeV2TrueBatchScratchCaps) -> bool {
+        self.fits(*other)
+    }
+}
+
+struct GpuDecodeV2TrueBatchScratch {
+    caps: GpuDecodeV2TrueBatchScratchCaps,
+    desc_buffer: wgpu::Buffer,
+    section_meta_buffer: wgpu::Buffer,
+    cmd_buffer: wgpu::Buffer,
+    table_buffer: wgpu::Buffer,
+    out_buffer: wgpu::Buffer,
+    error_buffer: wgpu::Buffer,
+    out_readback_buffer: wgpu::Buffer,
+    err_readback_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    ts_query_set: Option<wgpu::QuerySet>,
+    ts_resolve_buffer: Option<wgpu::Buffer>,
+    ts_readback_buffer: Option<wgpu::Buffer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3161,6 +3203,7 @@ struct GpuBatchScratchCaps {
 
 const GPU_SCRATCH_POOL_LIMIT: usize = 4;
 const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
+const GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
 const GPU_DECODE_V2_BATCH_DESC_WORDS: usize = 12;
 // Command stream cap heuristic for GPU section encode.
@@ -6018,6 +6061,7 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         scratch_hot: Mutex::new(None),
         sparse_pack_pool: Mutex::new(Vec::new()),
         sparse_pack_hot: Mutex::new(None),
+        decode_v2_true_batch_pool: Mutex::new(Vec::new()),
         decode_slot_pool: Mutex::new(GpuDecodeSlotPool::default()),
     })
 }
@@ -6141,6 +6185,170 @@ fn release_sparse_pack_scratch(r: &GpuMatchRuntime, scratch: GpuSparsePackScratc
             if pool.len() < GPU_SPARSE_PACK_POOL_LIMIT {
                 pool.push(s);
             }
+        }
+    }
+}
+
+fn create_gpu_decode_v2_true_batch_scratch(
+    runtime: &GpuMatchRuntime,
+    required: GpuDecodeV2TrueBatchScratchCaps,
+) -> GpuDecodeV2TrueBatchScratch {
+    let caps = GpuDecodeV2TrueBatchScratchCaps {
+        desc_bytes: round_capacity_bytes(required.desc_bytes),
+        section_meta_bytes: round_capacity_bytes(required.section_meta_bytes),
+        cmd_bytes: round_capacity_bytes(required.cmd_bytes),
+        table_bytes: round_capacity_bytes(required.table_bytes),
+        out_bytes: round_capacity_bytes(required.out_bytes),
+        error_bytes: round_capacity_bytes(required.error_bytes),
+    };
+    let desc_buffer = storage_upload_buffer(
+        &runtime.device,
+        "cozip-pdeflate-decode-v2-batch-desc-pool",
+        caps.desc_bytes,
+    );
+    let section_meta_buffer = storage_upload_buffer(
+        &runtime.device,
+        "cozip-pdeflate-decode-v2-batch-section-meta-pool",
+        caps.section_meta_bytes,
+    );
+    let cmd_buffer = storage_upload_buffer(
+        &runtime.device,
+        "cozip-pdeflate-decode-v2-batch-cmd-pool",
+        caps.cmd_bytes,
+    );
+    let table_buffer = storage_upload_buffer(
+        &runtime.device,
+        "cozip-pdeflate-decode-v2-batch-table-pool",
+        caps.table_bytes,
+    );
+    let out_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-batch-out-pool"),
+        size: caps.out_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let error_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-batch-error-pool"),
+        size: caps.error_bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let out_readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-batch-out-readback-pool"),
+        size: caps.out_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let err_readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-decode-v2-batch-err-readback-pool"),
+        size: caps.error_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = runtime
+        .device
+        .create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-decode-v2-batch-bg-pool"),
+            layout: &runtime.decode_v2_batch_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: desc_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: section_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cmd_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: table_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: error_buffer.as_entire_binding(),
+                },
+            ],
+        });
+    let (ts_query_set, ts_resolve_buffer, ts_readback_buffer) = if runtime.supports_timestamp_query
+    {
+        (
+            Some(runtime.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-query-pool"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2,
+            })),
+            Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-resolve-pool"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })),
+            Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cozip-pdeflate-decode-v2-batch-ts-readback-pool"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })),
+        )
+    } else {
+        (None, None, None)
+    };
+    GpuDecodeV2TrueBatchScratch {
+        caps,
+        desc_buffer,
+        section_meta_buffer,
+        cmd_buffer,
+        table_buffer,
+        out_buffer,
+        error_buffer,
+        out_readback_buffer,
+        err_readback_buffer,
+        bind_group,
+        ts_query_set,
+        ts_resolve_buffer,
+        ts_readback_buffer,
+    }
+}
+
+fn acquire_gpu_decode_v2_true_batch_scratch(
+    runtime: &GpuMatchRuntime,
+    required: GpuDecodeV2TrueBatchScratchCaps,
+) -> Result<GpuDecodeV2TrueBatchScratch, PDeflateError> {
+    let mut pool = runtime.decode_v2_true_batch_pool.lock().map_err(|_| {
+        PDeflateError::Gpu("gpu decode-v2 true-batch pool mutex poisoned".to_string())
+    })?;
+    if let Some(pos) = pool.iter().position(|s| s.caps.fits(required)) {
+        Ok(pool.swap_remove(pos))
+    } else {
+        Ok(create_gpu_decode_v2_true_batch_scratch(runtime, required))
+    }
+}
+
+fn release_gpu_decode_v2_true_batch_scratch(
+    runtime: &GpuMatchRuntime,
+    scratch: GpuDecodeV2TrueBatchScratch,
+) {
+    if let Ok(mut pool) = runtime.decode_v2_true_batch_pool.lock() {
+        if pool.len() < GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT {
+            pool.push(scratch);
+            return;
+        }
+        if let Some((idx, _)) = pool
+            .iter()
+            .enumerate()
+            .find(|(_, existing)| scratch.caps.covers(&existing.caps))
+        {
+            pool[idx] = scratch;
         }
     }
 }
@@ -9045,11 +9253,9 @@ fn decode_chunks_gpu_v2_true_batch(
 
     struct PendingGpuDecodeTrueBatch<'a> {
         host_jobs: Vec<GpuDecodeBatchHostJob<'a>>,
-        out_readback: wgpu::Buffer,
-        err_readback: wgpu::Buffer,
+        scratch: GpuDecodeV2TrueBatchScratch,
         out_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
         err_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-        ts_readback_buffer: Option<wgpu::Buffer>,
         ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
         submit_at: Instant,
         completion_gate: Arc<AtomicBool>,
@@ -9099,7 +9305,7 @@ fn decode_chunks_gpu_v2_true_batch(
                 matches!(ts_rx.recv(), Ok(Ok(())))
             };
             if ts_ready {
-                if let Some(ts_buffer) = pending.ts_readback_buffer.take() {
+                if let Some(ts_buffer) = pending.scratch.ts_readback_buffer.as_ref() {
                     let mapped = ts_buffer.slice(..).get_mapped_range();
                     let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
                     if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
@@ -9116,10 +9322,10 @@ fn decode_chunks_gpu_v2_true_batch(
 
         if !out_map_ok || !err_map_ok {
             if out_map_ok {
-                pending.out_readback.unmap();
+                pending.scratch.out_readback_buffer.unmap();
             }
             if err_map_ok {
-                pending.err_readback.unmap();
+                pending.scratch.err_readback_buffer.unmap();
             }
             if map_timed_out {
                 fallback_map_timeout_jobs =
@@ -9156,12 +9362,21 @@ fn decode_chunks_gpu_v2_true_batch(
                 wait_probe_completed_jobs =
                     wait_probe_completed_jobs.saturating_add(pending.host_jobs.len());
             }
+            release_gpu_decode_v2_true_batch_scratch(runtime, pending.scratch);
             return;
         }
 
         let t_map_copy = Instant::now();
-        let mapped_out = pending.out_readback.slice(..).get_mapped_range();
-        let mapped_err = pending.err_readback.slice(..).get_mapped_range();
+        let mapped_out = pending
+            .scratch
+            .out_readback_buffer
+            .slice(..)
+            .get_mapped_range();
+        let mapped_err = pending
+            .scratch
+            .err_readback_buffer
+            .slice(..)
+            .get_mapped_range();
         let err_words: &[u32] = bytemuck::cast_slice(&mapped_err);
         for host in &pending.host_jobs {
             let sec_count = host.prepared.job.section_meta.len();
@@ -9212,8 +9427,8 @@ fn decode_chunks_gpu_v2_true_batch(
         }
         drop(mapped_err);
         drop(mapped_out);
-        pending.err_readback.unmap();
-        pending.out_readback.unmap();
+        pending.scratch.err_readback_buffer.unmap();
+        pending.scratch.out_readback_buffer.unmap();
         let map_copy_ms = elapsed_ms(t_map_copy);
 
         if wait_probe_enabled {
@@ -9235,6 +9450,7 @@ fn decode_chunks_gpu_v2_true_batch(
             wait_probe_completed_jobs =
                 wait_probe_completed_jobs.saturating_add(pending.host_jobs.len());
         }
+        release_gpu_decode_v2_true_batch_scratch(runtime, pending.scratch);
     };
 
     for round in prepared_jobs.chunks(copy_jobs) {
@@ -9499,127 +9715,52 @@ fn decode_chunks_gpu_v2_true_batch(
             .saturating_mul(4)
             .max(4);
         let err_zero_words = vec![0u32; error_total_words.max(1)];
-
-        let desc_buffer = storage_upload_buffer(
-            &runtime.device,
-            "cozip-pdeflate-decode-v2-batch-desc",
-            desc_size,
-        );
-        let section_meta_buffer = storage_upload_buffer(
-            &runtime.device,
-            "cozip-pdeflate-decode-v2-batch-section-meta",
-            section_meta_size,
-        );
-        let cmd_buffer = storage_upload_buffer(
-            &runtime.device,
-            "cozip-pdeflate-decode-v2-batch-cmd",
-            cmd_size,
-        );
-        let table_buffer = storage_upload_buffer(
-            &runtime.device,
-            "cozip-pdeflate-decode-v2-batch-table",
-            table_size,
-        );
-        let out_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-decode-v2-batch-out"),
-            size: out_copy_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let error_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-decode-v2-batch-error"),
-            size: err_copy_bytes,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let out_readback = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-decode-v2-batch-out-readback"),
-            size: out_copy_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let err_readback = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-decode-v2-batch-err-readback"),
-            size: err_copy_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = runtime
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cozip-pdeflate-decode-v2-batch-bg"),
-                layout: &runtime.decode_v2_batch_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: desc_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: section_meta_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: cmd_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: table_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: out_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: error_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let scratch_caps = GpuDecodeV2TrueBatchScratchCaps {
+            desc_bytes: desc_size,
+            section_meta_bytes: section_meta_size,
+            cmd_bytes: cmd_size,
+            table_bytes: table_size,
+            out_bytes: out_copy_bytes,
+            error_bytes: err_copy_bytes,
+        };
+        let scratch = match acquire_gpu_decode_v2_true_batch_scratch(runtime, scratch_caps) {
+            Ok(s) => s,
+            Err(_) => {
+                for host in &host_jobs {
+                    out.push(GpuDecodeResult {
+                        chunk_index: host.prepared.job.chunk_index,
+                        slot: None,
+                        disposition: GpuDecodeDisposition::CpuFallback,
+                        decoded_chunk: None,
+                    });
+                }
+                fallback_submit_error_jobs =
+                    fallback_submit_error_jobs.saturating_add(host_jobs.len());
+                continue;
+            }
+        };
 
         runtime
             .queue
-            .write_buffer(&desc_buffer, 0, bytemuck::cast_slice(&desc_words));
+            .write_buffer(&scratch.desc_buffer, 0, bytemuck::cast_slice(&desc_words));
         runtime.queue.write_buffer(
-            &section_meta_buffer,
+            &scratch.section_meta_buffer,
             0,
             bytemuck::cast_slice(&section_meta_words),
         );
         runtime
             .queue
-            .write_buffer(&cmd_buffer, 0, bytemuck::cast_slice(&cmd_words));
+            .write_buffer(&scratch.cmd_buffer, 0, bytemuck::cast_slice(&cmd_words));
         runtime
             .queue
-            .write_buffer(&table_buffer, 0, bytemuck::cast_slice(&table_words));
-        runtime
-            .queue
-            .write_buffer(&error_buffer, 0, bytemuck::cast_slice(&err_zero_words));
+            .write_buffer(&scratch.table_buffer, 0, bytemuck::cast_slice(&table_words));
+        runtime.queue.write_buffer(
+            &scratch.error_buffer,
+            0,
+            bytemuck::cast_slice(&err_zero_words),
+        );
 
-        let mut ts_readback_buffer = None;
         let mut ts_map_rx = None;
-        let mut ts_query_set = None;
-        let mut ts_resolve_buffer = None;
-        if kernel_ts_probe {
-            ts_query_set = Some(runtime.device.create_query_set(&wgpu::QuerySetDescriptor {
-                label: Some("cozip-pdeflate-decode-v2-batch-ts-query"),
-                ty: wgpu::QueryType::Timestamp,
-                count: 2,
-            }));
-            ts_resolve_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-pdeflate-decode-v2-batch-ts-resolve"),
-                size: 16,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }));
-            ts_readback_buffer = Some(runtime.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cozip-pdeflate-decode-v2-batch-ts-readback"),
-                size: 16,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }));
-        }
 
         let dispatch_x = max_sections.max(1);
         let dispatch_y =
@@ -9632,29 +9773,46 @@ fn decode_chunks_gpu_v2_true_batch(
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("cozip-pdeflate-decode-v2-batch-pass"),
-                timestamp_writes: ts_query_set.as_ref().map(|query_set| {
-                    wgpu::ComputePassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }
-                }),
+                timestamp_writes: if kernel_ts_probe {
+                    scratch.ts_query_set.as_ref().map(|query_set| {
+                        wgpu::ComputePassTimestampWrites {
+                            query_set,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }
+                    })
+                } else {
+                    None
+                },
             });
             pass.set_pipeline(&runtime.decode_v2_batch_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &scratch.bind_group, &[]);
             pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
         }
-        if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
-            ts_query_set.as_ref(),
-            ts_resolve_buffer.as_ref(),
-            ts_readback_buffer.as_ref(),
-        ) {
-            encoder.resolve_query_set(query_set, 0..2, resolve_buffer, 0);
-            encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, 16);
+        if kernel_ts_probe {
+            if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
+                scratch.ts_query_set.as_ref(),
+                scratch.ts_resolve_buffer.as_ref(),
+                scratch.ts_readback_buffer.as_ref(),
+            ) {
+                encoder.resolve_query_set(query_set, 0..2, resolve_buffer, 0);
+                encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, 16);
+            }
         }
-        encoder.copy_buffer_to_buffer(&out_buffer, 0, &out_readback, 0, out_copy_bytes);
-        encoder.copy_buffer_to_buffer(&error_buffer, 0, &err_readback, 0, err_copy_bytes);
-
+        encoder.copy_buffer_to_buffer(
+            &scratch.out_buffer,
+            0,
+            &scratch.out_readback_buffer,
+            0,
+            out_copy_bytes,
+        );
+        encoder.copy_buffer_to_buffer(
+            &scratch.error_buffer,
+            0,
+            &scratch.err_readback_buffer,
+            0,
+            err_copy_bytes,
+        );
         let t_submit = Instant::now();
         let submission = runtime.queue.submit(Some(encoder.finish()));
         let submit_ms = elapsed_ms(t_submit);
@@ -9668,8 +9826,8 @@ fn decode_chunks_gpu_v2_true_batch(
             completion_gate_cb.store(true, Ordering::Release);
         });
 
-        let out_slice = out_readback.slice(..out_copy_bytes);
-        let err_slice = err_readback.slice(..err_copy_bytes);
+        let out_slice = scratch.out_readback_buffer.slice(..out_copy_bytes);
+        let err_slice = scratch.err_readback_buffer.slice(..err_copy_bytes);
         let (out_tx, out_rx) = mpsc::channel();
         let (err_tx, err_rx) = mpsc::channel();
         out_slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -9678,23 +9836,23 @@ fn decode_chunks_gpu_v2_true_batch(
         err_slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = err_tx.send(res);
         });
-        if let Some(ts_buffer) = ts_readback_buffer.as_ref() {
-            let (ts_tx, rx) = mpsc::channel();
-            ts_buffer
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |res| {
-                    let _ = ts_tx.send(res);
-                });
-            ts_map_rx = Some(rx);
+        if kernel_ts_probe {
+            if let Some(ts_buffer) = scratch.ts_readback_buffer.as_ref() {
+                let (ts_tx, rx) = mpsc::channel();
+                ts_buffer
+                    .slice(..)
+                    .map_async(wgpu::MapMode::Read, move |res| {
+                        let _ = ts_tx.send(res);
+                    });
+                ts_map_rx = Some(rx);
+            }
         }
 
         pending_batches.push_back(PendingGpuDecodeTrueBatch {
             host_jobs,
-            out_readback,
-            err_readback,
+            scratch,
             out_rx,
             err_rx,
-            ts_readback_buffer,
             ts_map_rx,
             submit_at,
             completion_gate,
