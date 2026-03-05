@@ -2004,6 +2004,9 @@ fn load_table_u16(idx: u32) -> u32 {
 }
 
 fn load_table_u32(idx: u32) -> u32 {
+    if ((idx & 3u) == 0u) {
+        return table_words[idx >> 2u];
+    }
     let b0 = load_table_u8(idx);
     let b1 = load_table_u8(idx + 1u);
     let b2 = load_table_u8(idx + 2u);
@@ -2036,20 +2039,89 @@ fn read_cmd_bit(bit_pos: u32) -> u32 {
 }
 
 fn peek_cmd_bits(bit_cursor: u32, bit_end: u32, bit_len: u32) -> u32 {
-    var out = 0u;
-    var i = 0u;
-    loop {
-        if (i >= bit_len) {
-            break;
-        }
-        let p = bit_cursor + i;
-        if (p >= bit_end) {
-            break;
-        }
-        out = out | (read_cmd_bit(p) << i);
-        i = i + 1u;
+    if (bit_len == 0u || bit_cursor >= bit_end) {
+        return 0u;
     }
-    return out;
+    let available = bit_end - bit_cursor;
+    if (bit_len > available) {
+        var out = 0u;
+        var i = 0u;
+        loop {
+            if (i >= bit_len) {
+                break;
+            }
+            let p = bit_cursor + i;
+            if (p >= bit_end) {
+                break;
+            }
+            out = out | (read_cmd_bit(p) << i);
+            i = i + 1u;
+        }
+        return out;
+    }
+
+    let byte_idx = bit_cursor >> 3u;
+    let bit_shift = bit_cursor & 7u;
+    let word_idx = byte_idx >> 2u;
+    let word_shift = ((byte_idx & 3u) << 3u) + bit_shift;
+    var out = cmd_words[word_idx] >> word_shift;
+    if (word_shift + bit_len > 32u) {
+        out = out | (cmd_words[word_idx + 1u] << (32u - word_shift));
+    }
+    if (bit_len >= 32u) {
+        return out;
+    }
+    return out & ((1u << bit_len) - 1u);
+}
+
+fn copy_table_repeat_to_output(table_src_base: u32, out_dst_base: u32, len: u32) {
+    var src = table_src_base;
+    var dst = out_dst_base;
+    var remaining = len;
+
+    loop {
+        if (remaining == 0u || ((src | dst) & 3u) == 0u) {
+            break;
+        }
+        store_out_u8(dst, load_table_u8(src));
+        src = src + 1u;
+        dst = dst + 1u;
+        remaining = remaining - 1u;
+    }
+
+    loop {
+        if (remaining < 12u) {
+            break;
+        }
+        let src_word = src >> 2u;
+        let dst_word = dst >> 2u;
+        out_words[dst_word] = table_words[src_word];
+        out_words[dst_word + 1u] = table_words[src_word + 1u];
+        out_words[dst_word + 2u] = table_words[src_word + 2u];
+        src = src + 12u;
+        dst = dst + 12u;
+        remaining = remaining - 12u;
+    }
+
+    loop {
+        if (remaining < 4u) {
+            break;
+        }
+        out_words[dst >> 2u] = table_words[src >> 2u];
+        src = src + 4u;
+        dst = dst + 4u;
+        remaining = remaining - 4u;
+    }
+
+    loop {
+        if (remaining == 0u) {
+            break;
+        }
+        store_out_u8(dst, load_table_u8(src));
+        src = src + 1u;
+        dst = dst + 1u;
+        remaining = remaining - 1u;
+    }
 }
 
 struct DecodedSymbol {
@@ -2236,15 +2308,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         }
 
         let table_base = tag * table_repeat_stride;
-        var j = 0u;
-        loop {
-            if (j >= len) {
-                break;
-            }
-            let b = load_table_u8(table_base + j);
-            store_out_u8(out_cursor + j, b);
-            j = j + 1u;
-        }
+        copy_table_repeat_to_output(table_base, out_cursor, len);
         out_cursor = out_cursor + len;
     }
 
@@ -2283,6 +2347,10 @@ fn load_table_u8(table_base: u32, idx: u32) -> u32 {
 }
 
 fn load_table_u32(table_base: u32, idx: u32) -> u32 {
+    let abs_idx = table_base + idx;
+    if ((abs_idx & 3u) == 0u) {
+        return table_words[abs_idx >> 2u];
+    }
     let b0 = load_table_u8(table_base, idx);
     let b1 = load_table_u8(table_base, idx + 1u);
     let b2 = load_table_u8(table_base, idx + 2u);
@@ -2310,20 +2378,95 @@ fn read_cmd_bit(cmd_base: u32, bit_pos: u32) -> u32 {
 }
 
 fn peek_cmd_bits(cmd_base: u32, bit_cursor: u32, bit_end: u32, bit_len: u32) -> u32 {
-    var out = 0u;
-    var i = 0u;
-    loop {
-        if (i >= bit_len) {
-            break;
-        }
-        let p = bit_cursor + i;
-        if (p >= bit_end) {
-            break;
-        }
-        out = out | (read_cmd_bit(cmd_base, p) << i);
-        i = i + 1u;
+    if (bit_len == 0u || bit_cursor >= bit_end) {
+        return 0u;
     }
-    return out;
+    let available = bit_end - bit_cursor;
+    if (bit_len > available) {
+        var out = 0u;
+        var i = 0u;
+        loop {
+            if (i >= bit_len) {
+                break;
+            }
+            let p = bit_cursor + i;
+            if (p >= bit_end) {
+                break;
+            }
+            out = out | (read_cmd_bit(cmd_base, p) << i);
+            i = i + 1u;
+        }
+        return out;
+    }
+
+    let byte_idx = bit_cursor >> 3u;
+    let bit_shift = bit_cursor & 7u;
+    let abs_byte = cmd_base + byte_idx;
+    let word_idx = abs_byte >> 2u;
+    let word_shift = ((abs_byte & 3u) << 3u) + bit_shift;
+    var out = cmd_words[word_idx] >> word_shift;
+    if (word_shift + bit_len > 32u) {
+        out = out | (cmd_words[word_idx + 1u] << (32u - word_shift));
+    }
+    if (bit_len >= 32u) {
+        return out;
+    }
+    return out & ((1u << bit_len) - 1u);
+}
+
+fn copy_table_repeat_to_output(
+    table_base: u32,
+    table_repeat_base: u32,
+    out_dst_base: u32,
+    len: u32,
+) {
+    var src = table_base + table_repeat_base;
+    var dst = out_dst_base;
+    var remaining = len;
+
+    loop {
+        if (remaining == 0u || ((src | dst) & 3u) == 0u) {
+            break;
+        }
+        store_out_u8(0u, dst, load_table_u8(0u, src));
+        src = src + 1u;
+        dst = dst + 1u;
+        remaining = remaining - 1u;
+    }
+
+    loop {
+        if (remaining < 12u) {
+            break;
+        }
+        let src_word = src >> 2u;
+        let dst_word = dst >> 2u;
+        out_words[dst_word] = table_words[src_word];
+        out_words[dst_word + 1u] = table_words[src_word + 1u];
+        out_words[dst_word + 2u] = table_words[src_word + 2u];
+        src = src + 12u;
+        dst = dst + 12u;
+        remaining = remaining - 12u;
+    }
+
+    loop {
+        if (remaining < 4u) {
+            break;
+        }
+        out_words[dst >> 2u] = table_words[src >> 2u];
+        src = src + 4u;
+        dst = dst + 4u;
+        remaining = remaining - 4u;
+    }
+
+    loop {
+        if (remaining == 0u) {
+            break;
+        }
+        store_out_u8(0u, dst, load_table_u8(0u, src));
+        src = src + 1u;
+        dst = dst + 1u;
+        remaining = remaining - 1u;
+    }
 }
 
 struct DecodedSymbol {
@@ -2563,15 +2706,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         }
 
         let table_repeat_base = tag * table_repeat_stride;
-        var j = 0u;
-        loop {
-            if (j >= len) {
-                break;
-            }
-            let b = load_table_u8(table_base, table_repeat_base + j);
-            store_out_u8(0u, out_cursor + j, b);
-            j = j + 1u;
-        }
+        copy_table_repeat_to_output(table_base, table_repeat_base, out_cursor, len);
         out_cursor = out_cursor + len;
     }
 
