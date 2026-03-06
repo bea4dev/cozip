@@ -3066,6 +3066,8 @@ struct GpuMatchRuntime {
     max_storage_binding_size: u64,
     scratch_pool: Mutex<Vec<GpuBatchScratch>>,
     scratch_hot: Mutex<Option<GpuBatchScratch>>,
+    table_build_batch_pool: Mutex<Vec<GpuTableBuildBatchScratch>>,
+    table_build_batch_hot: Mutex<Option<GpuTableBuildBatchScratch>>,
     sparse_pack_pool: Mutex<Vec<GpuSparsePackScratch>>,
     sparse_pack_hot: Mutex<Option<GpuSparsePackScratch>>,
     decode_v2_true_batch_pool: Mutex<Vec<GpuDecodeV2TrueBatchScratch>>,
@@ -3107,6 +3109,36 @@ struct GpuBatchScratch {
     bind_group: wgpu::BindGroup,
     prep_bind_group: wgpu::BindGroup,
     section_slots: Vec<GpuSectionEncodeSlot>,
+}
+
+#[derive(Clone, Copy)]
+struct GpuTableBuildBatchScratchCaps {
+    src_bytes: u64,
+    freq_params_bytes: u64,
+    cand_params_bytes: u64,
+    bucket_params_bytes: u64,
+    finalize_params_bytes: u64,
+    freq_bytes: u64,
+    cand_bytes: u64,
+    bucket_bytes: u64,
+    sorted_idx_bytes: u64,
+    emit_desc_bytes: u64,
+}
+
+struct GpuTableBuildBatchScratch {
+    caps: GpuTableBuildBatchScratchCaps,
+    src_buffer: wgpu::Buffer,
+    freq_params_buffer: wgpu::Buffer,
+    cand_params_buffer: wgpu::Buffer,
+    bucket_params_buffer: wgpu::Buffer,
+    finalize_params_buffer: wgpu::Buffer,
+    freq_buffer: wgpu::Buffer,
+    cand_buffer: wgpu::Buffer,
+    bucket_count_buffer: wgpu::Buffer,
+    bucket_offset_buffer: wgpu::Buffer,
+    bucket_cursor_buffer: wgpu::Buffer,
+    sorted_idx_buffer: wgpu::Buffer,
+    emit_desc_buffer: wgpu::Buffer,
 }
 
 struct GpuSectionEncodeSlot {
@@ -3410,7 +3442,27 @@ struct GpuBatchScratchCaps {
     out_bytes: u64,
 }
 
+impl GpuTableBuildBatchScratchCaps {
+    fn fits(&self, req: Self) -> bool {
+        self.src_bytes >= req.src_bytes
+            && self.freq_params_bytes >= req.freq_params_bytes
+            && self.cand_params_bytes >= req.cand_params_bytes
+            && self.bucket_params_bytes >= req.bucket_params_bytes
+            && self.finalize_params_bytes >= req.finalize_params_bytes
+            && self.freq_bytes >= req.freq_bytes
+            && self.cand_bytes >= req.cand_bytes
+            && self.bucket_bytes >= req.bucket_bytes
+            && self.sorted_idx_bytes >= req.sorted_idx_bytes
+            && self.emit_desc_bytes >= req.emit_desc_bytes
+    }
+
+    fn covers(&self, other: Self) -> bool {
+        self.fits(other)
+    }
+}
+
 const GPU_SCRATCH_POOL_LIMIT: usize = 4;
+const GPU_TABLE_BUILD_BATCH_POOL_LIMIT: usize = 4;
 const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
 const GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
@@ -4044,6 +4096,86 @@ impl GpuBatchScratch {
             bind_group,
             prep_bind_group,
             section_slots: Vec::new(),
+        }
+    }
+}
+
+impl GpuTableBuildBatchScratch {
+    fn new(runtime: &GpuMatchRuntime, required: GpuTableBuildBatchScratchCaps) -> Self {
+        let caps = GpuTableBuildBatchScratchCaps {
+            src_bytes: round_capacity_bytes(required.src_bytes),
+            freq_params_bytes: round_capacity_bytes(required.freq_params_bytes),
+            cand_params_bytes: round_capacity_bytes(required.cand_params_bytes),
+            bucket_params_bytes: round_capacity_bytes(required.bucket_params_bytes),
+            finalize_params_bytes: round_capacity_bytes(required.finalize_params_bytes),
+            freq_bytes: round_capacity_bytes(required.freq_bytes),
+            cand_bytes: round_capacity_bytes(required.cand_bytes),
+            bucket_bytes: round_capacity_bytes(required.bucket_bytes),
+            sorted_idx_bytes: round_capacity_bytes(required.sorted_idx_bytes),
+            emit_desc_bytes: round_capacity_bytes(required.emit_desc_bytes),
+        };
+        Self {
+            src_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-src",
+                caps.src_bytes,
+            ),
+            freq_params_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-freq-params",
+                caps.freq_params_bytes,
+            ),
+            cand_params_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-cand-params",
+                caps.cand_params_bytes,
+            ),
+            bucket_params_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-bucket-params",
+                caps.bucket_params_bytes,
+            ),
+            finalize_params_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-finalize-params",
+                caps.finalize_params_bytes,
+            ),
+            freq_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-freq",
+                caps.freq_bytes,
+            ),
+            cand_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-cand",
+                caps.cand_bytes,
+            ),
+            bucket_count_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-bucket-count",
+                caps.bucket_bytes,
+            ),
+            bucket_offset_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-bucket-offset",
+                caps.bucket_bytes,
+            ),
+            bucket_cursor_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-bucket-cursor",
+                caps.bucket_bytes,
+            ),
+            sorted_idx_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-sorted-idx",
+                caps.sorted_idx_bytes,
+            ),
+            emit_desc_buffer: storage_upload_buffer(
+                &runtime.device,
+                "cozip-pdeflate-bt-batch-emit-desc",
+                caps.emit_desc_bytes,
+            ),
+            caps,
         }
     }
 }
@@ -6405,6 +6537,8 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
         max_storage_binding_size,
         scratch_pool: Mutex::new(Vec::new()),
         scratch_hot: Mutex::new(None),
+        table_build_batch_pool: Mutex::new(Vec::new()),
+        table_build_batch_hot: Mutex::new(None),
         sparse_pack_pool: Mutex::new(Vec::new()),
         sparse_pack_hot: Mutex::new(None),
         decode_v2_true_batch_pool: Mutex::new(Vec::new()),
@@ -6471,6 +6605,62 @@ fn release_batch_scratch(r: &GpuMatchRuntime, scratch: GpuBatchScratch) {
     if let Some(s) = spill {
         if let Ok(mut pool) = r.scratch_pool.lock() {
             if pool.len() < GPU_SCRATCH_POOL_LIMIT {
+                pool.push(s);
+            }
+        }
+    }
+}
+
+fn acquire_table_build_batch_scratch(
+    r: &GpuMatchRuntime,
+    required_caps: GpuTableBuildBatchScratchCaps,
+) -> Result<GpuTableBuildBatchScratch, PDeflateError> {
+    if let Ok(mut hot) = r.table_build_batch_hot.lock() {
+        if let Some(scratch) = hot.take() {
+            if scratch.caps.fits(required_caps) {
+                return Ok(scratch);
+            }
+            if let Ok(mut pool) = r.table_build_batch_pool.lock() {
+                if pool.len() < GPU_TABLE_BUILD_BATCH_POOL_LIMIT {
+                    pool.push(scratch);
+                }
+            }
+        }
+    }
+    let mut pool = r
+        .table_build_batch_pool
+        .lock()
+        .map_err(|_| PDeflateError::Gpu("gpu table-build batch pool mutex poisoned".to_string()))?;
+    if let Some(pos) = pool.iter().position(|s| s.caps.fits(required_caps)) {
+        Ok(pool.swap_remove(pos))
+    } else {
+        Ok(GpuTableBuildBatchScratch::new(r, required_caps))
+    }
+}
+
+fn release_table_build_batch_scratch(r: &GpuMatchRuntime, scratch: GpuTableBuildBatchScratch) {
+    let mut spill = Some(scratch);
+    if let Ok(mut hot) = r.table_build_batch_hot.lock() {
+        match hot.take() {
+            None => *hot = spill.take(),
+            Some(existing) => {
+                if let Some(candidate) = spill.take() {
+                    if candidate.caps.covers(existing.caps) {
+                        *hot = Some(candidate);
+                        spill = Some(existing);
+                    } else {
+                        *hot = Some(existing);
+                        spill = Some(candidate);
+                    }
+                } else {
+                    *hot = Some(existing);
+                }
+            }
+        }
+    }
+    if let Some(s) = spill {
+        if let Ok(mut pool) = r.table_build_batch_pool.lock() {
+            if pool.len() < GPU_TABLE_BUILD_BATCH_POOL_LIMIT {
                 pool.push(s);
             }
         }
@@ -12289,107 +12479,39 @@ pub(crate) fn build_table_gpu_device_batch(
     let pre_resource_ms = elapsed_ms(t_pre_resource);
 
     let t_resource_setup = Instant::now();
-    let src_buffer = storage_upload_buffer(
-        &r.device,
-        "cozip-pdeflate-bt-batch-src",
-        u64::try_from(src_words.len())
+    let scratch_caps = GpuTableBuildBatchScratchCaps {
+        src_bytes: u64::try_from(src_words.len())
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
-    );
-    let freq_params_buffer = storage_upload_buffer(
-        &r.device,
-        "cozip-pdeflate-bt-batch-freq-params",
-        u64::try_from(total_freq_param_words)
+        freq_params_bytes: u64::try_from(total_freq_param_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
-    );
-    let cand_params_buffer = storage_upload_buffer(
-        &r.device,
-        "cozip-pdeflate-bt-batch-cand-params",
-        u64::try_from(total_cand_param_words)
+        cand_params_bytes: u64::try_from(total_cand_param_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
-    );
-    let bucket_params_buffer = storage_upload_buffer(
-        &r.device,
-        "cozip-pdeflate-bt-batch-bucket-params",
-        u64::try_from(total_bucket_param_words)
+        bucket_params_bytes: u64::try_from(total_bucket_param_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
-    );
-    let finalize_params_buffer = storage_upload_buffer(
-        &r.device,
-        "cozip-pdeflate-bt-batch-finalize-params",
-        u64::try_from(total_finalize_param_words)
+        finalize_params_bytes: u64::try_from(total_finalize_param_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4),
-    );
-    let freq_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-freq"),
-        size: u64::try_from(total_freq_words)
+        freq_bytes: u64::try_from(total_freq_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let cand_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-cand"),
-        size: u64::try_from(total_cand_words)
+            .saturating_mul(4),
+        cand_bytes: u64::try_from(total_cand_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let bucket_count_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-bucket-count"),
-        size: u64::try_from(total_bucket_words)
+            .saturating_mul(4),
+        bucket_bytes: u64::try_from(total_bucket_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let bucket_offset_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-bucket-offset"),
-        size: u64::try_from(total_bucket_words)
+            .saturating_mul(4),
+        sorted_idx_bytes: u64::try_from(total_sorted_idx_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let bucket_cursor_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-bucket-cursor"),
-        size: u64::try_from(total_bucket_words)
+            .saturating_mul(4),
+        emit_desc_bytes: u64::try_from(total_emit_desc_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let sorted_idx_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-sorted-idx"),
-        size: u64::try_from(total_sorted_idx_words)
-            .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+            .saturating_mul(4),
+    };
+    let scratch = acquire_table_build_batch_scratch(r, scratch_caps)?;
     let table_meta_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cozip-pdeflate-bt-batch-table-meta"),
         size: u64::try_from(total_meta_words)
@@ -12415,17 +12537,6 @@ pub(crate) fn build_table_gpu_device_batch(
     let table_index_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cozip-pdeflate-bt-batch-table-index"),
         size: u64::try_from(total_index_words)
-            .map_err(|_| PDeflateError::NumericOverflow)?
-            .saturating_mul(4)
-            .max(4),
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let emit_desc_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cozip-pdeflate-bt-batch-emit-desc"),
-        size: u64::try_from(total_emit_desc_words)
             .map_err(|_| PDeflateError::NumericOverflow)?
             .saturating_mul(4)
             .max(4),
@@ -12478,24 +12589,24 @@ pub(crate) fn build_table_gpu_device_batch(
 
     let t_upload = Instant::now();
     r.queue
-        .write_buffer(&src_buffer, 0, bytemuck::cast_slice(&src_words));
+        .write_buffer(&scratch.src_buffer, 0, bytemuck::cast_slice(&src_words));
     r.queue.write_buffer(
-        &freq_params_buffer,
+        &scratch.freq_params_buffer,
         0,
         bytemuck::cast_slice(&freq_params_words),
     );
     r.queue.write_buffer(
-        &cand_params_buffer,
+        &scratch.cand_params_buffer,
         0,
         bytemuck::cast_slice(&cand_params_words),
     );
     r.queue.write_buffer(
-        &bucket_params_buffer,
+        &scratch.bucket_params_buffer,
         0,
         bytemuck::cast_slice(&bucket_params_words),
     );
     r.queue.write_buffer(
-        &finalize_params_buffer,
+        &scratch.finalize_params_buffer,
         0,
         bytemuck::cast_slice(&finalize_params_words),
     );
@@ -12604,15 +12715,15 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                    resource: binding_resource(&scratch.src_buffer, src_offset, src_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&freq_params_buffer, freq_param_offset, 4),
+                    resource: binding_resource(&scratch.freq_params_buffer, freq_param_offset, 4),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&freq_buffer, freq_offset, freq_size),
+                    resource: binding_resource(&scratch.freq_buffer, freq_offset, freq_size),
                 },
             ],
         });
@@ -12622,15 +12733,15 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                    resource: binding_resource(&scratch.src_buffer, src_offset, src_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&cand_params_buffer, cand_param_offset, 28),
+                    resource: binding_resource(&scratch.cand_params_buffer, cand_param_offset, 28),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                    resource: binding_resource(&scratch.cand_buffer, cand_offset, cand_size),
                 },
             ],
         });
@@ -12640,15 +12751,23 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                    resource: binding_resource(&scratch.cand_buffer, cand_offset, cand_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&bucket_params_buffer, bucket_param_offset, 4),
+                    resource: binding_resource(
+                        &scratch.bucket_params_buffer,
+                        bucket_param_offset,
+                        4,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&bucket_count_buffer, bucket_offset, bucket_size),
+                    resource: binding_resource(
+                        &scratch.bucket_count_buffer,
+                        bucket_offset,
+                        bucket_size,
+                    ),
                 },
             ],
         });
@@ -12658,15 +12777,27 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&bucket_count_buffer, bucket_offset, bucket_size),
+                    resource: binding_resource(
+                        &scratch.bucket_count_buffer,
+                        bucket_offset,
+                        bucket_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&bucket_offset_buffer, bucket_offset, bucket_size),
+                    resource: binding_resource(
+                        &scratch.bucket_offset_buffer,
+                        bucket_offset,
+                        bucket_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                    resource: binding_resource(
+                        &scratch.finalize_params_buffer,
+                        finalize_param_offset,
+                        32,
+                    ),
                 },
             ],
         });
@@ -12676,24 +12807,36 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                    resource: binding_resource(&scratch.cand_buffer, cand_offset, cand_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&bucket_params_buffer, bucket_param_offset, 4),
+                    resource: binding_resource(
+                        &scratch.bucket_params_buffer,
+                        bucket_param_offset,
+                        4,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&bucket_offset_buffer, bucket_offset, bucket_size),
+                    resource: binding_resource(
+                        &scratch.bucket_offset_buffer,
+                        bucket_offset,
+                        bucket_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: binding_resource(&bucket_cursor_buffer, bucket_offset, bucket_size),
+                    resource: binding_resource(
+                        &scratch.bucket_cursor_buffer,
+                        bucket_offset,
+                        bucket_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: binding_resource(
-                        &sorted_idx_buffer,
+                        &scratch.sorted_idx_buffer,
                         sorted_idx_offset,
                         sorted_idx_size,
                     ),
@@ -12706,27 +12849,31 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                    resource: binding_resource(&scratch.src_buffer, src_offset, src_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&freq_buffer, freq_offset, freq_size),
+                    resource: binding_resource(&scratch.freq_buffer, freq_offset, freq_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&cand_buffer, cand_offset, cand_size),
+                    resource: binding_resource(&scratch.cand_buffer, cand_offset, cand_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: binding_resource(
-                        &sorted_idx_buffer,
+                        &scratch.sorted_idx_buffer,
                         sorted_idx_offset,
                         sorted_idx_size,
                     ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                    resource: binding_resource(
+                        &scratch.finalize_params_buffer,
+                        finalize_param_offset,
+                        32,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -12734,7 +12881,11 @@ pub(crate) fn build_table_gpu_device_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: binding_resource(&emit_desc_buffer, emit_desc_offset, emit_desc_size),
+                    resource: binding_resource(
+                        &scratch.emit_desc_buffer,
+                        emit_desc_offset,
+                        emit_desc_size,
+                    ),
                 },
             ],
         });
@@ -12744,7 +12895,7 @@ pub(crate) fn build_table_gpu_device_batch(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: binding_resource(&src_buffer, src_offset, src_size),
+                    resource: binding_resource(&scratch.src_buffer, src_offset, src_size),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -12752,11 +12903,19 @@ pub(crate) fn build_table_gpu_device_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: binding_resource(&emit_desc_buffer, emit_desc_offset, emit_desc_size),
+                    resource: binding_resource(
+                        &scratch.emit_desc_buffer,
+                        emit_desc_offset,
+                        emit_desc_size,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                    resource: binding_resource(
+                        &scratch.finalize_params_buffer,
+                        finalize_param_offset,
+                        32,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -12774,7 +12933,11 @@ pub(crate) fn build_table_gpu_device_batch(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: binding_resource(&finalize_params_buffer, finalize_param_offset, 32),
+                    resource: binding_resource(
+                        &scratch.finalize_params_buffer,
+                        finalize_param_offset,
+                        32,
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -12803,16 +12966,16 @@ pub(crate) fn build_table_gpu_device_batch(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cozip-pdeflate-bt-batch-encoder"),
         });
-    encoder.clear_buffer(&freq_buffer, 0, None);
-    encoder.clear_buffer(&cand_buffer, 0, None);
-    encoder.clear_buffer(&bucket_count_buffer, 0, None);
-    encoder.clear_buffer(&bucket_offset_buffer, 0, None);
-    encoder.clear_buffer(&bucket_cursor_buffer, 0, None);
-    encoder.clear_buffer(&sorted_idx_buffer, 0, None);
+    encoder.clear_buffer(&scratch.freq_buffer, 0, None);
+    encoder.clear_buffer(&scratch.cand_buffer, 0, None);
+    encoder.clear_buffer(&scratch.bucket_count_buffer, 0, None);
+    encoder.clear_buffer(&scratch.bucket_offset_buffer, 0, None);
+    encoder.clear_buffer(&scratch.bucket_cursor_buffer, 0, None);
+    encoder.clear_buffer(&scratch.sorted_idx_buffer, 0, None);
     encoder.clear_buffer(&table_meta_buffer, 0, None);
     encoder.clear_buffer(&table_data_buffer, 0, None);
     encoder.clear_buffer(&table_index_buffer, 0, None);
-    encoder.clear_buffer(&emit_desc_buffer, 0, None);
+    encoder.clear_buffer(&scratch.emit_desc_buffer, 0, None);
     for (group, desc) in groups.iter().zip(descs.iter()) {
         let freq_groups = u32::try_from(desc.chunk_len)
             .map_err(|_| PDeflateError::NumericOverflow)?
@@ -12975,6 +13138,7 @@ pub(crate) fn build_table_gpu_device_batch(
             },
         ));
     }
+    release_table_build_batch_scratch(r, scratch);
     Ok(out)
 }
 
