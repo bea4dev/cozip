@@ -1514,11 +1514,13 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
         counter_snapshot.legacy_gpu_prepare_gpu_table_readback_chunks;
     stats.legacy_gpu_profile_call_ms = counter_snapshot.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms = counter_snapshot.legacy_gpu_finalize_ms;
+    stats.legacy_gpu_match_total_ms = counter_snapshot.legacy_gpu_match_total_ms;
     stats.legacy_gpu_table_build_ms = counter_snapshot.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms = counter_snapshot.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms = counter_snapshot.legacy_gpu_section_encode_ms;
     stats.legacy_gpu_sparse_table_size_resolve_ms =
         counter_snapshot.legacy_gpu_sparse_table_size_resolve_ms;
+    stats.legacy_gpu_sparse_prepare_ms = counter_snapshot.legacy_gpu_sparse_prepare_ms;
     stats.legacy_gpu_sparse_prepare_misc_ms = counter_snapshot.legacy_gpu_sparse_prepare_misc_ms;
     stats.legacy_gpu_sparse_upload_dispatch_ms =
         counter_snapshot.legacy_gpu_sparse_upload_dispatch_ms;
@@ -1526,6 +1528,40 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
     stats.legacy_gpu_sparse_lens_wait_ms = counter_snapshot.legacy_gpu_sparse_lens_wait_ms;
     stats.legacy_gpu_sparse_lens_copy_ms = counter_snapshot.legacy_gpu_sparse_lens_copy_ms;
     stats.legacy_gpu_sparse_copy_ms = counter_snapshot.legacy_gpu_sparse_copy_ms;
+    stats.legacy_gpu_sparse_total_ms = counter_snapshot.legacy_gpu_sparse_total_ms;
+    stats.legacy_gpu_kernel_pack_inputs_ms = counter_snapshot.legacy_gpu_kernel_pack_inputs_ms;
+    stats.legacy_gpu_kernel_pack_alloc_setup_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_alloc_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_sizes_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_sizes_ms;
+    stats.legacy_gpu_kernel_pack_resolve_scan_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_scan_ms;
+    stats.legacy_gpu_kernel_pack_resolve_readback_setup_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_readback_setup_ms;
+    stats.legacy_gpu_kernel_pack_resolve_submit_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_submit_ms;
+    stats.legacy_gpu_kernel_pack_resolve_map_wait_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_map_wait_ms;
+    stats.legacy_gpu_kernel_pack_resolve_parse_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_resolve_parse_ms;
+    stats.legacy_gpu_kernel_pack_src_copy_ms = counter_snapshot.legacy_gpu_kernel_pack_src_copy_ms;
+    stats.legacy_gpu_kernel_pack_metadata_loop_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_metadata_loop_ms;
+    stats.legacy_gpu_kernel_pack_host_copy_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_host_copy_ms;
+    stats.legacy_gpu_kernel_pack_device_copy_plan_ms =
+        counter_snapshot.legacy_gpu_kernel_pack_device_copy_plan_ms;
+    stats.legacy_gpu_kernel_pack_finalize_ms = counter_snapshot.legacy_gpu_kernel_pack_finalize_ms;
+    stats.legacy_gpu_kernel_scratch_acquire_ms =
+        counter_snapshot.legacy_gpu_kernel_scratch_acquire_ms;
+    stats.legacy_gpu_kernel_match_dispatch_ms =
+        counter_snapshot.legacy_gpu_kernel_match_dispatch_ms;
+    stats.legacy_gpu_kernel_match_submit_ms = counter_snapshot.legacy_gpu_kernel_match_submit_ms;
+    stats.legacy_gpu_kernel_section_dispatch_ms =
+        counter_snapshot.legacy_gpu_kernel_section_dispatch_ms;
+    stats.legacy_gpu_kernel_section_submit_ms =
+        counter_snapshot.legacy_gpu_kernel_section_submit_ms;
+    stats.legacy_gpu_kernel_section_wait_ms = counter_snapshot.legacy_gpu_kernel_section_wait_ms;
     Ok(stats)
 }
 

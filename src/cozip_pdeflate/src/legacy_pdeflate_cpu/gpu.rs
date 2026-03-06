@@ -935,6 +935,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let max_ref_len = params[3];
     let max_cmd_len = params[4];
     let src_base = params[5];
+    let out_lens_base = params[6];
     if (sec >= section_count) {
         return;
     }
@@ -956,7 +957,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
             let mlen = word & 0xffffu;
             cursor = emit_header(base, cursor, cap, tag, mlen);
             if (cursor == 0xffffffffu) {
-                out_lens[sec] = 0xffffffffu;
+                out_lens[out_lens_base + sec] = 0xffffffffu;
                 return;
             }
             pos = pos + mlen;
@@ -979,7 +980,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         let lit_len = pos - lit_start;
         cursor = emit_header(base, cursor, cap, 0x0fffu, lit_len);
         if (cursor == 0xffffffffu) {
-            out_lens[sec] = 0xffffffffu;
+            out_lens[out_lens_base + sec] = 0xffffffffu;
             return;
         }
         var i: u32 = 0u;
@@ -989,14 +990,14 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
             }
             cursor = emit_cmd_byte(base, cursor, cap, load_src(src_base + lit_start + i));
             if (cursor == 0xffffffffu) {
-                out_lens[sec] = 0xffffffffu;
+                out_lens[out_lens_base + sec] = 0xffffffffu;
                 return;
             }
             i = i + 1u;
         }
     }
 
-    out_lens[sec] = cursor;
+    out_lens[out_lens_base + sec] = cursor;
 }
 "#;
 
@@ -1213,13 +1214,14 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     if (sec >= section_count) {
         return;
     }
+    let out_lens_base = params[6];
     let count = token_counts[sec];
     if (count == 0xffffffffu) {
-        out_lens[sec] = 0xffffffffu;
+        out_lens[out_lens_base + sec] = 0xffffffffu;
         return;
     }
     if (count > token_caps[sec]) {
-        out_lens[sec] = 0xffffffffu;
+        out_lens[out_lens_base + sec] = 0xffffffffu;
         return;
     }
 
@@ -1235,12 +1237,12 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         token_cmd_offsets[idx] = cursor;
         cursor = cursor + cmd_size_bytes(token_meta[idx]);
         if (cursor > cap) {
-            out_lens[sec] = 0xffffffffu;
+            out_lens[out_lens_base + sec] = 0xffffffffu;
             return;
         }
         i = i + 1u;
     }
-    out_lens[sec] = cursor;
+    out_lens[out_lens_base + sec] = cursor;
 }
 "#;
 
@@ -1344,7 +1346,8 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     if (sec >= section_count) {
         return;
     }
-    let len = out_lens[sec];
+    let out_lens_base = params[6];
+    let len = out_lens[out_lens_base + sec];
     if (len == 0xffffffffu) {
         return;
     }
@@ -1376,8 +1379,10 @@ const SECTION_META_SHADER: &str = r#"
 @group(0) @binding(4) var<storage, read> params: array<u32>;
 
 fn write_section_index_byte(idx: u32, value: u32) {
-    let wi = idx >> 2u;
-    let shift = (idx & 3u) * 8u;
+    let base = params[8];
+    let abs = base + idx;
+    let wi = abs >> 2u;
+    let shift = (abs & 3u) * 8u;
     let mask = 0xffu << shift;
     let prev = section_index_words[wi];
     section_index_words[wi] = (prev & (~mask)) | ((value & 0xffu) << shift);
@@ -1408,6 +1413,9 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         return;
     }
     let section_count = params[1];
+    let out_lens_base = params[6];
+    let section_prefix_base = params[7];
+    let section_meta_base = params[9];
     var total_cmd_len = 0u;
     var section_index_len = 0u;
     var overflow = 0u;
@@ -1416,12 +1424,12 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         if (sec >= section_count) {
             break;
         }
-        let len = out_lens[sec];
+        let len = out_lens[out_lens_base + sec];
         if (len == 0xffffffffu) {
             overflow = 1u;
             break;
         }
-        section_prefix[sec] = total_cmd_len;
+        section_prefix[section_prefix_base + sec] = total_cmd_len;
         total_cmd_len = total_cmd_len + len;
         // section index stores bit_len (not byte_len) for each section.
         if (len > 0x1fffffffu) {
@@ -1433,15 +1441,15 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         sec = sec + 1u;
     }
     if (overflow != 0u) {
-        section_meta_words[0] = 0xffffffffu;
-        section_meta_words[1] = 0xffffffffu;
-        section_meta_words[2] = 1u;
-        section_meta_words[3] = 0u;
+        section_meta_words[section_meta_base + 0u] = 0xffffffffu;
+        section_meta_words[section_meta_base + 1u] = 0xffffffffu;
+        section_meta_words[section_meta_base + 2u] = 1u;
+        section_meta_words[section_meta_base + 3u] = 0u;
     } else {
-        section_meta_words[0] = total_cmd_len;
-        section_meta_words[1] = section_index_len;
-        section_meta_words[2] = 0u;
-        section_meta_words[3] = 0u;
+        section_meta_words[section_meta_base + 0u] = total_cmd_len;
+        section_meta_words[section_meta_base + 1u] = section_index_len;
+        section_meta_words[section_meta_base + 2u] = 0u;
+        section_meta_words[section_meta_base + 3u] = 0u;
     }
 }
 "#;
@@ -1545,8 +1553,11 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
 "#;
 
 const PACK_CHUNK_SPARSE_SECTION_SHADER: &str = r#"
-@group(0) @binding(0) var<storage, read> params: array<u32>;
-@group(0) @binding(1) var<storage, read> section_meta_words: array<u32>;
+const SPARSE_BATCH_DESC_WORDS: u32 = 20u;
+const SPARSE_BATCH_RESULT_WORDS: u32 = 4u;
+
+@group(0) @binding(0) var<storage, read> desc_words: array<u32>;
+@group(0) @binding(1) var<storage, read> result_words: array<u32>;
 @group(0) @binding(2) var<storage, read> table_index_words: array<u32>;
 @group(0) @binding(3) var<storage, read> table_data_words: array<u32>;
 @group(0) @binding(4) var<storage, read> section_index_words: array<u32>;
@@ -1561,106 +1572,87 @@ fn low8(v: u32, s: u32) -> u32 {
     return (v >> s) & 0xffu;
 }
 
-fn sparse_probe_enabled() -> bool {
-    return params[12] != 0u;
+fn sparse_probe_enabled(desc_base: u32) -> bool {
+    return desc_words[desc_base + 17u] != 0u;
 }
 
-fn sparse_stat_add(idx: u32, value: u32) {
-    if (sparse_probe_enabled()) {
+fn sparse_stat_add(desc_base: u32, idx: u32, value: u32) {
+    if (sparse_probe_enabled(desc_base)) {
         atomicAdd(&sparse_stats_words[idx], value);
     }
 }
 
-fn load_header_byte(idx: u32, section_cmd_off: u32) -> u32 {
-    let chunk_len = params[0];
-    let table_count = params[1];
-    let section_count = params[2];
-    let table_index_off = params[3];
-    let table_data_off = params[5];
-    let section_index_off = params[7];
+fn load_table_index_byte(desc_base: u32, idx: u32) -> u32 {
+    let abs_idx = desc_words[desc_base + 3u] + idx;
+    let w = table_index_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_table_data_byte(desc_base: u32, idx: u32) -> u32 {
+    let abs_idx = desc_words[desc_base + 5u] + idx;
+    let w = table_data_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_section_index_byte(desc_base: u32, idx: u32) -> u32 {
+    let abs_idx = desc_words[desc_base + 8u] + idx;
+    let w = section_index_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_section_cmd_sparse_byte(desc_base: u32, idx: u32) -> u32 {
+    let abs_idx = desc_words[desc_base + 13u] + idx;
+    let w = section_cmd_sparse_words[abs_idx >> 2u];
+    let shift = (abs_idx & 3u) * 8u;
+    return (w >> shift) & 0xffu;
+}
+
+fn load_header_byte(desc_base: u32, section_cmd_off: u32, idx: u32) -> u32 {
+    let chunk_len = desc_words[desc_base + 1u];
+    let table_count = desc_words[desc_base + 2u];
+    let section_count = desc_words[desc_base];
+    let table_index_off = 36u;
+    let table_data_off = desc_words[desc_base + 18u];
+    let section_index_off = desc_words[desc_base + 19u];
     let huff_lut_off = section_index_off;
 
-    if (idx == 0u) {
-        return 0x50u;
-    }
-    if (idx == 1u) {
-        return 0x44u;
-    }
-    if (idx == 2u) {
-        return 0x46u;
-    }
-    if (idx == 3u) {
-        return 0x30u;
-    }
-    if (idx == 4u || idx == 5u || idx == 6u || idx == 7u) {
-        return 0u;
-    }
-    if (idx >= 8u && idx < 12u) {
-        return low8(chunk_len, (idx - 8u) * 8u);
-    }
-    if (idx >= 12u && idx < 14u) {
-        return low8(table_count, (idx - 12u) * 8u);
-    }
-    if (idx >= 14u && idx < 16u) {
-        return low8(section_count, (idx - 14u) * 8u);
-    }
-    if (idx >= 16u && idx < 20u) {
-        return low8(table_index_off, (idx - 16u) * 8u);
-    }
-    if (idx >= 20u && idx < 24u) {
-        return low8(table_data_off, (idx - 20u) * 8u);
-    }
-    if (idx >= 24u && idx < 28u) {
-        return low8(huff_lut_off, (idx - 24u) * 8u);
-    }
-    if (idx >= 28u && idx < 32u) {
-        return low8(section_index_off, (idx - 28u) * 8u);
-    }
-    if (idx >= 32u && idx < 36u) {
-        return low8(section_cmd_off, (idx - 32u) * 8u);
-    }
+    if (idx == 0u) { return 0x50u; }
+    if (idx == 1u) { return 0x44u; }
+    if (idx == 2u) { return 0x46u; }
+    if (idx == 3u) { return 0x30u; }
+    if (idx == 4u || idx == 5u || idx == 6u || idx == 7u) { return 0u; }
+    if (idx >= 8u && idx < 12u) { return low8(chunk_len, (idx - 8u) * 8u); }
+    if (idx >= 12u && idx < 14u) { return low8(table_count, (idx - 12u) * 8u); }
+    if (idx >= 14u && idx < 16u) { return low8(section_count, (idx - 14u) * 8u); }
+    if (idx >= 16u && idx < 20u) { return low8(table_index_off, (idx - 16u) * 8u); }
+    if (idx >= 20u && idx < 24u) { return low8(table_data_off, (idx - 20u) * 8u); }
+    if (idx >= 24u && idx < 28u) { return low8(huff_lut_off, (idx - 24u) * 8u); }
+    if (idx >= 28u && idx < 32u) { return low8(section_index_off, (idx - 28u) * 8u); }
+    if (idx >= 32u && idx < 36u) { return low8(section_cmd_off, (idx - 32u) * 8u); }
     return 0u;
 }
 
-fn load_table_index_byte(idx: u32) -> u32 {
-    let w = table_index_words[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (w >> shift) & 0xffu;
-}
-
-fn load_table_data_byte(idx: u32) -> u32 {
-    let w = table_data_words[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (w >> shift) & 0xffu;
-}
-
-fn load_section_index_byte(idx: u32) -> u32 {
-    let w = section_index_words[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (w >> shift) & 0xffu;
-}
-
-fn load_section_cmd_sparse_byte(idx: u32) -> u32 {
-    let w = section_cmd_sparse_words[idx >> 2u];
-    let shift = (idx & 3u) * 8u;
-    return (w >> shift) & 0xffu;
-}
-
-fn find_section_for_local(local: u32, section_count: u32) -> u32 {
+fn find_section_for_local(desc_base: u32, local: u32) -> u32 {
+    let section_count = desc_words[desc_base];
     if (section_count == 0u) {
-        sparse_stat_add(7u, 1u);
+        sparse_stat_add(desc_base, 7u, 1u);
         return 0xffffffffu;
     }
+    let prefix_base = desc_words[desc_base + 11u];
+    let lens_base = desc_words[desc_base + 10u];
     var lo = 0u;
     var hi = section_count;
     loop {
-        sparse_stat_add(5u, 1u);
+        sparse_stat_add(desc_base, 5u, 1u);
         if (lo >= hi) {
             break;
         }
         let mid = (lo + hi) >> 1u;
-        let start = section_prefix_words[mid];
-        let end = start + section_lens_words[mid];
+        let start = section_prefix_words[prefix_base + mid];
+        let end = start + section_lens_words[lens_base + mid];
         if (local < start) {
             hi = mid;
             continue;
@@ -1669,63 +1661,35 @@ fn find_section_for_local(local: u32, section_count: u32) -> u32 {
             lo = mid + 1u;
             continue;
         }
-        sparse_stat_add(6u, 1u);
+        sparse_stat_add(desc_base, 6u, 1u);
         return mid;
     }
-    sparse_stat_add(7u, 1u);
+    sparse_stat_add(desc_base, 7u, 1u);
     return 0xffffffffu;
 }
 
-fn load_section_cmd_compact_byte(local: u32, section_count: u32) -> u32 {
-    if (section_count == 0u) {
-        sparse_stat_add(7u, 1u);
-        return 0u;
-    }
-    var lo = 0u;
-    var hi = section_count;
-    loop {
-        sparse_stat_add(5u, 1u);
-        if (lo >= hi) {
-            break;
-        }
-        let mid = (lo + hi) >> 1u;
-        let start = section_prefix_words[mid];
-        let end = start + section_lens_words[mid];
-        if (local < start) {
-            hi = mid;
-            continue;
-        }
-        if (local >= end) {
-            lo = mid + 1u;
-            continue;
-        }
-        let rel = local - start;
-        let src = section_offsets_words[mid] + rel;
-        sparse_stat_add(6u, 1u);
-        return load_section_cmd_sparse_byte(src);
-    }
-    sparse_stat_add(7u, 1u);
-    return 0u;
-}
-
-fn load_section_cmd_compact_word(local_base: u32, section_count: u32, remaining: u32) -> u32 {
-    var sec_idx = find_section_for_local(local_base, section_count);
+fn load_section_cmd_compact_word(desc_base: u32, local_base: u32, remaining: u32) -> u32 {
+    let section_count = desc_words[desc_base];
+    let prefix_base = desc_words[desc_base + 11u];
+    let lens_base = desc_words[desc_base + 10u];
+    let offsets_base = desc_words[desc_base + 12u];
+    var sec_idx = find_section_for_local(desc_base, local_base);
     var sec_start = 0u;
     var sec_end = 0u;
     if (sec_idx != 0xffffffffu) {
-        sec_start = section_prefix_words[sec_idx];
-        sec_end = sec_start + section_lens_words[sec_idx];
+        sec_start = section_prefix_words[prefix_base + sec_idx];
+        sec_end = sec_start + section_lens_words[lens_base + sec_idx];
     }
 
-    var b0 = 0u;
-    var b1 = 0u;
-    var b2 = 0u;
-    var b3 = 0u;
-
-    if (remaining > 0u) {
-        let local0 = local_base;
+    var out = 0u;
+    var i = 0u;
+    loop {
+        if (i >= 4u || i >= remaining) {
+            break;
+        }
+        let local = local_base + i;
         loop {
-            if (sec_idx == 0xffffffffu || local0 < sec_end) {
+            if (sec_idx == 0xffffffffu || local < sec_end) {
                 break;
             }
             if (sec_idx + 1u >= section_count) {
@@ -1733,221 +1697,130 @@ fn load_section_cmd_compact_word(local_base: u32, section_count: u32, remaining:
                 break;
             }
             sec_idx = sec_idx + 1u;
-            sec_start = section_prefix_words[sec_idx];
-            sec_end = sec_start + section_lens_words[sec_idx];
+            sec_start = section_prefix_words[prefix_base + sec_idx];
+            sec_end = sec_start + section_lens_words[lens_base + sec_idx];
         }
-        if (sec_idx != 0xffffffffu && local0 >= sec_start && local0 < sec_end) {
-            sparse_stat_add(4u, 1u);
-            b0 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local0 - sec_start));
+        if (sec_idx != 0xffffffffu && local >= sec_start && local < sec_end) {
+            sparse_stat_add(desc_base, 4u, 1u);
+            let src = section_offsets_words[offsets_base + sec_idx] + (local - sec_start);
+            let byte = load_section_cmd_sparse_byte(desc_base, src);
+            out = out | (byte << (i * 8u));
         } else {
-            sparse_stat_add(7u, 1u);
+            sparse_stat_add(desc_base, 7u, 1u);
         }
+        i = i + 1u;
     }
-
-    if (remaining > 1u) {
-        let local1 = local_base + 1u;
-        loop {
-            if (sec_idx == 0xffffffffu || local1 < sec_end) {
-                break;
-            }
-            if (sec_idx + 1u >= section_count) {
-                sec_idx = 0xffffffffu;
-                break;
-            }
-            sec_idx = sec_idx + 1u;
-            sec_start = section_prefix_words[sec_idx];
-            sec_end = sec_start + section_lens_words[sec_idx];
-        }
-        if (sec_idx != 0xffffffffu && local1 >= sec_start && local1 < sec_end) {
-            sparse_stat_add(4u, 1u);
-            b1 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local1 - sec_start));
-        } else {
-            sparse_stat_add(7u, 1u);
-        }
-    }
-
-    if (remaining > 2u) {
-        let local2 = local_base + 2u;
-        loop {
-            if (sec_idx == 0xffffffffu || local2 < sec_end) {
-                break;
-            }
-            if (sec_idx + 1u >= section_count) {
-                sec_idx = 0xffffffffu;
-                break;
-            }
-            sec_idx = sec_idx + 1u;
-            sec_start = section_prefix_words[sec_idx];
-            sec_end = sec_start + section_lens_words[sec_idx];
-        }
-        if (sec_idx != 0xffffffffu && local2 >= sec_start && local2 < sec_end) {
-            sparse_stat_add(4u, 1u);
-            b2 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local2 - sec_start));
-        } else {
-            sparse_stat_add(7u, 1u);
-        }
-    }
-
-    if (remaining > 3u) {
-        let local3 = local_base + 3u;
-        loop {
-            if (sec_idx == 0xffffffffu || local3 < sec_end) {
-                break;
-            }
-            if (sec_idx + 1u >= section_count) {
-                sec_idx = 0xffffffffu;
-                break;
-            }
-            sec_idx = sec_idx + 1u;
-            sec_start = section_prefix_words[sec_idx];
-            sec_end = sec_start + section_lens_words[sec_idx];
-        }
-        if (sec_idx != 0xffffffffu && local3 >= sec_start && local3 < sec_end) {
-            sparse_stat_add(4u, 1u);
-            b3 = load_section_cmd_sparse_byte(section_offsets_words[sec_idx] + (local3 - sec_start));
-        } else {
-            sparse_stat_add(7u, 1u);
-        }
-    }
-
-    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    return out;
 }
 
-fn read_output_byte(pos: u32) -> u32 {
-    let section_cmd_len = section_meta_words[0];
-    let section_index_len = section_meta_words[1];
-    let overflow = section_meta_words[2];
-    let header_len = 36u;
-    let table_index_off = params[3];
-    let table_index_len = params[4];
-    let table_data_off = params[5];
-    let table_data_len = params[6];
-    let section_index_off = params[7];
-    let section_count = params[2];
-    let section_cmd_off = section_index_off + section_index_len;
-    let total_len = section_cmd_off + section_cmd_len;
-
-    if (overflow != 0u || section_cmd_len == 0xffffffffu || section_index_len == 0xffffffffu) {
-        return 0u;
-    }
-    if (pos >= total_len) {
-        return 0u;
-    }
-
-    if (pos < header_len) {
-        sparse_stat_add(0u, 1u);
-        return load_header_byte(pos, section_cmd_off);
-    }
-    if (pos >= table_index_off && pos < table_index_off + table_index_len) {
-        sparse_stat_add(1u, 1u);
-        return load_table_index_byte(pos - table_index_off);
-    }
-    if (pos >= table_data_off && pos < table_data_off + table_data_len) {
-        sparse_stat_add(2u, 1u);
-        return load_table_data_byte(pos - table_data_off);
-    }
-    if (pos >= section_index_off && pos < section_index_off + section_index_len) {
-        sparse_stat_add(3u, 1u);
-        return load_section_index_byte(pos - section_index_off);
-    }
-    if (pos >= section_cmd_off && pos < section_cmd_off + section_cmd_len) {
-        sparse_stat_add(4u, 1u);
-        return load_section_cmd_compact_byte(pos - section_cmd_off, section_count);
-    }
-    return 0u;
+fn load_section_cmd_compact_byte(desc_base: u32, local: u32) -> u32 {
+    return load_section_cmd_compact_word(desc_base, local, 1u) & 0xffu;
 }
 
-fn read_output_word(base: u32) -> u32 {
-    let section_cmd_len = section_meta_words[0];
-    let section_index_len = section_meta_words[1];
-    let overflow = section_meta_words[2];
-    let section_count = params[2];
-    let section_index_off = params[7];
+fn read_output_word(desc_base: u32, result_base: u32, byte_base: u32) -> u32 {
+    let total_len = result_words[result_base + 2u];
+    let section_index_len = result_words[result_base + 1u];
+    let section_cmd_len = result_words[result_base];
+    let table_index_off = 36u;
+    let table_index_len = desc_words[desc_base + 4u];
+    let table_data_off = desc_words[desc_base + 18u];
+    let table_data_len = desc_words[desc_base + 6u];
+    let section_index_off = desc_words[desc_base + 19u];
     let section_cmd_off = section_index_off + section_index_len;
     let section_cmd_end = section_cmd_off + section_cmd_len;
-    let total_len = section_cmd_end;
 
-    if (overflow == 0u
-        && section_cmd_len != 0xffffffffu
-        && section_index_len != 0xffffffffu
-        && base >= section_cmd_off
-        && base < section_cmd_end
-        && section_count > 0u) {
-        let local_base = base - section_cmd_off;
-        let remaining = section_cmd_end - base;
-        return load_section_cmd_compact_word(local_base, section_count, remaining);
+    if (total_len == 0xffffffffu || byte_base >= total_len) {
+        return 0u;
+    }
+    if (byte_base >= section_cmd_off && byte_base < section_cmd_end && desc_words[desc_base] > 0u) {
+        let remaining = section_cmd_end - byte_base;
+        return load_section_cmd_compact_word(desc_base, byte_base - section_cmd_off, remaining);
     }
 
-    var b0 = read_output_byte(base);
-    var b1 = 0u;
-    var b2 = 0u;
-    var b3 = 0u;
-    if (base + 1u < total_len) {
-        b1 = read_output_byte(base + 1u);
+    var out = 0u;
+    var i = 0u;
+    loop {
+        if (i >= 4u) {
+            break;
+        }
+        let pos = byte_base + i;
+        if (pos >= total_len) {
+            break;
+        }
+        var byte = 0u;
+        if (pos < 36u) {
+            sparse_stat_add(desc_base, 0u, 1u);
+            byte = load_header_byte(desc_base, section_cmd_off, pos);
+        } else if (pos >= table_index_off && pos < table_index_off + table_index_len) {
+            sparse_stat_add(desc_base, 1u, 1u);
+            byte = load_table_index_byte(desc_base, pos - table_index_off);
+        } else if (pos >= table_data_off && pos < table_data_off + table_data_len) {
+            sparse_stat_add(desc_base, 2u, 1u);
+            byte = load_table_data_byte(desc_base, pos - table_data_off);
+        } else if (pos >= section_index_off && pos < section_index_off + section_index_len) {
+            sparse_stat_add(desc_base, 3u, 1u);
+            byte = load_section_index_byte(desc_base, pos - section_index_off);
+        } else if (pos >= section_cmd_off && pos < section_cmd_end) {
+            sparse_stat_add(desc_base, 4u, 1u);
+            byte = load_section_cmd_compact_byte(desc_base, pos - section_cmd_off);
+        }
+        out = out | (byte << (i * 8u));
+        i = i + 1u;
     }
-    if (base + 2u < total_len) {
-        b2 = read_output_byte(base + 2u);
-    }
-    if (base + 3u < total_len) {
-        b3 = read_output_byte(base + 3u);
-    }
-    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+    return out;
 }
 
 @compute
 @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let job_count = desc_words[0];
+    let job = gid3.y;
+    if (gid3.z != 0u || job >= job_count) {
+        return;
+    }
+    let desc_base = 1u + job * SPARSE_BATCH_DESC_WORDS;
+    let result_base = job * SPARSE_BATCH_RESULT_WORDS;
     let word_idx = gid3.x;
-    let out_words_len = params[11];
+    let out_words_len = result_words[result_base + 3u];
     if (word_idx >= out_words_len) {
         return;
     }
-    let base = word_idx * 4u;
-    out_words[word_idx] = read_output_word(base);
+    let out_base_word = desc_words[desc_base + 15u];
+    out_words[out_base_word + word_idx] = read_output_word(desc_base, result_base, word_idx * 4u);
 }
 "#;
 
 const PACK_CHUNK_SPARSE_PREPARE_SHADER: &str = r#"
-@group(0) @binding(0) var<storage, read_write> params: array<u32>;
+const SPARSE_BATCH_DESC_WORDS: u32 = 20u;
+const SPARSE_BATCH_RESULT_WORDS: u32 = 4u;
+
+@group(0) @binding(0) var<storage, read> desc_words: array<u32>;
 @group(0) @binding(1) var<storage, read> section_meta_words: array<u32>;
-@group(0) @binding(2) var<storage, read_write> dispatch_words: array<u32>;
-@group(0) @binding(3) var<storage, read> table_meta_words: array<u32>;
+@group(0) @binding(2) var<storage, read_write> result_words: array<u32>;
 
 fn align_up4(v: u32) -> u32 {
     return (v + 3u) & 0xfffffffcu;
 }
 
 @compute
-@workgroup_size(1, 1, 1)
-fn main() {
-    let table_count_hint = params[1];
-    let table_index_off = params[3];
-    var table_index_len = params[4];
-    var table_data_len = params[6];
-    if (table_count_hint != 0u) {
-        let meta_count = table_meta_words[0];
-        let meta_data_total_idx = 1u + table_count_hint * 2u;
-        let meta_data_total = table_meta_words[meta_data_total_idx];
-        if (meta_count != 0u || meta_data_total != 0u) {
-            let capped_count = min(meta_count, table_count_hint);
-            table_index_len = min(table_index_len, capped_count);
-            table_data_len = min(table_data_len, meta_data_total);
-            params[1] = capped_count;
-            params[4] = table_index_len;
-            params[6] = table_data_len;
-        }
+@workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
+    let job = gid3.x;
+    let job_count = desc_words[0];
+    if (gid3.y != 0u || gid3.z != 0u || job >= job_count) {
+        return;
     }
-
-    let table_data_off = table_index_off + table_index_len;
-    let section_index_off = table_data_off + table_data_len;
-    let section_index_cap_len = params[8];
-    let section_cmd_cap_len = params[9];
+    let desc_base = 1u + job * SPARSE_BATCH_DESC_WORDS;
+    let result_base = job * SPARSE_BATCH_RESULT_WORDS;
+    let section_meta_base = desc_words[desc_base + 7u];
+    let section_index_off = desc_words[desc_base + 19u];
+    let section_index_cap_len = desc_words[desc_base + 9u];
+    let section_cmd_cap_len = desc_words[desc_base + 14u];
+    let section_cmd_len = section_meta_words[section_meta_base];
+    let section_index_len = section_meta_words[section_meta_base + 1u];
+    let overflow = section_meta_words[section_meta_base + 2u];
     let section_cmd_off_cap = section_index_off + section_index_cap_len;
     let total_len_cap = section_cmd_off_cap + section_cmd_cap_len;
-
-    let section_cmd_len = section_meta_words[0];
-    let section_index_len = section_meta_words[1];
-    let overflow = section_meta_words[2];
 
     var total_len = 0xffffffffu;
     if (overflow == 0u && section_cmd_len != 0xffffffffu && section_index_len != 0xffffffffu) {
@@ -1957,17 +1830,11 @@ fn main() {
             total_len = 0xffffffffu;
         }
     }
-
     let total_words = select(max(1u, align_up4(total_len) >> 2u), 1u, total_len == 0xffffffffu);
-    let groups_x = max(1u, (total_words + 255u) / 256u);
-
-    params[5] = table_data_off;
-    params[7] = section_index_off;
-    params[10] = total_len;
-    params[11] = total_words;
-    dispatch_words[0] = groups_x;
-    dispatch_words[1] = 1u;
-    dispatch_words[2] = 1u;
+    result_words[result_base] = section_cmd_len;
+    result_words[result_base + 1u] = section_index_len;
+    result_words[result_base + 2u] = total_len;
+    result_words[result_base + 3u] = total_words;
 }
 "#;
 
@@ -2848,6 +2715,15 @@ pub(crate) struct GpuBatchSectionEncodeOutput {
     pub(crate) keepalive: Option<GpuBatchSectionKeepalive>,
 }
 
+pub(crate) struct GpuBatchSparsePackOutput {
+    pub(crate) chunks: Vec<GpuSparsePackChunkOutput>,
+    pub(crate) match_profile: GpuMatchProfile,
+    pub(crate) section_profile: GpuSectionEncodeProfile,
+    pub(crate) sparse_profile: GpuMatchProfile,
+    pub(crate) sparse_batch_profile: GpuSparsePackBatchProfile,
+    pub(crate) kernel_profile: GpuBatchKernelProfile,
+}
+
 pub(crate) struct GpuSectionCmdDeviceOutput {
     pub(crate) section_count: usize,
     pub(crate) section_offsets_buffer: Arc<wgpu::Buffer>,
@@ -3115,13 +2991,20 @@ struct GpuSectionEncodeSlot {
 }
 
 struct GpuSparsePackScratch {
-    params_cap_bytes: u64,
-    out_cap_bytes: u64,
-    params_buffer: wgpu::Buffer,
-    params_readback_buffer: wgpu::Buffer,
+    caps: GpuSparsePackScratchCaps,
+    desc_buffer: wgpu::Buffer,
+    section_meta_buffer: wgpu::Buffer,
+    table_index_buffer: wgpu::Buffer,
+    table_data_buffer: wgpu::Buffer,
+    section_index_buffer: wgpu::Buffer,
+    out_lens_buffer: wgpu::Buffer,
+    section_prefix_buffer: wgpu::Buffer,
+    section_offsets_buffer: wgpu::Buffer,
+    out_cmd_buffer: wgpu::Buffer,
+    result_buffer: wgpu::Buffer,
+    result_readback_buffer: wgpu::Buffer,
     out_buffer: wgpu::Buffer,
-    dispatch_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
+    prepare_bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy)]
@@ -3328,10 +3211,35 @@ struct InflightGpuDecodeSubmission<'a> {
     wait_profile: GpuDecodeV2WaitProfile,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct GpuSparsePackScratchCaps {
-    params_bytes: u64,
+    desc_bytes: u64,
+    section_meta_bytes: u64,
+    table_index_bytes: u64,
+    table_data_bytes: u64,
+    section_index_bytes: u64,
+    out_lens_bytes: u64,
+    section_prefix_bytes: u64,
+    section_offsets_bytes: u64,
+    out_cmd_bytes: u64,
+    result_bytes: u64,
     out_bytes: u64,
+}
+
+impl GpuSparsePackScratchCaps {
+    fn fits(&self, req: GpuSparsePackScratchCaps) -> bool {
+        self.desc_bytes >= req.desc_bytes
+            && self.section_meta_bytes >= req.section_meta_bytes
+            && self.table_index_bytes >= req.table_index_bytes
+            && self.table_data_bytes >= req.table_data_bytes
+            && self.section_index_bytes >= req.section_index_bytes
+            && self.out_lens_bytes >= req.out_lens_bytes
+            && self.section_prefix_bytes >= req.section_prefix_bytes
+            && self.section_offsets_bytes >= req.section_offsets_bytes
+            && self.out_cmd_bytes >= req.out_cmd_bytes
+            && self.result_bytes >= req.result_bytes
+            && self.out_bytes >= req.out_bytes
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3358,6 +3266,8 @@ const GPU_SPARSE_PACK_POOL_LIMIT: usize = 16;
 const GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
 const GPU_DECODE_V2_BATCH_DESC_WORDS: usize = 12;
+const GPU_SPARSE_PACK_BATCH_DESC_WORDS: usize = 20;
+const GPU_SPARSE_PACK_BATCH_RESULT_WORDS: usize = 4;
 // Command stream cap heuristic for GPU section encode.
 // If this underestimates a pathological section, kernel marks overflow and
 // caller falls back to CPU for correctness.
@@ -3711,7 +3621,9 @@ fn storage_upload_buffer(device: &wgpu::Device, label: &'static str, size: u64) 
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size.max(4),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -4002,7 +3914,7 @@ impl GpuSectionEncodeSlot {
             u64::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
         let section_offsets_bytes = section_count_u64.saturating_mul(4);
         let section_caps_bytes = section_count_u64.saturating_mul(4);
-        let section_params_bytes = 24u64;
+        let section_params_bytes = 40u64;
         let out_lens_bytes = section_count_u64.saturating_mul(4);
         let section_prefix_bytes = section_count_u64.saturating_mul(4);
         let section_index_cap_bytes = u64::try_from(section_count.saturating_mul(5))
@@ -4380,58 +4292,125 @@ impl GpuSectionEncodeSlot {
 
 impl GpuSparsePackScratch {
     fn fits(&self, caps: GpuSparsePackScratchCaps) -> bool {
-        self.params_cap_bytes >= caps.params_bytes && self.out_cap_bytes >= caps.out_bytes
+        self.caps.fits(caps)
     }
 
     fn covers(&self, other: &Self) -> bool {
-        self.params_cap_bytes >= other.params_cap_bytes && self.out_cap_bytes >= other.out_cap_bytes
+        self.caps.fits(other.caps)
     }
 
     fn new(runtime: &GpuMatchRuntime, caps: GpuSparsePackScratchCaps) -> Self {
-        let params_cap_bytes = round_capacity_bytes(caps.params_bytes);
-        let out_cap_bytes = round_capacity_bytes(caps.out_bytes);
-        let params_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-params"),
-            size: params_cap_bytes.max(4),
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+        let caps = GpuSparsePackScratchCaps {
+            desc_bytes: round_capacity_bytes(caps.desc_bytes),
+            section_meta_bytes: round_capacity_bytes(caps.section_meta_bytes),
+            table_index_bytes: round_capacity_bytes(caps.table_index_bytes),
+            table_data_bytes: round_capacity_bytes(caps.table_data_bytes),
+            section_index_bytes: round_capacity_bytes(caps.section_index_bytes),
+            out_lens_bytes: round_capacity_bytes(caps.out_lens_bytes),
+            section_prefix_bytes: round_capacity_bytes(caps.section_prefix_bytes),
+            section_offsets_bytes: round_capacity_bytes(caps.section_offsets_bytes),
+            out_cmd_bytes: round_capacity_bytes(caps.out_cmd_bytes),
+            result_bytes: round_capacity_bytes(caps.result_bytes),
+            out_bytes: round_capacity_bytes(caps.out_bytes),
+        };
+        let desc_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-desc",
+            caps.desc_bytes,
+        );
+        let section_meta_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-section-meta",
+            caps.section_meta_bytes,
+        );
+        let table_index_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-table-index",
+            caps.table_index_bytes,
+        );
+        let table_data_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-table-data",
+            caps.table_data_bytes,
+        );
+        let section_index_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-section-index",
+            caps.section_index_bytes,
+        );
+        let out_lens_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-out-lens",
+            caps.out_lens_bytes,
+        );
+        let section_prefix_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-section-prefix",
+            caps.section_prefix_bytes,
+        );
+        let section_offsets_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-section-offsets",
+            caps.section_offsets_bytes,
+        );
+        let out_cmd_buffer = storage_upload_buffer(
+            &runtime.device,
+            "cozip-pdeflate-pack-sparse-batch-out-cmd",
+            caps.out_cmd_bytes,
+        );
+        let result_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-batch-result"),
+            size: caps.result_bytes.max(4),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let params_readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-params-readback"),
-            size: params_cap_bytes.max(4),
+        let result_readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-batch-result-readback"),
+            size: caps.result_bytes.max(4),
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let out_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-out"),
-            size: out_cap_bytes.max(4),
+            label: Some("cozip-pdeflate-pack-sparse-batch-out"),
+            size: caps.out_bytes.max(4),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let dispatch_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-dispatch"),
-            size: 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let readback_buffer = runtime.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-readback"),
-            size: out_cap_bytes.max(4),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let prepare_bind_group = runtime
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cozip-pdeflate-pack-sparse-batch-prepare-bg"),
+                layout: &runtime.pack_sparse_prepare_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: desc_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: section_meta_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: result_buffer.as_entire_binding(),
+                    },
+                ],
+            });
         Self {
-            params_cap_bytes,
-            out_cap_bytes,
-            params_buffer,
-            params_readback_buffer,
+            caps,
+            desc_buffer,
+            section_meta_buffer,
+            table_index_buffer,
+            table_data_buffer,
+            section_index_buffer,
+            out_lens_buffer,
+            section_prefix_buffer,
+            section_offsets_buffer,
+            out_cmd_buffer,
+            result_buffer,
+            result_readback_buffer,
             out_buffer,
-            dispatch_buffer,
-            readback_buffer,
+            prepare_bind_group,
         }
     }
 }
@@ -4681,7 +4660,7 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -4702,16 +4681,6 @@ fn init_runtime() -> Result<GpuMatchRuntime, String> {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -6973,9 +6942,10 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     struct SparsePackPrepared {
         chunk_len: usize,
         section_count: usize,
-        table_index_offset: usize,
-        table_data_offset: usize,
-        section_index_offset: usize,
+        table_data_stream_offset: usize,
+        section_index_stream_offset: usize,
+        section_index_cap_len: usize,
+        section_cmd_cap_len: usize,
         total_len_cap: usize,
         total_bytes_cap: u64,
         table_count: usize,
@@ -6983,8 +6953,17 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         table_data_len: usize,
     }
 
-    struct SparsePackDispatchJob {
-        scratch: GpuSparsePackScratch,
+    #[derive(Clone, Copy)]
+    struct SparsePackHostJob {
+        section_meta_words_off: usize,
+        table_index_off: usize,
+        table_data_off: usize,
+        section_index_off: usize,
+        out_lens_words_off: usize,
+        section_prefix_words_off: usize,
+        section_offsets_words_off: usize,
+        out_cmd_off: usize,
+        out_base_word: usize,
     }
 
     let r = runtime()?;
@@ -7004,38 +6983,26 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let lens_copy_ms;
 
     let t_prepare = Instant::now();
-    let table_size_resolve_ms = 0.0_f64;
+    let packed_tables: Vec<&GpuPackedTableDevice> =
+        inputs.iter().map(|input| input.table).collect();
+    let (resolved_table_sizes, resolve_profile) = resolve_packed_table_sizes_batch(&packed_tables)?;
+    let table_size_resolve_ms = resolve_profile.total_ms;
     let mut prepared = Vec::<SparsePackPrepared>::with_capacity(inputs.len());
-    for input in inputs {
-        let (table_count, table_index_len, table_data_len) = if input.table.sizes_known
-            || input.table.table_count > 0
-            || input.table.table_index_len > 0
-            || input.table.table_data_len > 0
-        {
-            (
-                input.table.table_count,
-                input.table.table_index_len,
-                input.table.table_data_len,
-            )
-        } else {
-            (
-                input.table.max_entries,
-                input.table.max_entries,
-                input.table.table_data_bytes_cap,
-            )
-        };
+    for (input, &(table_count, table_index_len, table_data_len)) in
+        inputs.iter().zip(resolved_table_sizes.iter())
+    {
         let table_index_offset = PACK_CHUNK_HEADER_SIZE;
-        let table_data_offset = table_index_offset
+        let table_data_stream_offset = table_index_offset
             .checked_add(table_index_len)
             .ok_or(PDeflateError::NumericOverflow)?;
-        let section_index_offset = table_data_offset
+        let section_index_stream_offset = table_data_stream_offset
             .checked_add(table_data_len)
             .ok_or(PDeflateError::NumericOverflow)?;
         let section_index_cap_len = usize::try_from(input.section.section_index_cap_bytes)
             .map_err(|_| PDeflateError::NumericOverflow)?;
         let section_cmd_cap_len = usize::try_from(input.section.out_cmd_bytes.max(4))
             .map_err(|_| PDeflateError::NumericOverflow)?;
-        let section_cmd_offset_cap = section_index_offset
+        let section_cmd_offset_cap = section_index_stream_offset
             .checked_add(section_index_cap_len)
             .ok_or(PDeflateError::NumericOverflow)?;
         let total_len_cap = section_cmd_offset_cap
@@ -7057,9 +7024,10 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         prepared.push(SparsePackPrepared {
             chunk_len: input.chunk_len,
             section_count: input.section_count,
-            table_index_offset,
-            table_data_offset,
-            section_index_offset,
+            table_data_stream_offset,
+            section_index_stream_offset,
+            section_index_cap_len,
+            section_cmd_cap_len,
             total_len_cap,
             total_bytes_cap: total_bytes,
             table_count,
@@ -7070,15 +7038,104 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let prepare_ms = elapsed_ms(t_prepare);
     let prepare_misc_ms = (prepare_ms - table_size_resolve_ms).max(0.0);
 
-    let t_scratch_acquire = Instant::now();
-    let mut acquired_scratch = Vec::<GpuSparsePackScratch>::with_capacity(prepared.len());
-    for prep in prepared.iter() {
-        let caps = GpuSparsePackScratchCaps {
-            params_bytes: 52,
-            out_bytes: prep.total_bytes_cap,
-        };
-        acquired_scratch.push(acquire_sparse_pack_scratch(r, caps)?);
+    let mut section_meta_total_bytes = 0u64;
+    let mut table_index_total_bytes = 0u64;
+    let mut table_data_total_bytes = 0u64;
+    let mut section_index_total_bytes = 0u64;
+    let mut out_lens_total_bytes = 0u64;
+    let mut section_prefix_total_bytes = 0u64;
+    let mut section_offsets_total_bytes = 0u64;
+    let mut out_cmd_total_bytes = 0u64;
+    let mut out_total_bytes = 0u64;
+    let mut host_jobs = Vec::<SparsePackHostJob>::with_capacity(inputs.len());
+    for (input, prep) in inputs.iter().zip(prepared.iter()) {
+        let section_meta_words_off = usize::try_from(section_meta_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let table_index_off = align_up4(
+            usize::try_from(table_index_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
+        let table_data_off = align_up4(
+            usize::try_from(table_data_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
+        let section_index_off = usize::try_from(section_index_total_bytes)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_lens_words_off = usize::try_from(out_lens_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let section_prefix_words_off = usize::try_from(section_prefix_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let section_offsets_words_off = usize::try_from(section_offsets_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_cmd_off =
+            usize::try_from(out_cmd_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_base_word =
+            usize::try_from(out_total_bytes / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        host_jobs.push(SparsePackHostJob {
+            section_meta_words_off,
+            table_index_off,
+            table_data_off,
+            section_index_off,
+            out_lens_words_off,
+            section_prefix_words_off,
+            section_offsets_words_off,
+            out_cmd_off,
+            out_base_word,
+        });
+        section_meta_total_bytes = section_meta_total_bytes.saturating_add(16);
+        table_index_total_bytes = u64::try_from(
+            table_index_off
+                .checked_add(align_up4(prep.table_index_len))
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+        table_data_total_bytes = u64::try_from(
+            table_data_off
+                .checked_add(align_up4(prep.table_data_len))
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+        section_index_total_bytes =
+            section_index_total_bytes.saturating_add(input.section.section_index_cap_bytes.max(4));
+        out_lens_total_bytes =
+            out_lens_total_bytes.saturating_add(input.section.out_lens_bytes.max(4));
+        section_prefix_total_bytes =
+            section_prefix_total_bytes.saturating_add(input.section.out_lens_bytes.max(4));
+        section_offsets_total_bytes =
+            section_offsets_total_bytes.saturating_add(input.section.out_lens_bytes.max(4));
+        out_cmd_total_bytes =
+            out_cmd_total_bytes.saturating_add(input.section.out_cmd_bytes.max(4));
+        out_total_bytes = out_total_bytes.saturating_add(prep.total_bytes_cap.max(4));
     }
+
+    let t_scratch_acquire = Instant::now();
+    let scratch = acquire_sparse_pack_scratch(
+        r,
+        GpuSparsePackScratchCaps {
+            desc_bytes: u64::try_from(
+                4usize.saturating_add(
+                    inputs
+                        .len()
+                        .saturating_mul(GPU_SPARSE_PACK_BATCH_DESC_WORDS * 4),
+                ),
+            )
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+            section_meta_bytes: section_meta_total_bytes.max(4),
+            table_index_bytes: table_index_total_bytes.max(4),
+            table_data_bytes: table_data_total_bytes.max(4),
+            section_index_bytes: section_index_total_bytes.max(4),
+            out_lens_bytes: out_lens_total_bytes.max(4),
+            section_prefix_bytes: section_prefix_total_bytes.max(4),
+            section_offsets_bytes: section_offsets_total_bytes.max(4),
+            out_cmd_bytes: out_cmd_total_bytes.max(4),
+            result_bytes: u64::try_from(
+                inputs
+                    .len()
+                    .saturating_mul(GPU_SPARSE_PACK_BATCH_RESULT_WORDS * 4),
+            )
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .max(4),
+            out_bytes: out_total_bytes.max(4),
+        },
+    )?;
     let scratch_acquire_ms = elapsed_ms(t_scratch_acquire);
 
     let sparse_probe = sparse_probe_enabled();
@@ -7147,10 +7204,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     } else {
         None
     };
-    let sparse_ts_query_count = u32::try_from(inputs.len())
-        .ok()
-        .and_then(|n| n.checked_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT))
-        .unwrap_or(0);
+    let sparse_ts_query_count = if sparse_kernel_ts_probe { 4 } else { 0 };
     let mut sparse_ts_prepare_kernel_ms = 0.0_f64;
     let mut sparse_ts_kernel_ms = 0.0_f64;
     let mut sparse_ts_parse_ms = 0.0_f64;
@@ -7179,16 +7233,52 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         }));
     }
 
-    let t_upload = Instant::now();
-    let sparse_submit_chunk = sparse_inflight_submit_chunks().max(1);
-    let mut encoder = r
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-batch-encoder"),
-        });
-    let mut encoder_has_work = false;
-    let mut chunk_encoded = 0usize;
-    let mut dispatch_jobs = Vec::<SparsePackDispatchJob>::with_capacity(inputs.len());
+    let mut desc_words =
+        vec![0u32; 1usize.saturating_add(inputs.len() * GPU_SPARSE_PACK_BATCH_DESC_WORDS)];
+    desc_words[0] = u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?;
+    for (idx, (prep, host)) in prepared.iter().zip(host_jobs.iter()).enumerate() {
+        let base = 1 + idx * GPU_SPARSE_PACK_BATCH_DESC_WORDS;
+        desc_words[base] =
+            u32::try_from(prep.section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 1] =
+            u32::try_from(prep.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 2] =
+            u32::try_from(prep.table_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 3] =
+            u32::try_from(host.table_index_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 4] =
+            u32::try_from(prep.table_index_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 5] =
+            u32::try_from(host.table_data_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 6] =
+            u32::try_from(prep.table_data_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 7] = u32::try_from(host.section_meta_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 8] =
+            u32::try_from(host.section_index_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 9] = u32::try_from(prep.section_index_cap_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 10] =
+            u32::try_from(host.out_lens_words_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 11] = u32::try_from(host.section_prefix_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 12] = u32::try_from(host.section_offsets_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 13] =
+            u32::try_from(host.out_cmd_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 14] =
+            u32::try_from(prep.section_cmd_cap_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 15] =
+            u32::try_from(host.out_base_word).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 16] =
+            u32::try_from(prep.total_bytes_cap / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 17] = if sparse_probe { 1 } else { 0 };
+        desc_words[base + 18] = u32::try_from(prep.table_data_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 19] = u32::try_from(prep.section_index_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+    }
+
     let mut sparse_submit_seq = 0u64;
     let mut sparse_submit_seq_last = 0u64;
     let mut sparse_submit_count = 0usize;
@@ -7202,205 +7292,210 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             pre_wait_latest_build_submit_ms = elapsed_ms(t_pre_wait);
         }
     }
-    for ((dispatch_idx, (input, prep)), scratch) in inputs
-        .iter()
-        .zip(prepared.iter())
-        .enumerate()
-        .zip(acquired_scratch.into_iter())
-    {
-        let section_index_cap_len = usize::try_from(input.section.section_index_cap_bytes)
-            .map_err(|_| PDeflateError::NumericOverflow)?;
-        let section_cmd_cap_len = usize::try_from(input.section.out_cmd_bytes.max(4))
-            .map_err(|_| PDeflateError::NumericOverflow)?;
-        let total_words_cap =
-            u32::try_from(prep.total_bytes_cap / 4).map_err(|_| PDeflateError::NumericOverflow)?;
-        let params_cap = [
-            u32::try_from(prep.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.table_count).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.section_count).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.table_index_offset).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.table_index_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.table_data_offset).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.table_data_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.section_index_offset).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(section_index_cap_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(section_cmd_cap_len).map_err(|_| PDeflateError::NumericOverflow)?,
-            u32::try_from(prep.total_len_cap).map_err(|_| PDeflateError::NumericOverflow)?,
-            total_words_cap,
-            if sparse_probe { 1 } else { 0 },
-        ];
 
-        let prepare_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-prepare-bg"),
-            layout: &r.pack_sparse_prepare_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: scratch.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input.section.section_meta_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: scratch.dispatch_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: input.table.table_meta_buffer.as_entire_binding(),
-                },
-            ],
-        });
+    let result_readback_bytes = u64::try_from(
+        inputs
+            .len()
+            .saturating_mul(GPU_SPARSE_PACK_BATCH_RESULT_WORDS * 4),
+    )
+    .map_err(|_| PDeflateError::NumericOverflow)?
+    .max(4);
+    let max_total_words_cap = prepared.iter().fold(1u32, |acc, prep| {
+        acc.max(u32::try_from(prep.total_bytes_cap / 4).unwrap_or(u32::MAX))
+    });
+    let pack_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cozip-pdeflate-pack-sparse-batch-bg"),
+        layout: &r.pack_sparse_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: scratch.desc_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: scratch.result_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: scratch.table_index_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: scratch.table_data_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: scratch.section_index_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: scratch.out_lens_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: scratch.section_prefix_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: scratch.section_offsets_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: scratch.out_cmd_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: scratch.out_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: sparse_stats_buffer
+                    .as_ref()
+                    .unwrap_or(&r.pack_sparse_stats_zero_buffer)
+                    .as_entire_binding(),
+            },
+        ],
+    });
 
-        let bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-bg"),
-            layout: &r.pack_sparse_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: scratch.params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input.section.section_meta_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: input.table.table_index_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: input.table.table_data_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: input.section.section_index_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: input.section.out_lens_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: input.section.section_prefix_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: input.section.section_offsets_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: input.section.out_cmd_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: scratch.out_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: sparse_stats_buffer
-                        .as_ref()
-                        .unwrap_or(&r.pack_sparse_stats_zero_buffer)
-                        .as_entire_binding(),
-                },
-            ],
-        });
-
-        r.queue
-            .write_buffer(&scratch.params_buffer, 0, bytemuck::cast_slice(&params_cap));
-
-        let stage_base = u32::try_from(dispatch_idx)
-            .ok()
-            .and_then(|v| v.checked_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT))
-            .unwrap_or(0);
-        if let Some(query_set) = sparse_ts_query_set.as_ref() {
-            if stage_base.saturating_add(3) < sparse_ts_query_count {
-                encoder.write_timestamp(query_set, stage_base);
-            }
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cozip-pdeflate-pack-sparse-prepare-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&r.pack_sparse_prepare_pipeline);
-            pass.set_bind_group(0, &prepare_bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        if let Some(query_set) = sparse_ts_query_set.as_ref() {
-            if stage_base.saturating_add(3) < sparse_ts_query_count {
-                encoder.write_timestamp(query_set, stage_base + 1);
-                encoder.write_timestamp(query_set, stage_base + 2);
-            }
-        }
-        encoder.copy_buffer_to_buffer(
-            &scratch.params_buffer,
-            0,
-            &scratch.params_readback_buffer,
-            0,
-            48,
-        );
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("cozip-pdeflate-pack-sparse-pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&r.pack_sparse_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups_indirect(&scratch.dispatch_buffer, 0);
-        }
-        if let Some(query_set) = sparse_ts_query_set.as_ref() {
-            if stage_base.saturating_add(3) < sparse_ts_query_count {
-                encoder.write_timestamp(query_set, stage_base + 3);
-            }
-        }
-        dispatch_jobs.push(SparsePackDispatchJob { scratch });
-        encoder_has_work = true;
-        chunk_encoded = chunk_encoded.saturating_add(1);
-        if chunk_encoded >= sparse_submit_chunk {
-            let t_submit_chunk = Instant::now();
-            let submit_seq = next_gpu_submit_seq();
-            if sparse_submit_seq == 0 {
-                sparse_submit_seq = submit_seq;
-            }
-            sparse_submit_seq_last = submit_seq;
-            r.queue.submit(Some(encoder.finish()));
-            submit_ms += elapsed_ms(t_submit_chunk);
-            sparse_submit_count = sparse_submit_count.saturating_add(1);
-            encoder = r
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("cozip-pdeflate-pack-sparse-batch-encoder"),
-                });
-            encoder_has_work = false;
-            chunk_encoded = 0;
-        }
+    let t_upload = Instant::now();
+    r.queue
+        .write_buffer(&scratch.desc_buffer, 0, bytemuck::cast_slice(&desc_words));
+    if let Some(stats_buffer) = sparse_stats_buffer.as_ref() {
+        let zeros = [0u8; 32];
+        r.queue.write_buffer(stats_buffer, 0, &zeros);
     }
-    if encoder_has_work {
-        let t_submit_chunk = Instant::now();
-        let submit_seq = next_gpu_submit_seq();
-        if sparse_submit_seq == 0 {
-            sparse_submit_seq = submit_seq;
-        }
-        sparse_submit_seq_last = submit_seq;
-        r.queue.submit(Some(encoder.finish()));
-        submit_ms += elapsed_ms(t_submit_chunk);
-        sparse_submit_count = sparse_submit_count.saturating_add(1);
-    }
-
-    let mut post_encoder = r
+    let mut encoder = r
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-post-encoder"),
+            label: Some("cozip-pdeflate-pack-sparse-batch-encoder"),
         });
-    let mut post_encoder_has_work = false;
+    for ((input, prep), host) in inputs.iter().zip(prepared.iter()).zip(host_jobs.iter()) {
+        encoder.copy_buffer_to_buffer(
+            &input.section.section_meta_buffer,
+            0,
+            &scratch.section_meta_buffer,
+            u64::try_from(host.section_meta_words_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .saturating_mul(4),
+            16,
+        );
+        if prep.table_index_len > 0 {
+            encoder.copy_buffer_to_buffer(
+                &input.table.table_index_buffer,
+                0,
+                &scratch.table_index_buffer,
+                u64::try_from(host.table_index_off).map_err(|_| PDeflateError::NumericOverflow)?,
+                u64::try_from(align_up4(prep.table_index_len))
+                    .map_err(|_| PDeflateError::NumericOverflow)?,
+            );
+        }
+        if prep.table_data_len > 0 {
+            encoder.copy_buffer_to_buffer(
+                &input.table.table_data_buffer,
+                0,
+                &scratch.table_data_buffer,
+                u64::try_from(host.table_data_off).map_err(|_| PDeflateError::NumericOverflow)?,
+                u64::try_from(align_up4(prep.table_data_len))
+                    .map_err(|_| PDeflateError::NumericOverflow)?,
+            );
+        }
+        let section_index_copy_bytes = input.section.section_index_cap_bytes.max(4);
+        encoder.copy_buffer_to_buffer(
+            &input.section.section_index_buffer,
+            0,
+            &scratch.section_index_buffer,
+            u64::try_from(host.section_index_off).map_err(|_| PDeflateError::NumericOverflow)?,
+            section_index_copy_bytes,
+        );
+        let lens_copy_bytes = input.section.out_lens_bytes.max(4);
+        let lens_copy_words = u64::try_from(host.out_lens_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        encoder.copy_buffer_to_buffer(
+            &input.section.out_lens_buffer,
+            0,
+            &scratch.out_lens_buffer,
+            lens_copy_words,
+            lens_copy_bytes,
+        );
+        let prefix_copy_words = u64::try_from(host.section_prefix_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        encoder.copy_buffer_to_buffer(
+            &input.section.section_prefix_buffer,
+            0,
+            &scratch.section_prefix_buffer,
+            prefix_copy_words,
+            lens_copy_bytes,
+        );
+        let offsets_copy_words = u64::try_from(host.section_offsets_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        encoder.copy_buffer_to_buffer(
+            &input.section.section_offsets_buffer,
+            0,
+            &scratch.section_offsets_buffer,
+            offsets_copy_words,
+            lens_copy_bytes,
+        );
+        let out_cmd_copy_bytes = input.section.out_cmd_bytes.max(4);
+        encoder.copy_buffer_to_buffer(
+            &input.section.out_cmd_buffer,
+            0,
+            &scratch.out_cmd_buffer,
+            u64::try_from(host.out_cmd_off).map_err(|_| PDeflateError::NumericOverflow)?,
+            out_cmd_copy_bytes,
+        );
+    }
+    if let Some(query_set) = sparse_ts_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 0);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-prepare-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&r.pack_sparse_prepare_pipeline);
+        pass.set_bind_group(0, &scratch.prepare_bind_group, &[]);
+        let groups_x = u32::try_from(inputs.len().div_ceil(64))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .max(1);
+        pass.dispatch_workgroups(groups_x, 1, 1);
+    }
+    if let Some(query_set) = sparse_ts_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 1);
+    }
+    encoder.copy_buffer_to_buffer(
+        &scratch.result_buffer,
+        0,
+        &scratch.result_readback_buffer,
+        0,
+        result_readback_bytes,
+    );
+    if let Some(query_set) = sparse_ts_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 2);
+    }
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&r.pack_sparse_pipeline);
+        pass.set_bind_group(0, &pack_bind_group, &[]);
+        pass.dispatch_workgroups(
+            max_total_words_cap.div_ceil(256).max(1),
+            u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+            1,
+        );
+    }
+    if let Some(query_set) = sparse_ts_query_set.as_ref() {
+        encoder.write_timestamp(query_set, 3);
+    }
     if let (Some(stats_buffer), Some(stats_readback)) = (
         sparse_stats_buffer.as_ref(),
         sparse_stats_readback_buffer.as_ref(),
     ) {
-        post_encoder.copy_buffer_to_buffer(stats_buffer, 0, stats_readback, 0, 32);
-        post_encoder_has_work = true;
+        encoder.copy_buffer_to_buffer(stats_buffer, 0, stats_readback, 0, 32);
     }
     if let (Some(query_set), Some(resolve_buffer), Some(readback_buffer)) = (
         sparse_ts_query_set.as_ref(),
@@ -7408,25 +7503,17 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         sparse_ts_readback_buffer.as_ref(),
     ) {
         let ts_bytes = u64::from(sparse_ts_query_count).saturating_mul(8).max(8);
-        post_encoder.resolve_query_set(query_set, 0..sparse_ts_query_count, resolve_buffer, 0);
-        post_encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, ts_bytes);
-        post_encoder_has_work = true;
+        encoder.resolve_query_set(query_set, 0..sparse_ts_query_count, resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(resolve_buffer, 0, readback_buffer, 0, ts_bytes);
     }
-    if post_encoder_has_work {
-        let t_submit_post = Instant::now();
-        let submit_seq = next_gpu_submit_seq();
-        if sparse_submit_seq == 0 {
-            sparse_submit_seq = submit_seq;
-        }
-        sparse_submit_seq_last = submit_seq;
-        r.queue.submit(Some(post_encoder.finish()));
-        submit_ms += elapsed_ms(t_submit_post);
-        sparse_submit_count = sparse_submit_count.saturating_add(1);
-    }
-    if sparse_submit_seq == 0 {
-        sparse_submit_seq = sparse_submit_seq_last;
-    }
-    let mut upload_dispatch_ms = (elapsed_ms(t_upload) - submit_ms).max(0.0);
+    let t_submit_all = Instant::now();
+    let submit_seq = next_gpu_submit_seq();
+    sparse_submit_seq = submit_seq;
+    sparse_submit_seq_last = submit_seq;
+    r.queue.submit(Some(encoder.finish()));
+    submit_ms += elapsed_ms(t_submit_all);
+    sparse_submit_count = 1;
+    let upload_dispatch_ms = (elapsed_ms(t_upload) - submit_ms).max(0.0);
     upload_ms += upload_dispatch_ms;
 
     let mut lens_submit_done_wait_ms = 0.0_f64;
@@ -7438,14 +7525,20 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     let mut phase2_wait_max_ms = 0.0_f64;
     let mut phase1_wait_ready_total = 0usize;
     let mut phase2_wait_ready_total = 0usize;
-    let mut size_slices = Vec::with_capacity(dispatch_jobs.len());
-    let mut size_receivers = Vec::with_capacity(dispatch_jobs.len());
+    let mut phase1_submit_done_wait_ms = 0.0_f64;
+    let phase1_wait_ms;
+    let phase1_map_after_done_ms;
+
+    let result_slice = scratch
+        .result_readback_buffer
+        .slice(..result_readback_bytes);
+    let (result_tx, result_rx) = mpsc::channel();
+    result_slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = result_tx.send(res);
+    });
     let mut sparse_stats_slice = None;
     let mut sparse_stats_receiver = None;
     let mut sparse_stats_pending = false;
-    let mut sparse_ts_slice = None;
-    let mut sparse_ts_receiver = None;
-    let mut sparse_ts_pending = false;
     if let Some(stats_readback) = sparse_stats_readback_buffer.as_ref() {
         let stats_slice = stats_readback.slice(..32);
         let (stats_tx, stats_rx) = mpsc::channel();
@@ -7456,6 +7549,9 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         sparse_stats_receiver = Some(stats_rx);
         sparse_stats_pending = true;
     }
+    let mut sparse_ts_slice = None;
+    let mut sparse_ts_receiver = None;
+    let mut sparse_ts_pending = false;
     if let Some(ts_readback) = sparse_ts_readback_buffer.as_ref() {
         let ts_size = u64::from(sparse_ts_query_count).saturating_mul(8).max(8);
         let ts_slice = ts_readback.slice(..ts_size);
@@ -7467,40 +7563,26 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         sparse_ts_receiver = Some(ts_rx);
         sparse_ts_pending = true;
     }
-    for dispatch in &dispatch_jobs {
-        let size_slice = dispatch.scratch.params_readback_buffer.slice(..48);
-        let (tx, rx) = mpsc::channel();
-        size_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        size_slices.push(size_slice);
-        size_receivers.push(rx);
-    }
     let t_lens_wait_phase1 = Instant::now();
-    let mut phase1_submit_done_wait_ms = 0.0_f64;
-    let mut pending_sizes = vec![true; size_receivers.len()];
-    let mut remaining_sizes = size_receivers.len();
-    while remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending {
+    let mut result_pending = true;
+    while result_pending || sparse_stats_pending || sparse_ts_pending {
         r.device.poll(wgpu::Maintain::Poll);
         lens_poll_calls = lens_poll_calls.saturating_add(1);
         let mut collected = 0usize;
-        for (i, rx) in size_receivers.iter().enumerate() {
-            if pending_sizes[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse size map failed: {e}"))
-                        })?;
-                        pending_sizes[i] = false;
-                        remaining_sizes = remaining_sizes.saturating_sub(1);
-                        collected = collected.saturating_add(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse size map channel closed".to_string(),
-                        ));
-                    }
+        if result_pending {
+            match result_rx.try_recv() {
+                Ok(res) => {
+                    res.map_err(|e| {
+                        PDeflateError::Gpu(format!("gpu sparse size map failed: {e}"))
+                    })?;
+                    result_pending = false;
+                    collected = collected.saturating_add(1);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(PDeflateError::Gpu(
+                        "gpu sparse size map channel closed".to_string(),
+                    ));
                 }
             }
         }
@@ -7552,23 +7634,20 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         phase1_wait_max_ms = phase1_wait_max_ms.max(wait_ms);
         phase1_submit_done_wait_ms += wait_ms;
         let mut collected_after_wait = 0usize;
-        for (i, rx) in size_receivers.iter().enumerate() {
-            if pending_sizes[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse size map failed: {e}"))
-                        })?;
-                        pending_sizes[i] = false;
-                        remaining_sizes = remaining_sizes.saturating_sub(1);
-                        collected_after_wait = collected_after_wait.saturating_add(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse size map channel closed".to_string(),
-                        ));
-                    }
+        if result_pending {
+            match result_rx.try_recv() {
+                Ok(res) => {
+                    res.map_err(|e| {
+                        PDeflateError::Gpu(format!("gpu sparse size map failed: {e}"))
+                    })?;
+                    result_pending = false;
+                    collected_after_wait = collected_after_wait.saturating_add(1);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(PDeflateError::Gpu(
+                        "gpu sparse size map channel closed".to_string(),
+                    ));
                 }
             }
         }
@@ -7611,50 +7690,151 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         }
         phase1_wait_ready_total = phase1_wait_ready_total.saturating_add(collected_after_wait);
         if collected_after_wait == 0
-            && (remaining_sizes > 0 || sparse_stats_pending || sparse_ts_pending)
+            && (result_pending || sparse_stats_pending || sparse_ts_pending)
         {
             return Err(PDeflateError::Gpu(
-                "gpu sparse size/stats pending stalled after wait".to_string(),
+                "gpu sparse result/stats pending stalled after wait".to_string(),
             ));
         }
     }
     lens_submit_done_wait_ms += phase1_submit_done_wait_ms;
-    let phase1_wait_ms = elapsed_ms(t_lens_wait_phase1);
-    let phase1_map_after_done_ms = (phase1_wait_ms - phase1_submit_done_wait_ms).max(0.0);
-    let mut lens_map_after_done_ms = phase1_map_after_done_ms;
+    phase1_wait_ms = elapsed_ms(t_lens_wait_phase1);
+    phase1_map_after_done_ms = (phase1_wait_ms - phase1_submit_done_wait_ms).max(0.0);
 
-    if let Some(ts_slice) = sparse_ts_slice {
-        if sparse_ts_map_status.is_none() {
-            let t_parse = Instant::now();
-            let mapped = ts_slice.get_mapped_range();
-            let ticks: &[u64] = bytemuck::cast_slice(&mapped);
-            let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
-            for dispatch_idx in 0..inputs.len() {
-                let stage_base =
-                    dispatch_idx.saturating_mul(SPARSE_KERNEL_STAGE_QUERY_COUNT as usize);
-                if stage_base + 3 < ticks.len() {
-                    let t0 = ticks[stage_base];
-                    let t1 = ticks[stage_base + 1];
-                    let t2 = ticks[stage_base + 2];
-                    let t3 = ticks[stage_base + 3];
-                    if t1 >= t0 {
-                        sparse_ts_prepare_kernel_ms += (t1 - t0) as f64 * period_ms;
-                    }
-                    if t3 >= t2 {
-                        sparse_ts_kernel_ms += (t3 - t2) as f64 * period_ms;
-                    }
-                }
-            }
-            drop(mapped);
-            sparse_ts_parse_ms = elapsed_ms(t_parse);
+    let t_lens_copy = Instant::now();
+    let mut payload_lens = Vec::<usize>::with_capacity(inputs.len());
+    let mut payload_table_counts = Vec::<usize>::with_capacity(inputs.len());
+    let mut payload_copy_offsets = Vec::<u64>::with_capacity(inputs.len());
+    let mut payload_copy_bytes = Vec::<u64>::with_capacity(inputs.len());
+    let mut payload_readback_bytes = 0u64;
+    let result_mapped = result_slice.get_mapped_range();
+    let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
+    for (idx, prep) in prepared.iter().enumerate() {
+        let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
+        let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
+        let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
+        if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
+            return Err(PDeflateError::Gpu(
+                "gpu sparse size prepare overflow while packing".to_string(),
+            ));
         }
-        if let Some(ts_readback) = sparse_ts_readback_buffer.as_ref() {
-            ts_readback.unmap();
+        let total_len =
+            usize::try_from(total_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+        let total_copy_len = align_up4(total_len);
+        let total_copy_bytes =
+            u64::try_from(total_copy_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        if total_copy_bytes > prep.total_bytes_cap {
+            return Err(PDeflateError::Gpu(
+                "gpu sparse pack produced oversized aligned payload".to_string(),
+            ));
+        }
+        payload_copy_offsets.push(payload_readback_bytes);
+        payload_copy_bytes.push(total_copy_bytes);
+        payload_readback_bytes = payload_readback_bytes
+            .checked_add(total_copy_bytes.max(4))
+            .ok_or(PDeflateError::NumericOverflow)?;
+        payload_lens.push(total_len);
+        payload_table_counts.push(prep.table_count);
+    }
+    drop(result_mapped);
+    scratch.result_readback_buffer.unmap();
+    lens_copy_ms = elapsed_ms(t_lens_copy);
+
+    let payload_readback_bytes = payload_readback_bytes.max(4);
+    let payload_readback_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cozip-pdeflate-pack-sparse-payload-batch-readback"),
+        size: payload_readback_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let t_payload_submit_all = Instant::now();
+    let mut payload_encoder = r
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-payload-batch-readback-encoder"),
+        });
+    for ((host, &dst_off), &copy_bytes) in host_jobs
+        .iter()
+        .zip(payload_copy_offsets.iter())
+        .zip(payload_copy_bytes.iter())
+    {
+        payload_encoder.copy_buffer_to_buffer(
+            &scratch.out_buffer,
+            u64::try_from(host.out_base_word)
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .saturating_mul(4),
+            &payload_readback_buffer,
+            dst_off,
+            copy_bytes.max(4),
+        );
+    }
+    let t_payload_submit = Instant::now();
+    let payload_submit_seq = next_gpu_submit_seq();
+    sparse_submit_seq_last = payload_submit_seq;
+    r.queue.submit(Some(payload_encoder.finish()));
+    let payload_submit_ms = elapsed_ms(t_payload_submit);
+    submit_ms += payload_submit_ms;
+    sparse_submit_count = 2;
+    upload_ms += (elapsed_ms(t_payload_submit_all) - payload_submit_ms).max(0.0);
+
+    let payload_slice = payload_readback_buffer.slice(..payload_readback_bytes);
+    let (out_tx, out_rx) = mpsc::channel();
+    payload_slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = out_tx.send(res);
+    });
+    let t_lens_wait_phase2 = Instant::now();
+    let mut phase2_submit_done_wait_ms = 0.0_f64;
+    let mut payload_pending = true;
+    while payload_pending {
+        r.device.poll(wgpu::Maintain::Poll);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        match out_rx.try_recv() {
+            Ok(res) => {
+                res.map_err(|e| {
+                    PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
+                })?;
+                payload_pending = false;
+                continue;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(PDeflateError::Gpu(
+                    "gpu sparse chunk pack map channel closed".to_string(),
+                ));
+            }
+        }
+        let t_wait = Instant::now();
+        r.device.poll(wgpu::Maintain::Wait);
+        let wait_ms = elapsed_ms(t_wait);
+        lens_poll_calls = lens_poll_calls.saturating_add(1);
+        phase2_wait_calls = phase2_wait_calls.saturating_add(1);
+        phase2_wait_max_ms = phase2_wait_max_ms.max(wait_ms);
+        phase2_submit_done_wait_ms += wait_ms;
+        match out_rx.try_recv() {
+            Ok(res) => {
+                res.map_err(|e| {
+                    PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
+                })?;
+                payload_pending = false;
+                phase2_wait_ready_total = phase2_wait_ready_total.saturating_add(1);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                return Err(PDeflateError::Gpu(
+                    "gpu sparse payload pending stalled after wait".to_string(),
+                ));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(PDeflateError::Gpu(
+                    "gpu sparse chunk pack map channel closed".to_string(),
+                ));
+            }
         }
     }
-    let sparse_ts_kernel_total_ms = sparse_ts_prepare_kernel_ms + sparse_ts_kernel_ms;
-    let sparse_ts_queue_stall_est_ms =
-        (phase1_submit_done_wait_ms - sparse_ts_kernel_total_ms).max(0.0);
+    lens_submit_done_wait_ms += phase2_submit_done_wait_ms;
+    let phase2_wait_ms = elapsed_ms(t_lens_wait_phase2);
+    let phase2_map_after_done_ms = (phase2_wait_ms - phase2_submit_done_wait_ms).max(0.0);
+    let lens_map_after_done_ms = phase1_map_after_done_ms + phase2_map_after_done_ms;
+    lens_wait_ms = phase1_wait_ms + phase2_wait_ms;
 
     let mut sparse_probe_counters = [0u64; 8];
     if let Some(stats_slice) = sparse_stats_slice {
@@ -7668,167 +7848,42 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             stats_readback.unmap();
         }
     }
-
-    let t_lens_copy = Instant::now();
-    let mut payload_lens = Vec::<usize>::with_capacity(dispatch_jobs.len());
-    let mut payload_copy_bytes = Vec::<u64>::with_capacity(dispatch_jobs.len());
-    let mut payload_table_counts = Vec::<usize>::with_capacity(dispatch_jobs.len());
-    for (idx, prep) in prepared.iter().enumerate() {
-        let size_mapped = size_slices[idx].get_mapped_range();
-        let size_words: &[u32] = bytemuck::cast_slice(&size_mapped);
-        let table_count_u32 = *size_words.get(1).unwrap_or(&0);
-        let total_len_u32 = *size_words.get(10).unwrap_or(&0xffff_ffff);
-        let total_words_u32 = *size_words.get(11).unwrap_or(&0);
-        drop(size_mapped);
-        dispatch_jobs[idx].scratch.params_readback_buffer.unmap();
-        payload_table_counts
-            .push(usize::try_from(table_count_u32).map_err(|_| PDeflateError::NumericOverflow)?);
-
-        if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
-            return Err(PDeflateError::Gpu(
-                "gpu sparse size prepare overflow while packing".to_string(),
-            ));
-        }
-
-        let total_len =
-            usize::try_from(total_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-        let total_copy_len = align_up4(total_len);
-        let total_copy_bytes =
-            u64::try_from(total_copy_len).map_err(|_| PDeflateError::NumericOverflow)?;
-        if total_copy_bytes > prep.total_bytes_cap {
-            return Err(PDeflateError::Gpu(
-                "gpu sparse pack produced oversized aligned payload".to_string(),
-            ));
-        }
-        payload_lens.push(total_len);
-        payload_copy_bytes.push(total_copy_bytes.max(4));
-    }
-    lens_copy_ms = elapsed_ms(t_lens_copy);
-
-    let t_payload_submit_all = Instant::now();
-    let mut payload_encoder = r
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-payload-readback-encoder"),
-        });
-    for (idx, dispatch) in dispatch_jobs.iter().enumerate() {
-        payload_encoder.copy_buffer_to_buffer(
-            &dispatch.scratch.out_buffer,
-            0,
-            &dispatch.scratch.readback_buffer,
-            0,
-            payload_copy_bytes[idx],
-        );
-    }
-    let t_payload_submit = Instant::now();
-    let payload_readback_submit_seq = next_gpu_submit_seq();
-    r.queue.submit(Some(payload_encoder.finish()));
-    let payload_submit_ms = elapsed_ms(t_payload_submit);
-    submit_ms += payload_submit_ms;
-    let payload_upload_dispatch_ms =
-        (elapsed_ms(t_payload_submit_all) - payload_submit_ms).max(0.0);
-    upload_ms += payload_upload_dispatch_ms;
-    upload_dispatch_ms += payload_upload_dispatch_ms;
-
-    let t_lens_wait_phase2 = Instant::now();
-    let mut phase2_submit_done_wait_ms = 0.0_f64;
-    let mut out_slices = Vec::with_capacity(dispatch_jobs.len());
-    let mut out_receivers = Vec::with_capacity(dispatch_jobs.len());
-    for (idx, dispatch) in dispatch_jobs.iter().enumerate() {
-        let out_slice = dispatch
-            .scratch
-            .readback_buffer
-            .slice(..payload_copy_bytes[idx]);
-        let (out_tx, out_rx) = mpsc::channel();
-        out_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = out_tx.send(res);
-        });
-        out_slices.push(out_slice);
-        out_receivers.push(out_rx);
-    }
-    let mut pending_out = vec![true; out_receivers.len()];
-    let mut remaining_out = out_receivers.len();
-    while remaining_out > 0 {
-        r.device.poll(wgpu::Maintain::Poll);
-        lens_poll_calls = lens_poll_calls.saturating_add(1);
-        let mut collected = 0usize;
-        for (i, rx) in out_receivers.iter().enumerate() {
-            if pending_out[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
-                        })?;
-                        pending_out[i] = false;
-                        remaining_out = remaining_out.saturating_sub(1);
-                        collected = collected.saturating_add(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse chunk pack map channel closed".to_string(),
-                        ));
-                    }
+    if let Some(ts_slice) = sparse_ts_slice {
+        if sparse_ts_map_status.is_none() {
+            let t_parse = Instant::now();
+            let mapped = ts_slice.get_mapped_range();
+            let ticks: &[u64] = bytemuck::cast_slice(&mapped);
+            if ticks.len() >= 4 {
+                let period_ms = (r.queue.get_timestamp_period() as f64) / 1_000_000.0;
+                if ticks[1] >= ticks[0] {
+                    sparse_ts_prepare_kernel_ms = (ticks[1] - ticks[0]) as f64 * period_ms;
+                }
+                if ticks[3] >= ticks[2] {
+                    sparse_ts_kernel_ms = (ticks[3] - ticks[2]) as f64 * period_ms;
                 }
             }
+            drop(mapped);
+            sparse_ts_parse_ms = elapsed_ms(t_parse);
         }
-        if collected > 0 {
-            continue;
-        }
-        let t_wait = Instant::now();
-        r.device.poll(wgpu::Maintain::Wait);
-        let wait_ms = elapsed_ms(t_wait);
-        lens_poll_calls = lens_poll_calls.saturating_add(1);
-        phase2_wait_calls = phase2_wait_calls.saturating_add(1);
-        phase2_wait_max_ms = phase2_wait_max_ms.max(wait_ms);
-        phase2_submit_done_wait_ms += wait_ms;
-        let mut collected_after_wait = 0usize;
-        for (i, rx) in out_receivers.iter().enumerate() {
-            if pending_out[i] {
-                match rx.try_recv() {
-                    Ok(res) => {
-                        res.map_err(|e| {
-                            PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}"))
-                        })?;
-                        pending_out[i] = false;
-                        remaining_out = remaining_out.saturating_sub(1);
-                        collected_after_wait = collected_after_wait.saturating_add(1);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(PDeflateError::Gpu(
-                            "gpu sparse chunk pack map channel closed".to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        phase2_wait_ready_total = phase2_wait_ready_total.saturating_add(collected_after_wait);
-        if collected_after_wait == 0 && remaining_out > 0 {
-            return Err(PDeflateError::Gpu(
-                "gpu sparse payload pending stalled after wait".to_string(),
-            ));
+        if let Some(ts_readback) = sparse_ts_readback_buffer.as_ref() {
+            ts_readback.unmap();
         }
     }
-    lens_submit_done_wait_ms += phase2_submit_done_wait_ms;
-    let phase2_wait_ms = elapsed_ms(t_lens_wait_phase2);
-    let phase2_map_after_done_ms = (phase2_wait_ms - phase2_submit_done_wait_ms).max(0.0);
-    lens_map_after_done_ms += phase2_map_after_done_ms;
-    lens_wait_ms = phase1_wait_ms + phase2_wait_ms;
+    let sparse_ts_kernel_total_ms = sparse_ts_prepare_kernel_ms + sparse_ts_kernel_ms;
+    let sparse_ts_queue_stall_est_ms = ((phase1_submit_done_wait_ms + phase2_submit_done_wait_ms)
+        - sparse_ts_kernel_total_ms)
+        .max(0.0);
 
     if sparse_lens_wait_probe {
         let seq = SPARSE_LENS_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
         if table_stage_probe_should_log(seq) {
-            let size_readback_bytes = (dispatch_jobs.len() as u64).saturating_mul(48);
+            let size_readback_bytes = result_readback_bytes;
             let stats_readback_bytes = if sparse_probe { 32u64 } else { 0u64 };
             let ts_readback_bytes = if sparse_kernel_ts_probe {
                 u64::from(sparse_ts_query_count).saturating_mul(8)
             } else {
                 0u64
             };
-            let payload_readback_bytes = payload_copy_bytes
-                .iter()
-                .fold(0u64, |acc, v| acc.saturating_add(*v));
             let readback_bytes = size_readback_bytes
                 .saturating_add(stats_readback_bytes)
                 .saturating_add(ts_readback_bytes)
@@ -7873,10 +7928,10 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                 "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq={} sparse_submit_seq_last={} sparse_submit_count={} payload_submit_seq={} pre_wait_latest_build_submit_ms={:.3} submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms={:.3} map_callback_wait_payload_ms={:.3} map_callback_wait_ms={:.3} sparse_wait_calls={} payload_wait_calls={} sparse_wait_max_ms={:.3} payload_wait_max_ms={:.3} sparse_wait_ready={} payload_wait_ready={} sparse_ts_prepare_kernel_ms={:.3} sparse_ts_kernel_ms={:.3} sparse_ts_kernel_total_ms={:.3} sparse_ts_parse_ms={:.3} sparse_ts_queue_stall_est_ms={:.3} sparse_ts_status={} lens_wait_ms={:.3}",
                 seq,
                 inputs.len(),
-                dispatch_jobs
-                    .len()
+                1usize
                     .saturating_add(if sparse_probe { 1 } else { 0 })
-                    .saturating_add(dispatch_jobs.len()),
+                    .saturating_add(if sparse_kernel_ts_probe { 1 } else { 0 })
+                    .saturating_add(1),
                 (readback_bytes as f64) / 1024.0,
                 (payload_readback_bytes as f64) / 1024.0,
                 build_id_range,
@@ -7885,9 +7940,9 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
                 latest_build_submit_seq,
                 latest_build_id,
                 sparse_submit_seq,
-                sparse_submit_seq_last,
+                payload_submit_seq,
                 sparse_submit_count,
-                payload_readback_submit_seq,
+                sparse_submit_seq_last,
                 pre_wait_latest_build_submit_ms,
                 phase1_submit_done_wait_ms,
                 phase2_submit_done_wait_ms,
@@ -7949,20 +8004,32 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
     wait_ms += sparse_wait_ms;
 
     let t_copy = Instant::now();
-    let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(dispatch_jobs.len());
-    for (idx, dispatch) in dispatch_jobs.iter().enumerate() {
-        let mapped = out_slices[idx].get_mapped_range();
+    let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(inputs.len());
+    let payload_mapped = payload_slice.get_mapped_range();
+    let payload_bytes: &[u8] = &payload_mapped;
+    for (idx, host) in host_jobs.iter().enumerate() {
+        let chunk_base = host
+            .out_base_word
+            .checked_mul(4)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let chunk_copy_len = align_up4(payload_lens[idx]);
+        let chunk_end = chunk_base
+            .checked_add(chunk_copy_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
+            PDeflateError::Gpu("gpu sparse payload batch readback truncated".to_string())
+        })?;
         let payload_len = payload_lens[idx];
         let mut payload = vec![0u8; payload_len];
         payload.copy_from_slice(&mapped[..payload_len]);
-        drop(mapped);
-        dispatch.scratch.readback_buffer.unmap();
         ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
         out.push(GpuSparsePackChunkOutput {
             payload,
             table_count: payload_table_counts[idx],
         });
     }
+    drop(payload_mapped);
+    payload_readback_buffer.unmap();
     let sparse_copy_ms = elapsed_ms(t_copy);
     map_copy_ms += lens_copy_ms + sparse_copy_ms;
 
@@ -8002,9 +8069,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         );
     }
 
-    for job in dispatch_jobs.drain(..) {
-        release_sparse_pack_scratch(r, job.scratch);
-    }
+    release_sparse_pack_scratch(r, scratch);
 
     let total_ms = elapsed_ms(t_total);
     Ok((
@@ -12558,8 +12623,8 @@ pub(crate) fn compute_matches_batch(
             profile: GpuMatchProfile::default(),
         });
     }
-    let t_total = Instant::now();
     let r = runtime()?;
+    let t_total = Instant::now();
     let (packed, _pack_profile) = pack_match_batch_inputs(inputs)?;
     let groups_total = (u32::try_from(packed.total_src_len)
         .map_err(|_| PDeflateError::NumericOverflow)?)
@@ -13049,13 +13114,17 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
 
             let section_count_u64 =
                 u64::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
-            let section_params: [u32; 6] = [
+            let section_params: [u32; 10] = [
                 u32::try_from(chunk_len).map_err(|_| PDeflateError::NumericOverflow)?,
                 u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?,
                 u32::try_from(packed.min_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
                 u32::try_from(packed.max_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
                 u32::try_from(max_cmd_len).map_err(|_| PDeflateError::NumericOverflow)?,
                 src_base_u32,
+                0,
+                0,
+                0,
+                0,
             ];
             let out_lens_bytes = section_count_u64.saturating_mul(4);
             let out_cmd_words = total_cmd_cap_bytes.div_ceil(4);
@@ -13551,6 +13620,1450 @@ pub(crate) fn compute_matches_and_encode_sections_batch(
     }
 }
 
+pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
+    inputs: &[GpuMatchInput<'_>],
+    section_count: usize,
+    max_cmd_len: usize,
+) -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+    if inputs.is_empty() {
+        return Ok(GpuBatchSparsePackOutput {
+            chunks: Vec::new(),
+            match_profile: GpuMatchProfile::default(),
+            section_profile: GpuSectionEncodeProfile::default(),
+            sparse_profile: GpuMatchProfile::default(),
+            sparse_batch_profile: GpuSparsePackBatchProfile::default(),
+            kernel_profile: GpuBatchKernelProfile::default(),
+        });
+    }
+    if section_count == 0 {
+        return Err(PDeflateError::InvalidOptions(
+            "gpu section encode requires section_count > 0",
+        ));
+    }
+
+    struct SparsePackPrepared {
+        chunk_len: usize,
+        section_count: usize,
+        table_data_stream_offset: usize,
+        section_index_stream_offset: usize,
+        section_index_cap_len: usize,
+        section_cmd_cap_len: usize,
+        total_len_cap: usize,
+        total_bytes_cap: u64,
+        table_count: usize,
+        table_index_len: usize,
+        table_data_len: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct SparsePackHostJob {
+        section_meta_words_off: usize,
+        table_index_off: usize,
+        table_data_off: usize,
+        section_index_off: usize,
+        out_lens_words_off: usize,
+        section_prefix_words_off: usize,
+        section_offsets_words_off: usize,
+        out_cmd_off: usize,
+        out_base_word: usize,
+    }
+
+    struct DirectSectionState {
+        chunk_len: usize,
+        src_base_u32: u32,
+        out_lens_bytes: u64,
+        out_cmd_bytes: u64,
+        max_tokens_per_section: u32,
+        max_cmd_words_per_section: u32,
+        prep: SparsePackPrepared,
+        host: SparsePackHostJob,
+        section_offsets_global: Vec<u32>,
+        section_caps: Vec<u32>,
+        section_token_offsets: Vec<u32>,
+        section_token_caps: Vec<u32>,
+    }
+
+    struct DirectSectionGpu {
+        state_idx: usize,
+        bind_group: wgpu::BindGroup,
+        tokenize_bind_group: wgpu::BindGroup,
+        prefix_bind_group: wgpu::BindGroup,
+        scatter_bind_group: wgpu::BindGroup,
+        pack_bind_group: wgpu::BindGroup,
+        meta_bind_group: wgpu::BindGroup,
+    }
+
+    let r = runtime()?;
+    let (packed, pack_profile) = pack_match_batch_inputs(inputs)?;
+    let pack_inputs_ms = pack_profile.total_ms;
+
+    let groups_total = (u32::try_from(packed.total_src_len)
+        .map_err(|_| PDeflateError::NumericOverflow)?)
+    .div_ceil(WORKGROUP_SIZE)
+    .max(1);
+    let groups_x = groups_total.min(65_535);
+    let groups_y = groups_total.div_ceil(groups_x).max(1);
+    let row_stride = groups_x.saturating_mul(WORKGROUP_SIZE);
+    let match_params: [u32; 6] = [
+        u32::try_from(packed.total_src_len).map_err(|_| PDeflateError::NumericOverflow)?,
+        u32::try_from(packed.max_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
+        u32::try_from(packed.min_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
+        row_stride,
+        u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?,
+        u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+    ];
+    let out_len_u64 = u64::try_from(packed.total_src_len)
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .saturating_mul(4);
+    let required_caps = GpuBatchScratchCaps {
+        src_bytes: u64::try_from(packed.src_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        chunk_starts_bytes: u64::try_from(packed.chunk_starts.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_base_bytes: u64::try_from(packed.table_chunk_bases.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_count_bytes: u64::try_from(packed.table_chunk_counts.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_index_offsets_bytes: u64::try_from(packed.table_chunk_index_offsets.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_data_offsets_bytes: u64::try_from(packed.table_chunk_data_offsets.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_meta_bytes: u64::try_from(packed.table_chunk_meta_words.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_index_bytes: u64::try_from(packed.table_index_words_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        prefix_first_bytes: u64::try_from(inputs.len().saturating_mul(PREFIX2_TABLE_SIZE))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_lens_bytes: u64::try_from(packed.total_table_entries)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_offsets_bytes: u64::try_from(packed.total_table_entries)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        table_data_bytes: u64::try_from(packed.table_data_words_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        prep_params_bytes: 4,
+        params_bytes: u64::try_from(match_params.len())
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4),
+        out_bytes: out_len_u64.max(4),
+    };
+
+    let t_batch_scratch = Instant::now();
+    let batch_scratch = acquire_batch_scratch(r, required_caps)?;
+    let batch_scratch_acquire_ms = elapsed_ms(t_batch_scratch);
+
+    let mut uploaded_tables = Vec::<GpuPackedTableDevice>::with_capacity(inputs.len());
+    let mut uploaded_table_idx = Vec::<Option<usize>>::with_capacity(inputs.len());
+    for input in inputs {
+        if input.table_gpu.is_some() {
+            uploaded_table_idx.push(None);
+        } else {
+            let table_index = input.table_index.ok_or_else(|| {
+                PDeflateError::Gpu("gpu sparse direct path missing table_index".to_string())
+            })?;
+            let table_data = input.table_data.ok_or_else(|| {
+                PDeflateError::Gpu("gpu sparse direct path missing table_data".to_string())
+            })?;
+            let gpu_table = upload_packed_table_device(input.table.len(), table_index, table_data)?;
+            uploaded_tables.push(gpu_table);
+            uploaded_table_idx.push(Some(uploaded_tables.len() - 1));
+        }
+    }
+    let packed_tables: Vec<&GpuPackedTableDevice> = inputs
+        .iter()
+        .enumerate()
+        .map(|(idx, input)| match input.table_gpu {
+            Some(table) => table,
+            None => &uploaded_tables[uploaded_table_idx[idx].expect("uploaded table missing")],
+        })
+        .collect();
+
+    let t_sparse_prepare = Instant::now();
+    let (resolved_table_sizes, resolve_profile) = resolve_packed_table_sizes_batch(&packed_tables)?;
+    let table_size_resolve_ms = resolve_profile.total_ms;
+
+    let mut section_meta_total_bytes = 0u64;
+    let mut table_index_total_bytes = 0u64;
+    let mut table_data_total_bytes = 0u64;
+    let mut section_index_total_bytes = 0u64;
+    let mut out_lens_total_bytes = 0u64;
+    let mut section_prefix_total_bytes = 0u64;
+    let mut section_offsets_total_bytes = 0u64;
+    let mut out_cmd_total_bytes = 0u64;
+    let mut out_total_bytes = 0u64;
+    let mut direct_states = Vec::<DirectSectionState>::with_capacity(inputs.len());
+
+    for (chunk_idx, (input, &(table_count, table_index_len, table_data_len))) in
+        inputs.iter().zip(resolved_table_sizes.iter()).enumerate()
+    {
+        let chunk_len = packed.chunk_lens[chunk_idx];
+        let src_base_u32 = packed.chunk_starts[chunk_idx];
+        let table_index_offset = PACK_CHUNK_HEADER_SIZE;
+        let table_data_stream_offset = table_index_offset
+            .checked_add(table_index_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let section_index_stream_offset = table_data_stream_offset
+            .checked_add(table_data_len)
+            .ok_or(PDeflateError::NumericOverflow)?;
+
+        let mut section_offsets_local = vec![0u32; section_count];
+        let mut section_caps = vec![0u32; section_count];
+        let mut section_token_offsets = vec![0u32; section_count];
+        let mut section_token_caps = vec![0u32; section_count];
+        let mut total_cmd_cap_bytes: usize = 0;
+        let mut total_token_cap: usize = 0;
+        let mut max_tokens_per_section: usize = 1;
+        let mut max_cmd_words_per_section: usize = 1;
+        for sec in 0..section_count {
+            let s0 = section_start(sec, section_count, chunk_len);
+            let s1 = section_start(sec + 1, section_count, chunk_len);
+            let sec_len = s1.saturating_sub(s0);
+            let cap_bytes = estimate_section_cmd_cap_bytes(sec_len)?;
+            let aligned = align_up4(total_cmd_cap_bytes);
+            section_offsets_local[sec] =
+                u32::try_from(aligned).map_err(|_| PDeflateError::NumericOverflow)?;
+            section_caps[sec] =
+                u32::try_from(cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
+            total_cmd_cap_bytes = aligned
+                .checked_add(cap_bytes)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            section_token_offsets[sec] =
+                u32::try_from(total_token_cap).map_err(|_| PDeflateError::NumericOverflow)?;
+            let token_cap = sec_len.max(1);
+            section_token_caps[sec] =
+                u32::try_from(token_cap).map_err(|_| PDeflateError::NumericOverflow)?;
+            total_token_cap = total_token_cap
+                .checked_add(token_cap)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            max_tokens_per_section = max_tokens_per_section.max(token_cap);
+            max_cmd_words_per_section =
+                max_cmd_words_per_section.max(align_up4(cap_bytes).div_ceil(4));
+        }
+
+        let section_count_u64 =
+            u64::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_lens_bytes = section_count_u64.saturating_mul(4);
+        let section_index_cap_bytes = u64::try_from(section_count.saturating_mul(5))
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .max(4);
+        let out_cmd_words = total_cmd_cap_bytes.div_ceil(4);
+        let out_cmd_bytes = u64::try_from(out_cmd_words)
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4);
+        if out_cmd_bytes > r.max_storage_binding_size {
+            return Err(PDeflateError::Gpu(format!(
+                "gpu section encode output buffer too large ({} > {})",
+                out_cmd_bytes, r.max_storage_binding_size
+            )));
+        }
+
+        let prep = SparsePackPrepared {
+            chunk_len,
+            section_count,
+            table_data_stream_offset,
+            section_index_stream_offset,
+            section_index_cap_len: usize::try_from(section_index_cap_bytes)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            section_cmd_cap_len: usize::try_from(out_cmd_bytes.max(4))
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            total_len_cap: section_index_stream_offset
+                .checked_add(
+                    usize::try_from(section_index_cap_bytes)
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                )
+                .and_then(|v| v.checked_add(usize::try_from(out_cmd_bytes.max(4)).ok()?))
+                .ok_or(PDeflateError::NumericOverflow)?,
+            total_bytes_cap: u64::try_from(
+                section_index_stream_offset
+                    .checked_add(
+                        usize::try_from(section_index_cap_bytes)
+                            .map_err(|_| PDeflateError::NumericOverflow)?,
+                    )
+                    .and_then(|v| v.checked_add(usize::try_from(out_cmd_bytes.max(4)).ok()?))
+                    .ok_or(PDeflateError::NumericOverflow)?
+                    .div_ceil(4),
+            )
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .saturating_mul(4)
+            .max(4),
+            table_count,
+            table_index_len,
+            table_data_len,
+        };
+
+        let section_meta_words_off = usize::try_from(section_meta_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let table_index_off = align_up4(
+            usize::try_from(table_index_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
+        let table_data_off = align_up4(
+            usize::try_from(table_data_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
+        let section_index_off = usize::try_from(section_index_total_bytes)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_lens_words_off = usize::try_from(out_lens_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let section_prefix_words_off = usize::try_from(section_prefix_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let section_offsets_words_off = usize::try_from(section_offsets_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_cmd_off =
+            usize::try_from(out_cmd_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_base_word =
+            usize::try_from(out_total_bytes / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        let host = SparsePackHostJob {
+            section_meta_words_off,
+            table_index_off,
+            table_data_off,
+            section_index_off,
+            out_lens_words_off,
+            section_prefix_words_off,
+            section_offsets_words_off,
+            out_cmd_off,
+            out_base_word,
+        };
+
+        let section_offsets_global: Vec<u32> = section_offsets_local
+            .iter()
+            .map(|&off| {
+                u32::try_from(
+                    out_cmd_off
+                        .checked_add(
+                            usize::try_from(off).map_err(|_| PDeflateError::NumericOverflow)?,
+                        )
+                        .ok_or(PDeflateError::NumericOverflow)?,
+                )
+                .map_err(|_| PDeflateError::NumericOverflow)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        section_meta_total_bytes = section_meta_total_bytes.saturating_add(16);
+        table_index_total_bytes = u64::try_from(
+            table_index_off
+                .checked_add(align_up4(table_index_len))
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+        table_data_total_bytes = u64::try_from(
+            table_data_off
+                .checked_add(align_up4(table_data_len))
+                .ok_or(PDeflateError::NumericOverflow)?,
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+        section_index_total_bytes =
+            section_index_total_bytes.saturating_add(section_index_cap_bytes.max(4));
+        out_lens_total_bytes = out_lens_total_bytes.saturating_add(out_lens_bytes.max(4));
+        section_prefix_total_bytes =
+            section_prefix_total_bytes.saturating_add(out_lens_bytes.max(4));
+        section_offsets_total_bytes =
+            section_offsets_total_bytes.saturating_add(out_lens_bytes.max(4));
+        out_cmd_total_bytes = out_cmd_total_bytes.saturating_add(out_cmd_bytes.max(4));
+        out_total_bytes = out_total_bytes.saturating_add(prep.total_bytes_cap.max(4));
+
+        direct_states.push(DirectSectionState {
+            chunk_len,
+            src_base_u32,
+            out_lens_bytes,
+            out_cmd_bytes,
+            max_tokens_per_section: u32::try_from(max_tokens_per_section)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            max_cmd_words_per_section: u32::try_from(max_cmd_words_per_section)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            prep,
+            host,
+            section_offsets_global,
+            section_caps,
+            section_token_offsets,
+            section_token_caps,
+        });
+        let _ = input;
+    }
+
+    let t_sparse_scratch = Instant::now();
+    let scratch = acquire_sparse_pack_scratch(
+        r,
+        GpuSparsePackScratchCaps {
+            desc_bytes: u64::try_from(
+                4usize.saturating_add(
+                    inputs
+                        .len()
+                        .saturating_mul(GPU_SPARSE_PACK_BATCH_DESC_WORDS * 4),
+                ),
+            )
+            .map_err(|_| PDeflateError::NumericOverflow)?,
+            section_meta_bytes: section_meta_total_bytes.max(4),
+            table_index_bytes: table_index_total_bytes.max(4),
+            table_data_bytes: table_data_total_bytes.max(4),
+            section_index_bytes: section_index_total_bytes.max(4),
+            out_lens_bytes: out_lens_total_bytes.max(4),
+            section_prefix_bytes: section_prefix_total_bytes.max(4),
+            section_offsets_bytes: section_offsets_total_bytes.max(4),
+            out_cmd_bytes: out_cmd_total_bytes.max(4),
+            result_bytes: u64::try_from(
+                inputs
+                    .len()
+                    .saturating_mul(GPU_SPARSE_PACK_BATCH_RESULT_WORDS * 4),
+            )
+            .map_err(|_| PDeflateError::NumericOverflow)?
+            .max(4),
+            out_bytes: out_total_bytes.max(4),
+        },
+    )?;
+    let sparse_scratch_acquire_ms = elapsed_ms(t_sparse_scratch);
+
+    let sparse_probe = sparse_probe_enabled();
+    let sparse_kernel_ts_probe = sparse_kernel_ts_probe_enabled() && r.supports_timestamp_query;
+    let sparse_lens_wait_probe = sparse_lens_wait_probe_enabled();
+    let sparse_wait_attr_probe = sparse_wait_attribution_probe_enabled();
+    let mut sparse_prebuild_build_id_min = u64::MAX;
+    let mut sparse_prebuild_build_id_max = 0u64;
+    let mut sparse_prebuild_submit_seq_min = u64::MAX;
+    let mut sparse_prebuild_submit_seq_max = 0u64;
+    let mut sparse_latest_build_submit: Option<(u64, u64, wgpu::SubmissionIndex)> = None;
+    let mut sparse_build_ids = Vec::<u64>::with_capacity(inputs.len());
+    for table in &packed_tables {
+        if table.build_id != 0 {
+            sparse_prebuild_build_id_min = sparse_prebuild_build_id_min.min(table.build_id);
+            sparse_prebuild_build_id_max = sparse_prebuild_build_id_max.max(table.build_id);
+            sparse_build_ids.push(table.build_id);
+        }
+        if table.build_submit_seq != 0 {
+            sparse_prebuild_submit_seq_min =
+                sparse_prebuild_submit_seq_min.min(table.build_submit_seq);
+            sparse_prebuild_submit_seq_max =
+                sparse_prebuild_submit_seq_max.max(table.build_submit_seq);
+        }
+        if let Some(submit_index) = table.build_submit_index.clone() {
+            let should_replace = sparse_latest_build_submit
+                .as_ref()
+                .map(|(seq, _, _)| table.build_submit_seq > *seq)
+                .unwrap_or(true);
+            if should_replace {
+                sparse_latest_build_submit =
+                    Some((table.build_submit_seq, table.build_id, submit_index));
+            }
+        }
+    }
+
+    let mut desc_words =
+        vec![0u32; 1usize.saturating_add(inputs.len() * GPU_SPARSE_PACK_BATCH_DESC_WORDS)];
+    desc_words[0] = u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?;
+    for (idx, state) in direct_states.iter().enumerate() {
+        let base = 1 + idx * GPU_SPARSE_PACK_BATCH_DESC_WORDS;
+        let prep = &state.prep;
+        let host = &state.host;
+        desc_words[base] =
+            u32::try_from(prep.section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 1] =
+            u32::try_from(prep.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 2] =
+            u32::try_from(prep.table_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 3] =
+            u32::try_from(host.table_index_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 4] =
+            u32::try_from(prep.table_index_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 5] =
+            u32::try_from(host.table_data_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 6] =
+            u32::try_from(prep.table_data_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 7] = u32::try_from(host.section_meta_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 8] =
+            u32::try_from(host.section_index_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 9] = u32::try_from(prep.section_index_cap_len)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 10] =
+            u32::try_from(host.out_lens_words_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 11] = u32::try_from(host.section_prefix_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 12] = u32::try_from(host.section_offsets_words_off)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 13] =
+            u32::try_from(host.out_cmd_off).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 14] =
+            u32::try_from(prep.section_cmd_cap_len).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 15] =
+            u32::try_from(host.out_base_word).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 16] =
+            u32::try_from(prep.total_bytes_cap / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 17] = if sparse_probe { 1 } else { 0 };
+        desc_words[base + 18] = u32::try_from(prep.table_data_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 19] = u32::try_from(prep.section_index_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+    }
+
+    let pack_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cozip-pdeflate-pack-sparse-batch-bg"),
+        layout: &r.pack_sparse_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: scratch.desc_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: scratch.result_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: scratch.table_index_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: scratch.table_data_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: scratch.section_index_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: scratch.out_lens_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: scratch.section_prefix_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: scratch.section_offsets_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: scratch.out_cmd_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: scratch.out_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: r.pack_sparse_stats_zero_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let t_section_setup = Instant::now();
+    let mut section_upload_ms = 0.0_f64;
+    let mut direct_gpu = Vec::<DirectSectionGpu>::with_capacity(direct_states.len());
+    for (idx, state) in direct_states.iter().enumerate() {
+        let section_count_u64 =
+            u64::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+        let section_offsets_bytes = section_count_u64.saturating_mul(4);
+        let section_caps_bytes = section_count_u64.saturating_mul(4);
+        let section_params_bytes = 40u64;
+        let token_buf_bytes = u64::try_from(
+            usize::try_from(state.max_tokens_per_section)
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .saturating_mul(section_count)
+                .saturating_mul(4),
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .max(4);
+        let out_cmd_byte_buf_bytes = state.out_cmd_bytes.max(4);
+
+        let section_offsets_buffer = storage_upload_buffer(
+            &r.device,
+            "cozip-pdeflate-se-direct-offs",
+            section_offsets_bytes.max(4),
+        );
+        let section_caps_buffer = storage_upload_buffer(
+            &r.device,
+            "cozip-pdeflate-se-direct-caps",
+            section_caps_bytes.max(4),
+        );
+        let section_token_offsets_buffer = storage_upload_buffer(
+            &r.device,
+            "cozip-pdeflate-se-direct-token-offs",
+            section_offsets_bytes.max(4),
+        );
+        let section_token_caps_buffer = storage_upload_buffer(
+            &r.device,
+            "cozip-pdeflate-se-direct-token-caps",
+            section_caps_bytes.max(4),
+        );
+        let section_params_buffer = storage_upload_buffer(
+            &r.device,
+            "cozip-pdeflate-se-direct-params",
+            section_params_bytes.max(4),
+        );
+        let section_token_counts_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-direct-token-counts"),
+            size: state.out_lens_bytes.max(4),
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let section_token_meta_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-direct-token-meta"),
+            size: token_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let section_token_pos_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-direct-token-pos"),
+            size: token_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let section_token_cmd_offsets_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-direct-token-cmd-offs"),
+            size: token_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let out_cmd_byte_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-se-direct-out-cmd-byte"),
+            size: out_cmd_byte_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let section_params: [u32; 10] = [
+            u32::try_from(state.chunk_len).map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(packed.min_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(packed.max_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(max_cmd_len).map_err(|_| PDeflateError::NumericOverflow)?,
+            state.src_base_u32,
+            u32::try_from(state.host.out_lens_words_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(state.host.section_prefix_words_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(state.host.section_index_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+            u32::try_from(state.host.section_meta_words_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?,
+        ];
+
+        let t_upload = Instant::now();
+        r.queue.write_buffer(
+            &section_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&state.section_offsets_global),
+        );
+        r.queue.write_buffer(
+            &section_caps_buffer,
+            0,
+            bytemuck::cast_slice(&state.section_caps),
+        );
+        r.queue.write_buffer(
+            &section_token_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&state.section_token_offsets),
+        );
+        r.queue.write_buffer(
+            &section_token_caps_buffer,
+            0,
+            bytemuck::cast_slice(&state.section_token_caps),
+        );
+        r.queue.write_buffer(
+            &section_params_buffer,
+            0,
+            bytemuck::cast_slice(&section_params),
+        );
+        r.queue.write_buffer(
+            &scratch.section_offsets_buffer,
+            u64::try_from(state.host.section_offsets_words_off)
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .saturating_mul(4),
+            bytemuck::cast_slice(&state.section_offsets_global),
+        );
+        section_upload_ms += elapsed_ms(t_upload);
+
+        let bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-bg"),
+            layout: &r.section_encode_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: batch_scratch.src_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: batch_scratch.out_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: section_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: section_caps_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: scratch.out_lens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: scratch.out_cmd_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let tokenize_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-tokenize-bg"),
+            layout: &r.section_tokenize_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: batch_scratch.src_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: batch_scratch.out_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: section_token_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: section_token_caps_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: section_token_counts_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: section_token_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: section_token_pos_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let prefix_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-prefix-bg"),
+            layout: &r.section_prefix_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: section_token_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: section_token_caps_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: section_token_counts_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: section_token_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: section_token_cmd_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: scratch.out_lens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: section_caps_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let scatter_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-scatter-bg"),
+            layout: &r.section_scatter_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: batch_scratch.src_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: section_token_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: section_token_counts_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: section_token_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: section_token_pos_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: section_token_cmd_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: section_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: section_caps_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: out_cmd_byte_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let pack_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-pack-bg"),
+            layout: &r.section_cmd_pack_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: out_cmd_byte_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: section_offsets_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scratch.out_lens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: scratch.out_cmd_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let meta_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cozip-pdeflate-se-direct-meta-bg"),
+            layout: &r.section_meta_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scratch.out_lens_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: scratch.section_prefix_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scratch.section_index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: scratch.section_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: section_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        direct_gpu.push(DirectSectionGpu {
+            state_idx: idx,
+            bind_group,
+            tokenize_bind_group,
+            prefix_bind_group,
+            scatter_bind_group,
+            pack_bind_group,
+            meta_bind_group,
+        });
+    }
+    let section_setup_ms = elapsed_ms(t_section_setup);
+    let sparse_prepare_total_ms = elapsed_ms(t_sparse_prepare);
+    let sparse_prepare_ms = (sparse_prepare_total_ms - sparse_scratch_acquire_ms).max(0.0);
+
+    let result = (|| -> Result<GpuBatchSparsePackOutput, PDeflateError> {
+        let t_match_upload = Instant::now();
+        r.queue.write_buffer(
+            &batch_scratch.src_buffer,
+            0,
+            bytemuck::cast_slice(&packed.src_words),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.chunk_starts_buffer,
+            0,
+            bytemuck::cast_slice(&packed.chunk_starts),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.table_base_buffer,
+            0,
+            bytemuck::cast_slice(&packed.table_chunk_bases),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.table_count_buffer,
+            0,
+            bytemuck::cast_slice(&packed.table_chunk_counts),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.table_index_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&packed.table_chunk_index_offsets),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.table_data_offsets_buffer,
+            0,
+            bytemuck::cast_slice(&packed.table_chunk_data_offsets),
+        );
+        if !packed.table_chunk_meta_words.is_empty() {
+            r.queue.write_buffer(
+                &batch_scratch.table_meta_buffer,
+                0,
+                bytemuck::cast_slice(&packed.table_chunk_meta_words),
+            );
+        }
+        if !packed.table_index_words.is_empty() {
+            r.queue.write_buffer(
+                &batch_scratch.table_index_buffer,
+                0,
+                bytemuck::cast_slice(&packed.table_index_words),
+            );
+        }
+        if !packed.table_data_words.is_empty() {
+            r.queue.write_buffer(
+                &batch_scratch.table_data_buffer,
+                0,
+                bytemuck::cast_slice(&packed.table_data_words),
+            );
+        }
+        let prep_params: [u32; 1] =
+            [u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?];
+        r.queue.write_buffer(
+            &batch_scratch.prep_params_buffer,
+            0,
+            bytemuck::cast_slice(&prep_params),
+        );
+        r.queue.write_buffer(
+            &batch_scratch.params_buffer,
+            0,
+            bytemuck::cast_slice(&match_params),
+        );
+        r.queue
+            .write_buffer(&scratch.desc_buffer, 0, bytemuck::cast_slice(&desc_words));
+        let match_upload_ms = elapsed_ms(t_match_upload);
+
+        let mut encoder = r
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cozip-pdeflate-match-section-sparse-direct-encoder"),
+            });
+        let t_table_copy = Instant::now();
+        encode_table_device_copies(
+            &mut encoder,
+            &batch_scratch,
+            &packed.table_device_copies,
+            &packed.table_meta_device_copies,
+        )?;
+        let match_table_copy_ms = elapsed_ms(t_table_copy);
+        encoder.clear_buffer(&batch_scratch.prefix_first_buffer, 0, None);
+        encoder.clear_buffer(&batch_scratch.table_lens_buffer, 0, None);
+        encoder.clear_buffer(&batch_scratch.table_offsets_buffer, 0, None);
+
+        let match_prepare_dispatch_ms = {
+            let t_prepare = Instant::now();
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-match-prepare-table-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.match_prepare_table_pipeline);
+            pass.set_bind_group(0, &batch_scratch.prep_bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            drop(pass);
+            elapsed_ms(t_prepare)
+        };
+        let match_kernel_dispatch_ms = {
+            let t_match = Instant::now();
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-match-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.pipeline);
+            pass.set_bind_group(0, &batch_scratch.bind_group, &[]);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
+            drop(pass);
+            elapsed_ms(t_match)
+        };
+
+        for (idx, state) in direct_states.iter().enumerate() {
+            let table = packed_tables[idx];
+            if state.prep.table_index_len > 0 {
+                encoder.copy_buffer_to_buffer(
+                    &table.table_index_buffer,
+                    0,
+                    &scratch.table_index_buffer,
+                    u64::try_from(state.host.table_index_off)
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                    u64::try_from(align_up4(state.prep.table_index_len))
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                );
+            }
+            if state.prep.table_data_len > 0 {
+                encoder.copy_buffer_to_buffer(
+                    &table.table_data_buffer,
+                    0,
+                    &scratch.table_data_buffer,
+                    u64::try_from(state.host.table_data_off)
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                    u64::try_from(align_up4(state.prep.table_data_len))
+                        .map_err(|_| PDeflateError::NumericOverflow)?,
+                );
+            }
+        }
+
+        let mut section_pass_dispatch_ms = 0.0_f64;
+        let mut section_tokenize_dispatch_ms = 0.0_f64;
+        let mut section_prefix_dispatch_ms = 0.0_f64;
+        let mut section_scatter_dispatch_ms = 0.0_f64;
+        let mut section_pack_dispatch_ms = 0.0_f64;
+        let mut section_meta_dispatch_ms = 0.0_f64;
+
+        for gpu_state in &direct_gpu {
+            let state = &direct_states[gpu_state.state_idx];
+            let groups_sections = u32::try_from(section_count)
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .div_ceil(64)
+                .max(1);
+            {
+                let t_stage = Instant::now();
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-pdeflate-se-direct-tokenize-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&r.section_tokenize_pipeline);
+                pass.set_bind_group(0, &gpu_state.tokenize_bind_group, &[]);
+                pass.dispatch_workgroups(groups_sections, 1, 1);
+                drop(pass);
+                let dt = elapsed_ms(t_stage);
+                section_pass_dispatch_ms += dt;
+                section_tokenize_dispatch_ms += dt;
+            }
+            {
+                let t_stage = Instant::now();
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-pdeflate-se-direct-prefix-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&r.section_prefix_pipeline);
+                pass.set_bind_group(0, &gpu_state.prefix_bind_group, &[]);
+                pass.dispatch_workgroups(groups_sections, 1, 1);
+                drop(pass);
+                let dt = elapsed_ms(t_stage);
+                section_pass_dispatch_ms += dt;
+                section_prefix_dispatch_ms += dt;
+            }
+            {
+                let t_stage = Instant::now();
+                let scatter_groups_x = state.max_tokens_per_section.div_ceil(64).max(1);
+                let scatter_groups_y =
+                    u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-pdeflate-se-direct-scatter-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&r.section_scatter_pipeline);
+                pass.set_bind_group(0, &gpu_state.scatter_bind_group, &[]);
+                pass.dispatch_workgroups(scatter_groups_x, scatter_groups_y, 1);
+                drop(pass);
+                let dt = elapsed_ms(t_stage);
+                section_pass_dispatch_ms += dt;
+                section_scatter_dispatch_ms += dt;
+            }
+            {
+                let t_stage = Instant::now();
+                let pack_groups_x = state.max_cmd_words_per_section.div_ceil(64).max(1);
+                let pack_groups_y =
+                    u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-pdeflate-se-direct-pack-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&r.section_cmd_pack_pipeline);
+                pass.set_bind_group(0, &gpu_state.pack_bind_group, &[]);
+                pass.dispatch_workgroups(pack_groups_x, pack_groups_y, 1);
+                drop(pass);
+                let dt = elapsed_ms(t_stage);
+                section_pass_dispatch_ms += dt;
+                section_pack_dispatch_ms += dt;
+            }
+            {
+                let t_stage = Instant::now();
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cozip-pdeflate-se-direct-meta-pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&r.section_meta_pipeline);
+                pass.set_bind_group(0, &gpu_state.meta_bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                drop(pass);
+                let dt = elapsed_ms(t_stage);
+                section_pass_dispatch_ms += dt;
+                section_meta_dispatch_ms += dt;
+            }
+        }
+
+        let result_readback_bytes = u64::try_from(
+            inputs
+                .len()
+                .saturating_mul(GPU_SPARSE_PACK_BATCH_RESULT_WORDS * 4),
+        )
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .max(4);
+        let max_total_words_cap = direct_states.iter().fold(1u32, |acc, state| {
+            acc.max(u32::try_from(state.prep.total_bytes_cap / 4).unwrap_or(u32::MAX))
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-pack-sparse-prepare-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.pack_sparse_prepare_pipeline);
+            pass.set_bind_group(0, &scratch.prepare_bind_group, &[]);
+            let groups_x = u32::try_from(inputs.len().div_ceil(64))
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .max(1);
+            pass.dispatch_workgroups(groups_x, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &scratch.result_buffer,
+            0,
+            &scratch.result_readback_buffer,
+            0,
+            result_readback_bytes,
+        );
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("cozip-pdeflate-pack-sparse-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&r.pack_sparse_pipeline);
+            pass.set_bind_group(0, &pack_bind_group, &[]);
+            pass.dispatch_workgroups(
+                max_total_words_cap.div_ceil(256).max(1),
+                u32::try_from(inputs.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+                1,
+            );
+        }
+
+        let t_submit = Instant::now();
+        r.queue.submit(Some(encoder.finish()));
+        let submit_ms = elapsed_ms(t_submit);
+
+        let result_slice = scratch
+            .result_readback_buffer
+            .slice(..result_readback_bytes);
+        let (result_tx, result_rx) = mpsc::channel();
+        result_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = result_tx.send(res);
+        });
+        let t_wait1 = Instant::now();
+        r.device.poll(wgpu::Maintain::Wait);
+        result_rx
+            .recv()
+            .map_err(|_| PDeflateError::Gpu("gpu sparse size map channel closed".to_string()))?
+            .map_err(|e| PDeflateError::Gpu(format!("gpu sparse size map failed: {e}")))?;
+        let phase1_wait_ms = elapsed_ms(t_wait1);
+
+        let t_lens_copy = Instant::now();
+        let result_mapped = result_slice.get_mapped_range();
+        let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
+        let mut payload_lens = Vec::<usize>::with_capacity(inputs.len());
+        let mut payload_table_counts = Vec::<usize>::with_capacity(inputs.len());
+        let mut payload_copy_offsets = Vec::<u64>::with_capacity(inputs.len());
+        let mut payload_copy_bytes = Vec::<u64>::with_capacity(inputs.len());
+        let mut payload_readback_bytes = 0u64;
+        for (idx, state) in direct_states.iter().enumerate() {
+            let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
+            let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
+            let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
+            if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
+                return Err(PDeflateError::Gpu(
+                    "gpu sparse size prepare overflow while packing".to_string(),
+                ));
+            }
+            let total_len =
+                usize::try_from(total_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+            let total_copy_len = align_up4(total_len);
+            let total_copy_bytes =
+                u64::try_from(total_copy_len).map_err(|_| PDeflateError::NumericOverflow)?;
+            if total_copy_bytes > state.prep.total_bytes_cap {
+                return Err(PDeflateError::Gpu(
+                    "gpu sparse pack produced oversized aligned payload".to_string(),
+                ));
+            }
+            payload_copy_offsets.push(payload_readback_bytes);
+            payload_copy_bytes.push(total_copy_bytes);
+            payload_readback_bytes = payload_readback_bytes
+                .checked_add(total_copy_bytes.max(4))
+                .ok_or(PDeflateError::NumericOverflow)?;
+            payload_lens.push(total_len);
+            payload_table_counts.push(state.prep.table_count);
+        }
+        drop(result_mapped);
+        scratch.result_readback_buffer.unmap();
+        let lens_copy_ms = elapsed_ms(t_lens_copy);
+
+        let payload_readback_bytes = payload_readback_bytes.max(4);
+        let payload_readback_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-direct-payload-readback"),
+            size: payload_readback_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut payload_encoder =
+            r.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cozip-pdeflate-pack-sparse-direct-payload-encoder"),
+                });
+        for (state, (&dst_off, &copy_bytes)) in direct_states
+            .iter()
+            .zip(payload_copy_offsets.iter().zip(payload_copy_bytes.iter()))
+        {
+            payload_encoder.copy_buffer_to_buffer(
+                &scratch.out_buffer,
+                u64::try_from(state.host.out_base_word)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+                &payload_readback_buffer,
+                dst_off,
+                copy_bytes.max(4),
+            );
+        }
+        let t_submit2 = Instant::now();
+        r.queue.submit(Some(payload_encoder.finish()));
+        let payload_submit_ms = elapsed_ms(t_submit2);
+        let payload_slice = payload_readback_buffer.slice(..payload_readback_bytes);
+        let (out_tx, out_rx) = mpsc::channel();
+        payload_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = out_tx.send(res);
+        });
+        let t_wait2 = Instant::now();
+        r.device.poll(wgpu::Maintain::Wait);
+        out_rx
+            .recv()
+            .map_err(|_| {
+                PDeflateError::Gpu("gpu sparse chunk pack map channel closed".to_string())
+            })?
+            .map_err(|e| PDeflateError::Gpu(format!("gpu sparse chunk pack map failed: {e}")))?;
+        let phase2_wait_ms = elapsed_ms(t_wait2);
+
+        let t_copy = Instant::now();
+        let payload_mapped = payload_slice.get_mapped_range();
+        let payload_bytes: &[u8] = &payload_mapped;
+        let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(inputs.len());
+        for (idx, state) in direct_states.iter().enumerate() {
+            let chunk_base = state
+                .host
+                .out_base_word
+                .checked_mul(4)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let chunk_copy_len = align_up4(payload_lens[idx]);
+            let chunk_end = chunk_base
+                .checked_add(chunk_copy_len)
+                .ok_or(PDeflateError::NumericOverflow)?;
+            let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
+                PDeflateError::Gpu("gpu sparse payload batch readback truncated".to_string())
+            })?;
+            let payload_len = payload_lens[idx];
+            let mut payload = vec![0u8; payload_len];
+            payload.copy_from_slice(&mapped[..payload_len]);
+            ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
+            out.push(GpuSparsePackChunkOutput {
+                payload,
+                table_count: payload_table_counts[idx],
+            });
+        }
+        drop(payload_mapped);
+        payload_readback_buffer.unmap();
+        let sparse_copy_ms = elapsed_ms(t_copy);
+
+        let sparse_wait_ms = phase1_wait_ms + phase2_wait_ms;
+        let sparse_submit_ms = submit_ms + payload_submit_ms;
+        let sparse_total_ms = sparse_prepare_ms
+            + sparse_scratch_acquire_ms
+            + sparse_submit_ms
+            + sparse_wait_ms
+            + lens_copy_ms
+            + sparse_copy_ms;
+        let sparse_profile = GpuMatchProfile {
+            upload_ms: 0.0,
+            wait_ms: sparse_wait_ms,
+            map_copy_ms: lens_copy_ms + sparse_copy_ms,
+            total_ms: sparse_total_ms,
+        };
+        let sparse_batch_profile = GpuSparsePackBatchProfile {
+            chunks: inputs.len(),
+            lens_bytes_total: direct_states
+                .iter()
+                .fold(0u64, |acc, s| acc.saturating_add(s.out_lens_bytes.max(4))),
+            out_cmd_bytes_total: direct_states
+                .iter()
+                .fold(0u64, |acc, s| acc.saturating_add(s.out_cmd_bytes.max(4))),
+            lens_submit_ms: sparse_submit_ms,
+            lens_submit_done_wait_ms: sparse_wait_ms,
+            lens_map_after_done_ms: 0.0,
+            lens_poll_calls: 0,
+            lens_yield_calls: 0,
+            lens_wait_ms: sparse_wait_ms,
+            lens_copy_ms,
+            prepare_ms: sparse_prepare_ms,
+            table_size_resolve_ms,
+            prepare_misc_ms: (sparse_prepare_ms - table_size_resolve_ms).max(0.0),
+            scratch_acquire_ms: sparse_scratch_acquire_ms,
+            upload_dispatch_ms: 0.0,
+            submit_ms: sparse_submit_ms,
+            wait_ms: sparse_wait_ms,
+            copy_ms: sparse_copy_ms,
+            total_ms: sparse_total_ms,
+        };
+
+        if sparse_lens_wait_probe {
+            let seq = SPARSE_LENS_WAIT_PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+            if table_stage_probe_should_log(seq) {
+                let readback_bytes = result_readback_bytes.saturating_add(payload_readback_bytes);
+                let build_id_range = if sparse_prebuild_build_id_min != u64::MAX {
+                    format!(
+                        "{}..{}",
+                        sparse_prebuild_build_id_min, sparse_prebuild_build_id_max
+                    )
+                } else {
+                    "none".to_string()
+                };
+                let submit_seq_range = if sparse_prebuild_submit_seq_min != u64::MAX {
+                    format!(
+                        "{}..{}",
+                        sparse_prebuild_submit_seq_min, sparse_prebuild_submit_seq_max
+                    )
+                } else {
+                    "none".to_string()
+                };
+                let build_ids = if sparse_build_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    sparse_build_ids
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let (latest_build_submit_seq, latest_build_id) = sparse_latest_build_submit
+                    .as_ref()
+                    .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
+                    .unwrap_or((0, 0));
+                eprintln!(
+                    "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq=0 sparse_submit_seq_last=0 sparse_submit_count=2 payload_submit_seq=0 pre_wait_latest_build_submit_ms=0.000 submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms=0.000 map_callback_wait_payload_ms=0.000 map_callback_wait_ms=0.000 sparse_wait_calls=0 payload_wait_calls=0 sparse_wait_max_ms=0.000 payload_wait_max_ms=0.000 sparse_wait_ready=0 payload_wait_ready=0 sparse_ts_prepare_kernel_ms=0.000 sparse_ts_kernel_ms=0.000 sparse_ts_kernel_total_ms=0.000 sparse_ts_parse_ms=0.000 sparse_ts_queue_stall_est_ms=0.000 sparse_ts_status={} lens_wait_ms={:.3}",
+                    seq,
+                    inputs.len(),
+                    2,
+                    (readback_bytes as f64) / 1024.0,
+                    (payload_readback_bytes as f64) / 1024.0,
+                    build_id_range,
+                    submit_seq_range,
+                    build_ids,
+                    latest_build_submit_seq,
+                    latest_build_id,
+                    phase1_wait_ms,
+                    phase2_wait_ms,
+                    phase1_wait_ms + phase2_wait_ms,
+                    if sparse_kernel_ts_probe { "on" } else { "off" },
+                    phase1_wait_ms + phase2_wait_ms,
+                );
+            }
+        }
+        let _ = sparse_wait_attr_probe;
+
+        Ok(GpuBatchSparsePackOutput {
+            chunks: out,
+            match_profile: GpuMatchProfile {
+                upload_ms: match_upload_ms,
+                wait_ms: 0.0,
+                map_copy_ms: 0.0,
+                total_ms: match_upload_ms
+                    + match_table_copy_ms
+                    + match_prepare_dispatch_ms
+                    + match_kernel_dispatch_ms,
+            },
+            section_profile: GpuSectionEncodeProfile {
+                upload_ms: section_upload_ms,
+                wait_ms: 0.0,
+                map_copy_ms: 0.0,
+                total_ms: section_upload_ms + section_setup_ms + section_pass_dispatch_ms,
+            },
+            sparse_profile,
+            sparse_batch_profile,
+            kernel_profile: GpuBatchKernelProfile {
+                pack_inputs_ms,
+                pack_alloc_setup_ms: pack_profile.alloc_setup_ms,
+                pack_resolve_sizes_ms: pack_profile.resolve_sizes_ms,
+                pack_resolve_scan_ms: pack_profile.resolve_scan_ms,
+                pack_resolve_readback_setup_ms: pack_profile.resolve_readback_setup_ms,
+                pack_resolve_submit_ms: pack_profile.resolve_submit_ms,
+                pack_resolve_map_wait_ms: pack_profile.resolve_map_wait_ms,
+                pack_resolve_parse_ms: pack_profile.resolve_parse_ms,
+                pack_src_copy_ms: pack_profile.src_copy_ms,
+                pack_metadata_loop_ms: pack_profile.metadata_loop_ms,
+                pack_host_copy_ms: pack_profile.host_copy_ms,
+                pack_device_copy_plan_ms: pack_profile.device_copy_plan_ms,
+                pack_finalize_ms: pack_profile.finalize_ms,
+                scratch_acquire_ms: batch_scratch_acquire_ms,
+                match_table_copy_ms,
+                match_prepare_dispatch_ms,
+                match_kernel_dispatch_ms,
+                section_setup_ms,
+                section_pass_dispatch_ms,
+                section_tokenize_dispatch_ms,
+                section_prefix_dispatch_ms,
+                section_scatter_dispatch_ms,
+                section_pack_dispatch_ms,
+                section_meta_dispatch_ms,
+                sparse_prepare_ms,
+                sparse_scratch_acquire_ms,
+                sparse_submit_ms: submit_ms + payload_submit_ms,
+                sparse_lens_wait_ms: phase1_wait_ms + phase2_wait_ms,
+                sparse_lens_copy_ms: lens_copy_ms,
+                sparse_copy_ms,
+                sparse_total_ms,
+                ..GpuBatchKernelProfile::default()
+            },
+        })
+    })();
+
+    release_sparse_pack_scratch(r, scratch);
+    release_batch_scratch(r, batch_scratch);
+    result
+}
+
 pub(crate) fn compute_matches(input: &GpuMatchInput<'_>) -> Result<GpuMatchOutput, PDeflateError> {
     let batch = compute_matches_batch(std::slice::from_ref(input))?;
     let mut iter = batch.chunks.into_iter();
@@ -13633,12 +15146,16 @@ pub(crate) fn encode_section_commands(
         u64::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?;
     let section_offsets_bytes = section_count_u64.saturating_mul(4);
     let section_caps_bytes = section_count_u64.saturating_mul(4);
-    let params: [u32; 6] = [
+    let params: [u32; 10] = [
         u32::try_from(src.len()).map_err(|_| PDeflateError::NumericOverflow)?,
         u32::try_from(section_count).map_err(|_| PDeflateError::NumericOverflow)?,
         u32::try_from(min_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
         u32::try_from(max_ref_len).map_err(|_| PDeflateError::NumericOverflow)?,
         u32::try_from(max_cmd_len).map_err(|_| PDeflateError::NumericOverflow)?,
+        0,
+        0,
+        0,
+        0,
         0,
     ];
     let params_bytes = u64::try_from(params.len())

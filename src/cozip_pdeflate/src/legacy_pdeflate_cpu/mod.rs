@@ -2473,25 +2473,8 @@ fn compress_chunk_gpu_batch(
 
     let t_gpu_call = Instant::now();
     if !gpu_job_indices.is_empty() {
-        struct PendingSectionBatch {
-            prep_indices: Vec<usize>,
-            batch: gpu::GpuBatchSectionEncodeOutput,
-        }
-        enum PendingTableRef {
-            Prepared,
-            Uploaded(usize),
-        }
-        struct PendingSparsePack {
-            prep_idx: usize,
-            section_device: gpu::GpuSectionCmdDeviceOutput,
-            table_ref: PendingTableRef,
-            section_scaled: gpu::GpuSectionEncodeProfile,
-            match_scaled: gpu::GpuMatchProfile,
-        }
-
-        let mut pending_section_batches = Vec::<PendingSectionBatch>::new();
         let gpu_max_cmd_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
-        let submit_group = options.gpu_pipelined_submit_chunks.max(1);
+        let submit_group = gpu_job_indices.len().max(1);
         for job_group in gpu_job_indices.chunks(submit_group) {
             let prep_indices = job_group.to_vec();
             let gpu_inputs: Vec<gpu::GpuMatchInput<'_>> = prep_indices
@@ -2510,27 +2493,13 @@ fn compress_chunk_gpu_batch(
                     }
                 })
                 .collect();
-            match gpu::compute_matches_and_encode_sections_batch(
+            match gpu::compute_matches_encode_and_pack_sparse_batch(
                 &gpu_inputs,
                 options.section_count,
                 gpu_max_cmd_len,
             ) {
                 Ok(batch) => {
-                    gpu_match_upload_ms += batch.match_profile.upload_ms;
-                    gpu_match_wait_ms += batch.match_profile.wait_ms;
-                    gpu_match_map_copy_ms += batch.match_profile.map_copy_ms;
-                    gpu_match_total_ms += batch.match_profile.total_ms;
-                    gpu_section_encode_upload_ms += batch.section_profile.upload_ms;
-                    gpu_section_encode_wait_ms += batch.section_profile.wait_ms;
-                    gpu_section_encode_map_copy_ms += batch.section_profile.map_copy_ms;
-                    gpu_section_encode_total_ms += batch.section_profile.total_ms;
-                    accumulate_gpu_kernel_profile(&mut kernel_profile, &batch.kernel_profile);
-                    if batch.chunks.len() == prep_indices.len() {
-                        pending_section_batches.push(PendingSectionBatch {
-                            prep_indices,
-                            batch,
-                        });
-                    } else {
+                    if batch.chunks.len() != prep_indices.len() {
                         if profile_detail {
                             eprintln!(
                                 "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=output_count_mismatch out={} jobs={}",
@@ -2541,110 +2510,66 @@ fn compress_chunk_gpu_batch(
                             );
                         }
                         fallback_match_job_indices.extend(prep_indices);
+                        continue;
                     }
-                }
-                Err(err) => {
-                    if profile_detail {
-                        eprintln!(
-                            "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason={}",
-                            indices.len(),
-                            prep_indices.len(),
-                            err
-                        );
-                    }
-                    fallback_match_job_indices.extend(prep_indices);
-                }
-            }
-        }
 
-        for pending_batch in pending_section_batches {
-            let prep_indices = pending_batch.prep_indices;
-            let batch = pending_batch.batch;
-            let total_gpu_bytes: usize = prep_indices
-                .iter()
-                .map(|&idx| prepared[idx].chunk.len())
-                .sum();
-            let mut uploaded_tables = Vec::<gpu::GpuPackedTableDevice>::new();
-            let mut pending = Vec::<PendingSparsePack>::new();
-            for (out_idx, chunk_out) in batch.chunks.into_iter().enumerate() {
-                let prep_idx = prep_indices[out_idx];
-                let Some(section_device) = chunk_out.section_cmd_device else {
-                    if profile_detail {
-                        eprintln!(
-                            "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=missing_section_device_output",
-                            indices.len(),
-                            prep_indices.len(),
-                        );
-                    }
-                    fallback_match_job_indices.push(prep_idx);
-                    continue;
-                };
-                let scale = if total_gpu_bytes == 0 {
-                    0.0
-                } else {
-                    (prepared[prep_idx].chunk.len() as f64) / (total_gpu_bytes as f64)
-                };
-                let section_scaled = scale_gpu_section_profile(batch.section_profile, scale);
-                let match_scaled = scale_gpu_profile(batch.match_profile, scale);
-                let table_ref = if prepared[prep_idx].gpu_table.is_some() {
-                    PendingTableRef::Prepared
-                } else {
-                    match gpu::upload_packed_table_device(
-                        prepared[prep_idx].table_count,
-                        &prepared[prep_idx].table_index,
-                        &prepared[prep_idx].table_data,
-                    ) {
-                        Ok(table_gpu) => {
-                            uploaded_tables.push(table_gpu);
-                            PendingTableRef::Uploaded(uploaded_tables.len() - 1)
-                        }
-                        Err(err) => {
-                            if profile_detail {
-                                eprintln!(
-                                    "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=table_upload_failed err={}",
-                                    indices.len(),
-                                    prep_indices.len(),
-                                    err
-                                );
-                            }
-                            fallback_match_job_indices.push(prep_idx);
-                            continue;
-                        }
-                    }
-                };
-                pending.push(PendingSparsePack {
-                    prep_idx,
-                    section_device,
-                    table_ref,
-                    section_scaled,
-                    match_scaled,
-                });
-            }
-            if pending.is_empty() {
-                continue;
-            }
+                    gpu_match_upload_ms += batch.match_profile.upload_ms;
+                    gpu_match_wait_ms += batch.match_profile.wait_ms;
+                    gpu_match_map_copy_ms += batch.match_profile.map_copy_ms;
+                    gpu_match_total_ms += batch.match_profile.total_ms;
+                    gpu_section_encode_upload_ms += batch.section_profile.upload_ms;
+                    gpu_section_encode_wait_ms += batch.section_profile.wait_ms;
+                    gpu_section_encode_map_copy_ms += batch.section_profile.map_copy_ms;
+                    gpu_section_encode_total_ms += batch.section_profile.total_ms;
+                    gpu_sparse_pack_upload_ms += batch.sparse_profile.upload_ms;
+                    gpu_sparse_pack_wait_ms += batch.sparse_profile.wait_ms;
+                    gpu_sparse_pack_map_copy_ms += batch.sparse_profile.map_copy_ms;
+                    gpu_sparse_lens_submit_ms += batch.sparse_batch_profile.lens_submit_ms;
+                    gpu_sparse_lens_submit_done_wait_ms +=
+                        batch.sparse_batch_profile.lens_submit_done_wait_ms;
+                    gpu_sparse_lens_map_after_done_ms +=
+                        batch.sparse_batch_profile.lens_map_after_done_ms;
+                    gpu_sparse_lens_poll_calls = gpu_sparse_lens_poll_calls
+                        .saturating_add(batch.sparse_batch_profile.lens_poll_calls);
+                    gpu_sparse_lens_yield_calls = gpu_sparse_lens_yield_calls
+                        .saturating_add(batch.sparse_batch_profile.lens_yield_calls);
+                    gpu_sparse_lens_wait_ms += batch.sparse_batch_profile.lens_wait_ms;
+                    gpu_sparse_lens_copy_ms += batch.sparse_batch_profile.lens_copy_ms;
+                    gpu_sparse_prepare_ms += batch.sparse_batch_profile.prepare_ms;
+                    gpu_sparse_table_size_resolve_ms +=
+                        batch.sparse_batch_profile.table_size_resolve_ms;
+                    gpu_sparse_prepare_misc_ms += batch.sparse_batch_profile.prepare_misc_ms;
+                    gpu_sparse_scratch_acquire_ms += batch.sparse_batch_profile.scratch_acquire_ms;
+                    gpu_sparse_upload_dispatch_ms += batch.sparse_batch_profile.upload_dispatch_ms;
+                    gpu_sparse_submit_ms += batch.sparse_batch_profile.submit_ms;
+                    gpu_sparse_wait_ms += batch.sparse_batch_profile.wait_ms;
+                    gpu_sparse_copy_ms += batch.sparse_batch_profile.copy_ms;
+                    gpu_sparse_total_ms += batch.sparse_batch_profile.total_ms;
+                    accumulate_gpu_kernel_profile(&mut kernel_profile, &batch.kernel_profile);
+                    kernel_profile.sparse_lens_submit_ms +=
+                        batch.sparse_batch_profile.lens_submit_ms;
+                    kernel_profile.sparse_lens_submit_done_wait_ms +=
+                        batch.sparse_batch_profile.lens_submit_done_wait_ms;
+                    kernel_profile.sparse_lens_map_after_done_ms +=
+                        batch.sparse_batch_profile.lens_map_after_done_ms;
+                    kernel_profile.sparse_lens_poll_calls = kernel_profile
+                        .sparse_lens_poll_calls
+                        .saturating_add(batch.sparse_batch_profile.lens_poll_calls);
+                    kernel_profile.sparse_lens_yield_calls = kernel_profile
+                        .sparse_lens_yield_calls
+                        .saturating_add(batch.sparse_batch_profile.lens_yield_calls);
+                    kernel_profile.sparse_lens_wait_ms += batch.sparse_batch_profile.lens_wait_ms;
+                    kernel_profile.sparse_lens_copy_ms += batch.sparse_batch_profile.lens_copy_ms;
+                    kernel_profile.sparse_prepare_ms += batch.sparse_batch_profile.prepare_ms;
+                    kernel_profile.sparse_scratch_acquire_ms +=
+                        batch.sparse_batch_profile.scratch_acquire_ms;
+                    kernel_profile.sparse_upload_dispatch_ms +=
+                        batch.sparse_batch_profile.upload_dispatch_ms;
+                    kernel_profile.sparse_submit_ms += batch.sparse_batch_profile.submit_ms;
+                    kernel_profile.sparse_wait_ms += batch.sparse_batch_profile.wait_ms;
+                    kernel_profile.sparse_copy_ms += batch.sparse_batch_profile.copy_ms;
+                    kernel_profile.sparse_total_ms += batch.sparse_batch_profile.total_ms;
 
-            let pack_inputs: Vec<gpu::GpuSparsePackInput<'_>> = pending
-                .iter()
-                .map(|p| {
-                    let table_ref = match p.table_ref {
-                        PendingTableRef::Prepared => prepared[p.prep_idx]
-                            .gpu_table
-                            .as_ref()
-                            .expect("prepared table missing"),
-                        PendingTableRef::Uploaded(i) => &uploaded_tables[i],
-                    };
-                    gpu::GpuSparsePackInput {
-                        chunk_len: prepared[p.prep_idx].chunk.len(),
-                        section_count: options.section_count,
-                        table: table_ref,
-                        section: &p.section_device,
-                    }
-                })
-                .collect();
-
-            match gpu::pack_chunk_payload_from_device_sparse_batch(&pack_inputs) {
-                Ok((packed_chunks, pack_profile, pack_detail)) => {
                     let emit_pack_batch_detail = if profile_detail {
                         let seq = PROFILE_DETAIL_GPU_PACK_SEQ.fetch_add(1, Ordering::Relaxed);
                         profile_detail_should_log_stream(seq)
@@ -2652,6 +2577,7 @@ fn compress_chunk_gpu_batch(
                         false
                     };
                     if emit_pack_batch_detail {
+                        let pack_detail = batch.sparse_batch_profile;
                         eprintln!(
                             "[cozip_pdeflate][timing][gpu-pack-batch] chunks={} lens_kib={:.2} out_cmd_mib={:.2} t_lens_submit_ms={:.3} t_lens_submit_done_wait_ms={:.3} t_lens_map_after_done_ms={:.3} lens_poll_calls={} lens_yield_calls={} t_lens_wait_ms={:.3} t_lens_copy_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_table_size_resolve_ms={:.3} t_sparse_prepare_misc_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_sparse_total_ms={:.3}",
                             pack_detail.chunks,
@@ -2674,115 +2600,63 @@ fn compress_chunk_gpu_batch(
                             pack_detail.total_ms
                         );
                     }
-                    if packed_chunks.len() != pending.len() {
-                        if profile_detail {
-                            eprintln!(
-                                "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=sparse_readback_output_count_mismatch out={} jobs={}",
-                                indices.len(),
-                                prep_indices.len(),
-                                packed_chunks.len(),
-                                pending.len()
-                            );
-                        }
-                        for p in pending {
-                            fallback_match_job_indices.push(p.prep_idx);
-                        }
-                        continue;
-                    }
 
-                    gpu_sparse_pack_upload_ms += pack_profile.upload_ms;
-                    gpu_sparse_pack_wait_ms += pack_profile.wait_ms;
-                    gpu_sparse_pack_map_copy_ms += pack_profile.map_copy_ms;
-                    gpu_sparse_lens_submit_ms += pack_detail.lens_submit_ms;
-                    gpu_sparse_lens_submit_done_wait_ms += pack_detail.lens_submit_done_wait_ms;
-                    gpu_sparse_lens_map_after_done_ms += pack_detail.lens_map_after_done_ms;
-                    gpu_sparse_lens_poll_calls =
-                        gpu_sparse_lens_poll_calls.saturating_add(pack_detail.lens_poll_calls);
-                    gpu_sparse_lens_yield_calls =
-                        gpu_sparse_lens_yield_calls.saturating_add(pack_detail.lens_yield_calls);
-                    gpu_sparse_lens_wait_ms += pack_detail.lens_wait_ms;
-                    gpu_sparse_lens_copy_ms += pack_detail.lens_copy_ms;
-                    gpu_sparse_prepare_ms += pack_detail.prepare_ms;
-                    gpu_sparse_table_size_resolve_ms += pack_detail.table_size_resolve_ms;
-                    gpu_sparse_prepare_misc_ms += pack_detail.prepare_misc_ms;
-                    gpu_sparse_scratch_acquire_ms += pack_detail.scratch_acquire_ms;
-                    gpu_sparse_upload_dispatch_ms += pack_detail.upload_dispatch_ms;
-                    gpu_sparse_submit_ms += pack_detail.submit_ms;
-                    gpu_sparse_wait_ms += pack_detail.wait_ms;
-                    gpu_sparse_copy_ms += pack_detail.copy_ms;
-                    gpu_sparse_total_ms += pack_detail.total_ms;
-                    kernel_profile.sparse_lens_submit_ms += pack_detail.lens_submit_ms;
-                    kernel_profile.sparse_lens_submit_done_wait_ms +=
-                        pack_detail.lens_submit_done_wait_ms;
-                    kernel_profile.sparse_lens_map_after_done_ms +=
-                        pack_detail.lens_map_after_done_ms;
-                    kernel_profile.sparse_lens_poll_calls = kernel_profile
-                        .sparse_lens_poll_calls
-                        .saturating_add(pack_detail.lens_poll_calls);
-                    kernel_profile.sparse_lens_yield_calls = kernel_profile
-                        .sparse_lens_yield_calls
-                        .saturating_add(pack_detail.lens_yield_calls);
-                    kernel_profile.sparse_lens_wait_ms += pack_detail.lens_wait_ms;
-                    kernel_profile.sparse_lens_copy_ms += pack_detail.lens_copy_ms;
-                    kernel_profile.sparse_prepare_ms += pack_detail.prepare_ms;
-                    kernel_profile.sparse_scratch_acquire_ms += pack_detail.scratch_acquire_ms;
-                    kernel_profile.sparse_upload_dispatch_ms += pack_detail.upload_dispatch_ms;
-                    kernel_profile.sparse_submit_ms += pack_detail.submit_ms;
-                    kernel_profile.sparse_wait_ms += pack_detail.wait_ms;
-                    kernel_profile.sparse_copy_ms += pack_detail.copy_ms;
-                    kernel_profile.sparse_total_ms += pack_detail.total_ms;
-
-                    let total_pack_bytes: usize = pending
+                    let total_pack_bytes: usize = prep_indices
                         .iter()
-                        .map(|p| prepared[p.prep_idx].chunk.len())
+                        .map(|&idx| prepared[idx].chunk.len())
                         .sum();
-                    for (p, packed_chunk) in pending.into_iter().zip(packed_chunks.into_iter()) {
+                    for (&prep_idx, packed_chunk) in
+                        prep_indices.iter().zip(batch.chunks.into_iter())
+                    {
                         let pack_scale = if total_pack_bytes == 0 {
                             0.0
                         } else {
-                            (prepared[p.prep_idx].chunk.len() as f64) / (total_pack_bytes as f64)
+                            (prepared[prep_idx].chunk.len() as f64) / (total_pack_bytes as f64)
                         };
-                        let pack_scaled = scale_gpu_profile(pack_profile, pack_scale);
+                        let match_scaled = scale_gpu_profile(batch.match_profile, pack_scale);
+                        let section_scaled =
+                            scale_gpu_section_profile(batch.section_profile, pack_scale);
+                        let pack_scaled = scale_gpu_profile(batch.sparse_profile, pack_scale);
                         let gpu_profile = gpu::GpuMatchProfile {
-                            upload_ms: p.match_scaled.upload_ms
-                                + p.section_scaled.upload_ms
+                            upload_ms: match_scaled.upload_ms
+                                + section_scaled.upload_ms
                                 + pack_scaled.upload_ms,
-                            wait_ms: p.match_scaled.wait_ms
-                                + p.section_scaled.wait_ms
+                            wait_ms: match_scaled.wait_ms
+                                + section_scaled.wait_ms
                                 + pack_scaled.wait_ms,
-                            map_copy_ms: p.match_scaled.map_copy_ms
-                                + p.section_scaled.map_copy_ms
+                            map_copy_ms: match_scaled.map_copy_ms
+                                + section_scaled.map_copy_ms
                                 + pack_scaled.map_copy_ms,
-                            total_ms: p.match_scaled.total_ms
-                                + p.section_scaled.total_ms
+                            total_ms: match_scaled.total_ms
+                                + section_scaled.total_ms
                                 + pack_scaled.total_ms,
                         };
-                        gpu_encoded_chunks[p.prep_idx] = Some(ChunkCompressed {
+                        gpu_encoded_chunks[prep_idx] = Some(ChunkCompressed {
                             payload: packed_chunk.payload,
                             table_entries: packed_chunk.table_count,
                             section_count: options.section_count,
                             profile: ChunkEncodeProfile {
-                                table_build_ms: prepared[p.prep_idx].table_build_ms,
-                                table_freq_ms: prepared[p.prep_idx].table_profile.freq_ms,
-                                table_probe_ms: prepared[p.prep_idx].table_profile.probe_ms,
-                                table_materialize_ms: prepared[p.prep_idx]
+                                table_build_ms: prepared[prep_idx].table_build_ms,
+                                table_freq_ms: prepared[prep_idx].table_profile.freq_ms,
+                                table_probe_ms: prepared[prep_idx].table_profile.probe_ms,
+                                table_materialize_ms: prepared[prep_idx]
                                     .table_profile
                                     .materialize_ms,
-                                table_sort_ms: prepared[p.prep_idx].table_profile.sort_ms,
-                                table_positions_scanned: prepared[p.prep_idx]
+                                table_sort_ms: prepared[prep_idx].table_profile.sort_ms,
+                                table_positions_scanned: prepared[prep_idx]
                                     .table_profile
                                     .positions_scanned,
-                                table_probe_pairs: prepared[p.prep_idx].table_profile.probe_pairs,
-                                table_match_len_calls: prepared[p.prep_idx]
+                                table_probe_pairs: prepared[prep_idx].table_profile.probe_pairs,
+                                table_match_len_calls: prepared[prep_idx]
                                     .table_profile
                                     .match_len_calls,
-                                table_hash_key_mismatch: prepared[p.prep_idx]
+                                table_hash_key_mismatch: prepared[prep_idx]
                                     .table_profile
                                     .hash_key_mismatch,
-                                anchored_short_hits: prepared[p.prep_idx]
+                                anchored_short_hits: prepared[prep_idx]
                                     .table_profile
                                     .anchored_short_hits,
-                                section_encode_ms: p.section_scaled.total_ms,
+                                section_encode_ms: section_scaled.total_ms,
                                 section_match_search_ms: 0.0,
                                 section_best_search_ms: 0.0,
                                 section_lookahead_search_ms: 0.0,
@@ -2809,10 +2683,8 @@ fn compress_chunk_gpu_batch(
                                 gpu_wait_ms: gpu_profile.wait_ms,
                                 gpu_map_copy_ms: gpu_profile.map_copy_ms,
                                 gpu_total_ms: gpu_profile.total_ms,
-                                header_pack_ms: 0.0,
-                                total_ms: prepared[p.prep_idx].table_build_ms
-                                    + gpu_profile.total_ms
-                                    + 0.0,
+                                header_pack_ms: pack_scaled.total_ms,
+                                total_ms: prepared[prep_idx].table_build_ms + gpu_profile.total_ms,
                             },
                         });
                         gpu_used_chunks = gpu_used_chunks.saturating_add(1);
@@ -2821,15 +2693,13 @@ fn compress_chunk_gpu_batch(
                 Err(err) => {
                     if profile_detail {
                         eprintln!(
-                            "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=sparse_readback_failed err={}",
+                            "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason={} ",
                             indices.len(),
                             prep_indices.len(),
                             err
                         );
                     }
-                    for p in pending {
-                        fallback_match_job_indices.push(p.prep_idx);
-                    }
+                    fallback_match_job_indices.extend(prep_indices);
                 }
             }
         }
