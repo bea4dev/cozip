@@ -3287,6 +3287,24 @@ struct PendingGpuDecodeMap {
     map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
+struct PendingGpuDecodeTrueBatch<'a> {
+    host_jobs: Vec<GpuDecodeBatchHostJob<'a>>,
+    out_copy_bytes: usize,
+    out_total_copy_bytes: usize,
+    scratch: GpuDecodeV2TrueBatchScratch,
+    map_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    submit_at: Instant,
+    map_requested_at: Instant,
+    completion_gate: Arc<AtomicBool>,
+    submission: wgpu::SubmissionIndex,
+    map_done: Option<Result<(), PDeflateError>>,
+    map_timed_out: bool,
+    kernel_timestamp_ms: Option<f64>,
+    submit_done_wait_ms: f64,
+    map_callback_wait_ms: f64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct GpuDecodeV2WaitProfile {
     submit_seq: u64,
@@ -9333,6 +9351,99 @@ fn collect_gpu_decode_job_from_slot(
     result.map(|decoded_chunk| (decoded_chunk, elapsed_ms(t_collect)))
 }
 
+fn promote_ready_gpu_decode_true_batch<'a>(
+    runtime: &GpuMatchRuntime,
+    pending_batches: &mut VecDeque<PendingGpuDecodeTrueBatch<'a>>,
+    ready_copy_batches: &mut VecDeque<PendingGpuDecodeTrueBatch<'a>>,
+    map_timeout_duration: Option<Duration>,
+) -> bool {
+    let mut ready_idx = None;
+    for idx in 0..pending_batches.len() {
+        let pending = match pending_batches.get_mut(idx) {
+            Some(p) => p,
+            None => continue,
+        };
+        if pending.submit_done_wait_ms == 0.0 && pending.completion_gate.load(Ordering::Acquire) {
+            pending.submit_done_wait_ms = elapsed_ms(pending.submit_at);
+        }
+        if pending.map_done.is_none() {
+            match pending.map_rx.try_recv() {
+                Ok(Ok(())) => pending.map_done = Some(Ok(())),
+                Ok(Err(e)) => {
+                    pending.map_done = Some(Err(PDeflateError::Gpu(format!(
+                        "gpu decode-v2 true-batch map failed: {e}"
+                    ))))
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pending.map_done = Some(Err(PDeflateError::Gpu(
+                        "gpu decode-v2 true-batch map channel closed".to_string(),
+                    )))
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(timeout) = map_timeout_duration {
+            if pending.map_done.is_none() && pending.map_requested_at.elapsed() >= timeout {
+                pending.map_done = Some(Err(PDeflateError::Gpu(format!(
+                    "gpu decode-v2 true-batch map timed out after {:.3} ms",
+                    timeout.as_secs_f64() * 1000.0
+                ))));
+                pending.map_timed_out = true;
+            }
+            if pending.map_timed_out && pending.kernel_timestamp_ms.is_none() {
+                pending.kernel_timestamp_ms = Some(f64::NAN);
+                pending.ts_map_rx = None;
+            }
+        }
+        if pending.map_callback_wait_ms == 0.0 && pending.map_done.is_some() {
+            pending.map_callback_wait_ms = elapsed_ms(pending.map_requested_at);
+        }
+        if pending.kernel_timestamp_ms.is_none() {
+            if let Some(ts_rx) = pending.ts_map_rx.as_ref() {
+                match ts_rx.try_recv() {
+                    Ok(Ok(())) => {
+                        let mut kernel_timestamp_ms = f64::NAN;
+                        if let Some(ts_buffer) = pending.scratch.ts_readback_buffer.as_ref() {
+                            let mapped = ts_buffer.slice(..).get_mapped_range();
+                            let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
+                            if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
+                                let period_ms =
+                                    (runtime.queue.get_timestamp_period() as f64) / 1_000_000.0;
+                                kernel_timestamp_ms =
+                                    (ts_words[1].saturating_sub(ts_words[0]) as f64) * period_ms;
+                            }
+                            drop(mapped);
+                            ts_buffer.unmap();
+                        }
+                        pending.kernel_timestamp_ms = Some(kernel_timestamp_ms);
+                        pending.ts_map_rx = None;
+                    }
+                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        pending.kernel_timestamp_ms = Some(f64::NAN);
+                        pending.ts_map_rx = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                pending.kernel_timestamp_ms = Some(f64::NAN);
+            }
+        }
+        let maps_ready = pending.map_done.is_some();
+        let ts_ready = pending.kernel_timestamp_ms.is_some();
+        if maps_ready && ts_ready {
+            ready_idx = Some(idx);
+            break;
+        }
+    }
+    if let Some(idx) = ready_idx {
+        if let Some(pending) = pending_batches.remove(idx) {
+            ready_copy_batches.push_back(pending);
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_chunks_gpu_v2_true_batch(
     runtime: &GpuMatchRuntime,
@@ -9365,6 +9476,7 @@ fn decode_chunks_gpu_v2_true_batch(
         .min(prepared_jobs.len().max(1));
     let readback_ring = gpu_decode_v2_true_batch_readback_ring(target_inflight.max(1))
         .clamp(1, wait_high_watermark.max(1));
+    let deferred_copy_depth = target_inflight.max(1).min(readback_ring.max(1));
     let map_timeout_duration = map_timeout_ms
         .filter(|ms| ms.is_finite() && *ms >= 0.0)
         .map(|ms| Duration::from_secs_f64(ms / 1000.0));
@@ -9389,25 +9501,8 @@ fn decode_chunks_gpu_v2_true_batch(
     let mut fallback_collect_error_jobs = 0usize;
     let mut fallback_kernel_error_jobs = 0usize;
 
-    struct PendingGpuDecodeTrueBatch<'a> {
-        host_jobs: Vec<GpuDecodeBatchHostJob<'a>>,
-        out_copy_bytes: usize,
-        out_total_copy_bytes: usize,
-        scratch: GpuDecodeV2TrueBatchScratch,
-        map_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-        ts_map_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
-        submit_at: Instant,
-        map_requested_at: Instant,
-        completion_gate: Arc<AtomicBool>,
-        submission: wgpu::SubmissionIndex,
-        map_done: Option<Result<(), PDeflateError>>,
-        map_timed_out: bool,
-        kernel_timestamp_ms: Option<f64>,
-        submit_done_wait_ms: f64,
-        map_callback_wait_ms: f64,
-    }
-
     let mut pending_batches = VecDeque::<PendingGpuDecodeTrueBatch<'_>>::new();
+    let mut ready_copy_batches = VecDeque::<PendingGpuDecodeTrueBatch<'_>>::new();
     let mut wait_probe_wait_loops = 0usize;
 
     let mut drain_pending = |mut pending: PendingGpuDecodeTrueBatch<'_>,
@@ -10064,95 +10159,26 @@ fn decode_chunks_gpu_v2_true_batch(
                 wait_probe_inflight_batches_max.max(pending_batches.len());
         }
 
-        while pending_batches.len() >= readback_ring {
-            runtime.device.poll(wgpu::Maintain::Poll);
-            let mut ready_idx = None;
-            for idx in 0..pending_batches.len() {
-                let pending = match pending_batches.get_mut(idx) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                if pending.submit_done_wait_ms == 0.0
-                    && pending.completion_gate.load(Ordering::Acquire)
-                {
-                    pending.submit_done_wait_ms = elapsed_ms(pending.submit_at);
-                }
-                if pending.map_done.is_none() {
-                    match pending.map_rx.try_recv() {
-                        Ok(Ok(())) => pending.map_done = Some(Ok(())),
-                        Ok(Err(e)) => {
-                            pending.map_done = Some(Err(PDeflateError::Gpu(format!(
-                                "gpu decode-v2 true-batch map failed: {e}"
-                            ))))
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            pending.map_done = Some(Err(PDeflateError::Gpu(
-                                "gpu decode-v2 true-batch map channel closed".to_string(),
-                            )))
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                if let Some(timeout) = map_timeout_duration {
-                    if pending.map_done.is_none() && pending.map_requested_at.elapsed() >= timeout {
-                        pending.map_done = Some(Err(PDeflateError::Gpu(format!(
-                            "gpu decode-v2 true-batch map timed out after {:.3} ms",
-                            timeout.as_secs_f64() * 1000.0
-                        ))));
-                        pending.map_timed_out = true;
-                    }
-                    if pending.map_timed_out && pending.kernel_timestamp_ms.is_none() {
-                        pending.kernel_timestamp_ms = Some(f64::NAN);
-                        pending.ts_map_rx = None;
-                    }
-                }
-                if pending.map_callback_wait_ms == 0.0 && pending.map_done.is_some() {
-                    pending.map_callback_wait_ms = elapsed_ms(pending.map_requested_at);
-                }
-                if pending.kernel_timestamp_ms.is_none() {
-                    if let Some(ts_rx) = pending.ts_map_rx.as_ref() {
-                        match ts_rx.try_recv() {
-                            Ok(Ok(())) => {
-                                let mut kernel_timestamp_ms = f64::NAN;
-                                if let Some(ts_buffer) = pending.scratch.ts_readback_buffer.as_ref()
-                                {
-                                    let mapped = ts_buffer.slice(..).get_mapped_range();
-                                    let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
-                                    if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
-                                        let period_ms = (runtime.queue.get_timestamp_period()
-                                            as f64)
-                                            / 1_000_000.0;
-                                        kernel_timestamp_ms =
-                                            (ts_words[1].saturating_sub(ts_words[0]) as f64)
-                                                * period_ms;
-                                    }
-                                    drop(mapped);
-                                    ts_buffer.unmap();
-                                }
-                                pending.kernel_timestamp_ms = Some(kernel_timestamp_ms);
-                                pending.ts_map_rx = None;
-                            }
-                            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                                pending.kernel_timestamp_ms = Some(f64::NAN);
-                                pending.ts_map_rx = None;
-                            }
-                            Err(mpsc::TryRecvError::Empty) => {}
-                        }
-                    } else {
-                        pending.kernel_timestamp_ms = Some(f64::NAN);
-                    }
-                }
-                let maps_ready = pending.map_done.is_some();
-                let ts_ready = pending.kernel_timestamp_ms.is_some();
-                if maps_ready && ts_ready {
-                    ready_idx = Some(idx);
-                    break;
+        while pending_batches.len() >= readback_ring
+            || ready_copy_batches.len() >= deferred_copy_depth
+        {
+            if ready_copy_batches.len() >= deferred_copy_depth {
+                if let Some(pending) = ready_copy_batches.pop_front() {
+                    drain_pending(pending, &mut out);
+                    continue;
                 }
             }
-            if let Some(idx) = ready_idx {
-                if let Some(pending) = pending_batches.remove(idx) {
-                    drain_pending(pending, &mut out);
-                }
+            runtime.device.poll(wgpu::Maintain::Poll);
+            if promote_ready_gpu_decode_true_batch(
+                runtime,
+                &mut pending_batches,
+                &mut ready_copy_batches,
+                map_timeout_duration,
+            ) {
+                continue;
+            }
+            if let Some(pending) = ready_copy_batches.pop_front() {
+                drain_pending(pending, &mut out);
                 continue;
             }
             wait_probe_wait_loops = wait_probe_wait_loops.saturating_add(1);
@@ -10160,92 +10186,24 @@ fn decode_chunks_gpu_v2_true_batch(
         }
     }
 
-    while !pending_batches.is_empty() {
-        runtime.device.poll(wgpu::Maintain::Poll);
-        let mut ready_idx = None;
-        for idx in 0..pending_batches.len() {
-            let pending = match pending_batches.get_mut(idx) {
-                Some(p) => p,
-                None => continue,
-            };
-            if pending.submit_done_wait_ms == 0.0 && pending.completion_gate.load(Ordering::Acquire)
-            {
-                pending.submit_done_wait_ms = elapsed_ms(pending.submit_at);
-            }
-            if pending.map_done.is_none() {
-                match pending.map_rx.try_recv() {
-                    Ok(Ok(())) => pending.map_done = Some(Ok(())),
-                    Ok(Err(e)) => {
-                        pending.map_done = Some(Err(PDeflateError::Gpu(format!(
-                            "gpu decode-v2 true-batch map failed: {e}"
-                        ))))
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        pending.map_done = Some(Err(PDeflateError::Gpu(
-                            "gpu decode-v2 true-batch map channel closed".to_string(),
-                        )))
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                }
-            }
-            if let Some(timeout) = map_timeout_duration {
-                if pending.map_done.is_none() && pending.map_requested_at.elapsed() >= timeout {
-                    pending.map_done = Some(Err(PDeflateError::Gpu(format!(
-                        "gpu decode-v2 true-batch map timed out after {:.3} ms",
-                        timeout.as_secs_f64() * 1000.0
-                    ))));
-                    pending.map_timed_out = true;
-                }
-                if pending.map_timed_out && pending.kernel_timestamp_ms.is_none() {
-                    pending.kernel_timestamp_ms = Some(f64::NAN);
-                    pending.ts_map_rx = None;
-                }
-            }
-            if pending.map_callback_wait_ms == 0.0 && pending.map_done.is_some() {
-                pending.map_callback_wait_ms = elapsed_ms(pending.map_requested_at);
-            }
-            if pending.kernel_timestamp_ms.is_none() {
-                if let Some(ts_rx) = pending.ts_map_rx.as_ref() {
-                    match ts_rx.try_recv() {
-                        Ok(Ok(())) => {
-                            let mut kernel_timestamp_ms = f64::NAN;
-                            if let Some(ts_buffer) = pending.scratch.ts_readback_buffer.as_ref() {
-                                let mapped = ts_buffer.slice(..).get_mapped_range();
-                                let ts_words: &[u64] = bytemuck::cast_slice(&mapped);
-                                if ts_words.len() >= 2 && ts_words[1] >= ts_words[0] {
-                                    let period_ms =
-                                        (runtime.queue.get_timestamp_period() as f64) / 1_000_000.0;
-                                    kernel_timestamp_ms = (ts_words[1].saturating_sub(ts_words[0])
-                                        as f64)
-                                        * period_ms;
-                                }
-                                drop(mapped);
-                                ts_buffer.unmap();
-                            }
-                            pending.kernel_timestamp_ms = Some(kernel_timestamp_ms);
-                            pending.ts_map_rx = None;
-                        }
-                        Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
-                            pending.kernel_timestamp_ms = Some(f64::NAN);
-                            pending.ts_map_rx = None;
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                } else {
-                    pending.kernel_timestamp_ms = Some(f64::NAN);
-                }
-            }
-            let maps_ready = pending.map_done.is_some();
-            let ts_ready = pending.kernel_timestamp_ms.is_some();
-            if maps_ready && ts_ready {
-                ready_idx = Some(idx);
-                break;
+    while !pending_batches.is_empty() || !ready_copy_batches.is_empty() {
+        if pending_batches.is_empty() {
+            if let Some(pending) = ready_copy_batches.pop_front() {
+                drain_pending(pending, &mut out);
+                continue;
             }
         }
-        if let Some(idx) = ready_idx {
-            if let Some(pending) = pending_batches.remove(idx) {
-                drain_pending(pending, &mut out);
-            }
+        runtime.device.poll(wgpu::Maintain::Poll);
+        if promote_ready_gpu_decode_true_batch(
+            runtime,
+            &mut pending_batches,
+            &mut ready_copy_batches,
+            map_timeout_duration,
+        ) {
+            continue;
+        }
+        if let Some(pending) = ready_copy_batches.pop_front() {
+            drain_pending(pending, &mut out);
             continue;
         }
         wait_probe_wait_loops = wait_probe_wait_loops.saturating_add(1);
