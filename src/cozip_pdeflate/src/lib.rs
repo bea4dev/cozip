@@ -4109,7 +4109,7 @@ fn compress_gpu_stream_worker_pdeflate_payload(
     total_tasks: Arc<AtomicUsize>,
     counters: Option<Arc<WorkerCounters>>,
 ) {
-    let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
+    let batch_limit = options.gpu_batch_chunks.max(1);
     loop {
         if has_error(&error) {
             break;
@@ -4773,7 +4773,7 @@ fn compress_gpu_stream_worker_continuous(
     total_tasks: Arc<AtomicUsize>,
     counters: Option<Arc<WorkerCounters>>,
 ) {
-    let batch_limit = options.gpu_batch_chunks.clamp(1, MAX_GPU_BATCH_CHUNKS);
+    let batch_limit = options.gpu_batch_chunks.max(1);
     loop {
         if has_error(&error) {
             break;

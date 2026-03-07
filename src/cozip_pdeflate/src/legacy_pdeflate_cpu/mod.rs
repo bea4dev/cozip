@@ -2726,7 +2726,32 @@ fn compress_chunk_gpu_batch(
     let t_gpu_call = Instant::now();
     if !gpu_job_indices.is_empty() {
         let gpu_max_cmd_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
-        let submit_group = gpu_job_indices.len().max(1);
+        let requested_submit_group = options.gpu_submit_chunks.max(1);
+        let safe_submit_group = gpu::max_safe_match_batch_chunks(chunk_size);
+        let submit_group = match safe_submit_group {
+            Ok(limit) => requested_submit_group.min(limit.max(1)),
+            Err(_) => requested_submit_group,
+        }
+        .min(gpu_job_indices.len())
+        .max(1);
+        if profile_detail && submit_group < requested_submit_group {
+            let max_binding_mib = gpu::max_storage_binding_size_bytes()
+                .ok()
+                .map(|bytes| bytes as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0);
+            let per_chunk_out_mib =
+                (chunk_size.saturating_mul(4) as f64) / (1024.0 * 1024.0);
+            let safe_limit = safe_submit_group.unwrap_or(submit_group);
+            eprintln!(
+                "[cozip_pdeflate][timing][gpu-submit-group-cap] requested={} effective={} safe_limit={} chunk_mib={:.2} per_chunk_match_out_mib={:.2} max_storage_binding_mib={:.2}",
+                requested_submit_group,
+                submit_group,
+                safe_limit,
+                chunk_size as f64 / (1024.0 * 1024.0),
+                per_chunk_out_mib,
+                max_binding_mib,
+            );
+        }
         for job_group in gpu_job_indices.chunks(submit_group) {
             let prep_indices = job_group.to_vec();
             let gpu_inputs: Vec<gpu::GpuMatchInput<'_>> = prep_indices
@@ -3361,15 +3386,7 @@ fn compress_chunks_hybrid(
         0
     };
     let cpu_workers = cpu_worker_count().min(chunk_count.max(1));
-    let gpu_batch_limit = if gpu_enabled {
-        let requested = options.gpu_slot_count.max(options.gpu_submit_chunks).max(1);
-        match gpu::max_safe_match_batch_chunks(chunk_size) {
-            Ok(limit) => requested.min(limit.max(1)),
-            Err(_) => requested,
-        }
-    } else {
-        options.gpu_slot_count.max(options.gpu_submit_chunks).max(1)
-    };
+    let gpu_batch_limit = options.gpu_slot_count.max(options.gpu_submit_chunks).max(1);
     let prof_enabled = profile_enabled();
     let sched_prof = Arc::new(Mutex::new(HybridCompressSchedulerProfile::default()));
 

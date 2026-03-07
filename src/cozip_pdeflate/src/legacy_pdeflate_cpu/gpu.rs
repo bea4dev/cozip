@@ -11697,6 +11697,11 @@ pub(crate) fn max_safe_match_batch_chunks(chunk_size: usize) -> Result<usize, PD
     Ok((max_binding / per_chunk_out).max(1))
 }
 
+pub(crate) fn max_storage_binding_size_bytes() -> Result<usize, PDeflateError> {
+    let r = runtime()?;
+    usize::try_from(r.max_storage_binding_size).map_err(|_| PDeflateError::NumericOverflow)
+}
+
 pub(crate) fn upload_packed_table_device(
     table_count: usize,
     table_index: &[u8],
