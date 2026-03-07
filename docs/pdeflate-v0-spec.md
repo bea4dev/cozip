@@ -29,6 +29,24 @@
 
 ## 4. チャンクフォーマット（v0）
 
+### 4.0 ストリームラッパー（PDS0）
+- PDeflate ストリームは、固定長ヘッダ + 可変個のチャンク frame で構成する。
+- 目的:
+  - `zero-temp streaming` を成立させる
+  - 圧縮時に全チャンク数/元サイズの事前確定を不要にする
+- ストリームヘッダ:
+  - `magic[4] = "PDS0"`
+  - `version: u16 = 1`
+  - `flags: u16`（v1 では 0 固定）
+  - `chunk_size: u32`
+- 本文:
+  - `chunk_payload_len: u32`
+  - `chunk_payload[chunk_payload_len]`
+  - 上記 frame の繰り返し
+- ストリームヘッダには `original_len` と `chunk_count` を保持しない。
+- ストリーム終端は、最後のチャンクの `flags.FINAL_STREAM == 1` で示す。
+- 空ストリームは、チャンク frame を 1 つも持たないヘッダのみのストリームとして表現してよい。
+
 ### 4.1 エンディアン
 - 整数はすべて Little Endian。
 
@@ -39,6 +57,9 @@
   - bit 0: `HUFFMAN`
     - `1`: セクション本文は Huffman 符号化済みであり、`huff_lut` を参照して復号する
     - `0`: セクション本文は Huffman 未使用であり、`section_bitstream` は論理命令列をそのまま格納する
+  - bit 1: `FINAL_STREAM`
+    - `1`: 当該チャンクがストリームの最終チャンク
+    - `0`: 後続チャンクが存在しうる
 - `chunk_uncompressed_len: u32`
 - `table_count: u16`
   - 有効範囲: `0..=0x0FFF - 1`（最大 4095 エントリ）
@@ -125,11 +146,14 @@
 
 ## 6. 解凍アルゴリズム
 
-1. チャンクヘッダ検証。
-2. 辞書テーブル（TABLE_REF）前処理。
-3. `flags.HUFFMAN == 1` のときのみ Huffman LUT ブロックを読み込み（またはGPU用バッファへ転送）。
-4. セクションインデックス（`bit_len` 列）から `bit_offset` を再構築し、同時に `out_offset/out_len` を算出。
-5. 各セクションを独立復号し、`out_offset..out_offset+out_len` へ出力。
+1. ストリームラッパーがある場合は `PDS0` ヘッダを検証し、frame を順に読む。
+   - `flags.FINAL_STREAM == 1` のチャンクに到達したら終端とみなす。
+   - `PDS0` ヘッダだけで本文 frame が存在しない場合は空出力とみなす。
+2. チャンクヘッダ検証。
+3. 辞書テーブル（TABLE_REF）前処理。
+4. `flags.HUFFMAN == 1` のときのみ Huffman LUT ブロックを読み込み（またはGPU用バッファへ転送）。
+5. セクションインデックス（`bit_len` 列）から `bit_offset` を再構築し、同時に `out_offset/out_len` を算出。
+6. 各セクションを独立復号し、`out_offset..out_offset+out_len` へ出力。
 
 ### 6.1 実行モデル（本仕様の必須方針）
 - **CPU:** チャンク並列（chunk-level parallel）

@@ -6821,7 +6821,7 @@ fn parse_gpu_decode_payload_layout(
         ));
     }
     let flags = read_le_u16_at(payload, 6)?;
-    if (flags & !super::CHUNK_FLAG_HUFFMAN) != 0 {
+    if (flags & !(super::CHUNK_FLAG_HUFFMAN | super::CHUNK_FLAG_FINAL_STREAM)) != 0 {
         return Err(PDeflateError::InvalidStream(
             "gpu decode unsupported chunk flags",
         ));
