@@ -478,6 +478,33 @@ struct EncodeWorkStats {
     legacy_gpu_profile_call_ms: f64,
     legacy_gpu_finalize_ms: f64,
     legacy_gpu_match_total_ms: f64,
+    legacy_gpu_match_table_copy_ms: f64,
+    legacy_gpu_match_prepare_dispatch_ms: f64,
+    legacy_gpu_match_kernel_dispatch_ms: f64,
+    legacy_gpu_match_submit_ms: f64,
+    legacy_gpu_integrated_chunks: usize,
+    legacy_gpu_fallback_match_chunks: usize,
+    legacy_gpu_fallback_integrated_error_chunks: usize,
+    legacy_gpu_fallback_integrated_invalid_options_chunks: usize,
+    legacy_gpu_fallback_integrated_invalid_stream_chunks: usize,
+    legacy_gpu_fallback_integrated_numeric_overflow_chunks: usize,
+    legacy_gpu_fallback_integrated_gpu_error_chunks: usize,
+    legacy_gpu_fallback_integrated_other_error_chunks: usize,
+    legacy_gpu_fallback_integrated_output_mismatch_chunks: usize,
+    legacy_gpu_fallback_match_error_chunks: usize,
+    legacy_gpu_fallback_match_output_mismatch_chunks: usize,
+    legacy_gpu_fallback_match_packed_len_mismatch_chunks: usize,
+    legacy_gpu_call_pack_bind_group_ms: f64,
+    legacy_gpu_call_encoder_create_ms: f64,
+    legacy_gpu_call_table_stream_copy_ms: f64,
+    legacy_gpu_call_match_clear_ms: f64,
+    legacy_gpu_call_sparse_prepare_dispatch_ms: f64,
+    legacy_gpu_call_sparse_pack_dispatch_ms: f64,
+    legacy_gpu_call_result_readback_setup_ms: f64,
+    legacy_gpu_call_payload_readback_setup_ms: f64,
+    legacy_gpu_post_total_pack_bytes_ms: f64,
+    legacy_gpu_post_scale_profiles_ms: f64,
+    legacy_gpu_post_chunk_materialize_ms: f64,
     legacy_gpu_table_build_ms: f64,
     legacy_gpu_header_pack_ms: f64,
     legacy_gpu_section_encode_ms: f64,
@@ -549,6 +576,33 @@ struct WorkerCounters {
     legacy_gpu_profile_call_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_finalize_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_match_total_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_match_table_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_match_prepare_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_match_kernel_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_match_submit_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_integrated_chunks: AtomicUsize,
+    legacy_gpu_fallback_match_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_error_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_invalid_options_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_invalid_stream_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_numeric_overflow_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_gpu_error_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_other_error_chunks: AtomicUsize,
+    legacy_gpu_fallback_integrated_output_mismatch_chunks: AtomicUsize,
+    legacy_gpu_fallback_match_error_chunks: AtomicUsize,
+    legacy_gpu_fallback_match_output_mismatch_chunks: AtomicUsize,
+    legacy_gpu_fallback_match_packed_len_mismatch_chunks: AtomicUsize,
+    legacy_gpu_call_pack_bind_group_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_encoder_create_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_table_stream_copy_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_match_clear_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_sparse_prepare_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_sparse_pack_dispatch_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_result_readback_setup_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_call_payload_readback_setup_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_post_total_pack_bytes_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_post_scale_profiles_ns: std::sync::atomic::AtomicU64,
+    legacy_gpu_post_chunk_materialize_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_table_build_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_header_pack_ns: std::sync::atomic::AtomicU64,
     legacy_gpu_section_encode_ns: std::sync::atomic::AtomicU64,
@@ -656,6 +710,103 @@ impl WorkerCounters {
                 / 1_000_000.0,
             legacy_gpu_match_total_ms: self.legacy_gpu_match_total_ns.load(Ordering::Relaxed)
                 as f64
+                / 1_000_000.0,
+            legacy_gpu_match_table_copy_ms: self
+                .legacy_gpu_match_table_copy_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_match_prepare_dispatch_ms: self
+                .legacy_gpu_match_prepare_dispatch_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_match_kernel_dispatch_ms: self
+                .legacy_gpu_match_kernel_dispatch_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_match_submit_ms: self.legacy_gpu_match_submit_ns.load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_integrated_chunks: self.legacy_gpu_integrated_chunks.load(Ordering::Relaxed),
+            legacy_gpu_fallback_match_chunks: self
+                .legacy_gpu_fallback_match_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_error_chunks: self
+                .legacy_gpu_fallback_integrated_error_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_invalid_options_chunks: self
+                .legacy_gpu_fallback_integrated_invalid_options_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_invalid_stream_chunks: self
+                .legacy_gpu_fallback_integrated_invalid_stream_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_numeric_overflow_chunks: self
+                .legacy_gpu_fallback_integrated_numeric_overflow_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_gpu_error_chunks: self
+                .legacy_gpu_fallback_integrated_gpu_error_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_other_error_chunks: self
+                .legacy_gpu_fallback_integrated_other_error_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_integrated_output_mismatch_chunks: self
+                .legacy_gpu_fallback_integrated_output_mismatch_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_match_error_chunks: self
+                .legacy_gpu_fallback_match_error_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_match_output_mismatch_chunks: self
+                .legacy_gpu_fallback_match_output_mismatch_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_fallback_match_packed_len_mismatch_chunks: self
+                .legacy_gpu_fallback_match_packed_len_mismatch_chunks
+                .load(Ordering::Relaxed),
+            legacy_gpu_call_pack_bind_group_ms: self
+                .legacy_gpu_call_pack_bind_group_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_call_encoder_create_ms: self
+                .legacy_gpu_call_encoder_create_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_call_table_stream_copy_ms: self
+                .legacy_gpu_call_table_stream_copy_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_call_match_clear_ms: self
+                .legacy_gpu_call_match_clear_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_call_sparse_prepare_dispatch_ms: self
+                .legacy_gpu_call_sparse_prepare_dispatch_ns
+                .load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_call_sparse_pack_dispatch_ms: self
+                .legacy_gpu_call_sparse_pack_dispatch_ns
+                .load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_call_result_readback_setup_ms: self
+                .legacy_gpu_call_result_readback_setup_ns
+                .load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_call_payload_readback_setup_ms: self
+                .legacy_gpu_call_payload_readback_setup_ns
+                .load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+            legacy_gpu_post_total_pack_bytes_ms: self
+                .legacy_gpu_post_total_pack_bytes_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_post_scale_profiles_ms: self
+                .legacy_gpu_post_scale_profiles_ns
+                .load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            legacy_gpu_post_chunk_materialize_ms: self
+                .legacy_gpu_post_chunk_materialize_ns
+                .load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             legacy_gpu_table_build_ms: self.legacy_gpu_table_build_ns.load(Ordering::Relaxed)
                 as f64
@@ -878,7 +1029,7 @@ fn deflate_decompress_on_cpu_with_capacity(
     Ok(decoder.finish()?)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeflateCpuStreamStats {
     pub input_bytes: u64,
     pub output_bytes: u64,
@@ -943,6 +1094,33 @@ pub struct DeflateCpuStreamStats {
     pub legacy_gpu_profile_call_ms: f64,
     pub legacy_gpu_finalize_ms: f64,
     pub legacy_gpu_match_total_ms: f64,
+    pub legacy_gpu_match_table_copy_ms: f64,
+    pub legacy_gpu_match_prepare_dispatch_ms: f64,
+    pub legacy_gpu_match_kernel_dispatch_ms: f64,
+    pub legacy_gpu_match_submit_ms: f64,
+    pub legacy_gpu_integrated_chunks: usize,
+    pub legacy_gpu_fallback_match_chunks: usize,
+    pub legacy_gpu_fallback_integrated_error_chunks: usize,
+    pub legacy_gpu_fallback_integrated_invalid_options_chunks: usize,
+    pub legacy_gpu_fallback_integrated_invalid_stream_chunks: usize,
+    pub legacy_gpu_fallback_integrated_numeric_overflow_chunks: usize,
+    pub legacy_gpu_fallback_integrated_gpu_error_chunks: usize,
+    pub legacy_gpu_fallback_integrated_other_error_chunks: usize,
+    pub legacy_gpu_fallback_integrated_output_mismatch_chunks: usize,
+    pub legacy_gpu_fallback_match_error_chunks: usize,
+    pub legacy_gpu_fallback_match_output_mismatch_chunks: usize,
+    pub legacy_gpu_fallback_match_packed_len_mismatch_chunks: usize,
+    pub legacy_gpu_call_pack_bind_group_ms: f64,
+    pub legacy_gpu_call_encoder_create_ms: f64,
+    pub legacy_gpu_call_table_stream_copy_ms: f64,
+    pub legacy_gpu_call_match_clear_ms: f64,
+    pub legacy_gpu_call_sparse_prepare_dispatch_ms: f64,
+    pub legacy_gpu_call_sparse_pack_dispatch_ms: f64,
+    pub legacy_gpu_call_result_readback_setup_ms: f64,
+    pub legacy_gpu_call_payload_readback_setup_ms: f64,
+    pub legacy_gpu_post_total_pack_bytes_ms: f64,
+    pub legacy_gpu_post_scale_profiles_ms: f64,
+    pub legacy_gpu_post_chunk_materialize_ms: f64,
     pub legacy_gpu_table_build_ms: f64,
     pub legacy_gpu_header_pack_ms: f64,
     pub legacy_gpu_section_encode_ms: f64,
@@ -1522,6 +1700,52 @@ fn deflate_decompress_stream_hybrid_indexed_with_context<R: Read, W: Write>(
     stats.legacy_gpu_profile_call_ms = counter_snapshot.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms = counter_snapshot.legacy_gpu_finalize_ms;
     stats.legacy_gpu_match_total_ms = counter_snapshot.legacy_gpu_match_total_ms;
+    stats.legacy_gpu_match_table_copy_ms = counter_snapshot.legacy_gpu_match_table_copy_ms;
+    stats.legacy_gpu_match_prepare_dispatch_ms =
+        counter_snapshot.legacy_gpu_match_prepare_dispatch_ms;
+    stats.legacy_gpu_match_kernel_dispatch_ms =
+        counter_snapshot.legacy_gpu_match_kernel_dispatch_ms;
+    stats.legacy_gpu_match_submit_ms = counter_snapshot.legacy_gpu_match_submit_ms;
+    stats.legacy_gpu_integrated_chunks = counter_snapshot.legacy_gpu_integrated_chunks;
+    stats.legacy_gpu_fallback_match_chunks = counter_snapshot.legacy_gpu_fallback_match_chunks;
+    stats.legacy_gpu_fallback_integrated_error_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_error_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_options_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_invalid_options_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_stream_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_invalid_stream_chunks;
+    stats.legacy_gpu_fallback_integrated_numeric_overflow_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_numeric_overflow_chunks;
+    stats.legacy_gpu_fallback_integrated_gpu_error_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_gpu_error_chunks;
+    stats.legacy_gpu_fallback_integrated_other_error_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_other_error_chunks;
+    stats.legacy_gpu_fallback_integrated_output_mismatch_chunks =
+        counter_snapshot.legacy_gpu_fallback_integrated_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_error_chunks =
+        counter_snapshot.legacy_gpu_fallback_match_error_chunks;
+    stats.legacy_gpu_fallback_match_output_mismatch_chunks =
+        counter_snapshot.legacy_gpu_fallback_match_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_packed_len_mismatch_chunks =
+        counter_snapshot.legacy_gpu_fallback_match_packed_len_mismatch_chunks;
+    stats.legacy_gpu_call_pack_bind_group_ms = counter_snapshot.legacy_gpu_call_pack_bind_group_ms;
+    stats.legacy_gpu_call_encoder_create_ms = counter_snapshot.legacy_gpu_call_encoder_create_ms;
+    stats.legacy_gpu_call_table_stream_copy_ms =
+        counter_snapshot.legacy_gpu_call_table_stream_copy_ms;
+    stats.legacy_gpu_call_match_clear_ms = counter_snapshot.legacy_gpu_call_match_clear_ms;
+    stats.legacy_gpu_call_sparse_prepare_dispatch_ms =
+        counter_snapshot.legacy_gpu_call_sparse_prepare_dispatch_ms;
+    stats.legacy_gpu_call_sparse_pack_dispatch_ms =
+        counter_snapshot.legacy_gpu_call_sparse_pack_dispatch_ms;
+    stats.legacy_gpu_call_result_readback_setup_ms =
+        counter_snapshot.legacy_gpu_call_result_readback_setup_ms;
+    stats.legacy_gpu_call_payload_readback_setup_ms =
+        counter_snapshot.legacy_gpu_call_payload_readback_setup_ms;
+    stats.legacy_gpu_post_total_pack_bytes_ms =
+        counter_snapshot.legacy_gpu_post_total_pack_bytes_ms;
+    stats.legacy_gpu_post_scale_profiles_ms = counter_snapshot.legacy_gpu_post_scale_profiles_ms;
+    stats.legacy_gpu_post_chunk_materialize_ms =
+        counter_snapshot.legacy_gpu_post_chunk_materialize_ms;
     stats.legacy_gpu_table_build_ms = counter_snapshot.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms = counter_snapshot.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms = counter_snapshot.legacy_gpu_section_encode_ms;
@@ -3353,6 +3577,46 @@ fn deflate_compress_stream_hybrid_zip_compatible_continuous_with_context<
     stats.legacy_gpu_profile_call_ms += counters.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms += counters.legacy_gpu_finalize_ms;
     stats.legacy_gpu_match_total_ms += counters.legacy_gpu_match_total_ms;
+    stats.legacy_gpu_match_table_copy_ms += counters.legacy_gpu_match_table_copy_ms;
+    stats.legacy_gpu_match_prepare_dispatch_ms += counters.legacy_gpu_match_prepare_dispatch_ms;
+    stats.legacy_gpu_match_kernel_dispatch_ms += counters.legacy_gpu_match_kernel_dispatch_ms;
+    stats.legacy_gpu_match_submit_ms += counters.legacy_gpu_match_submit_ms;
+    stats.legacy_gpu_integrated_chunks += counters.legacy_gpu_integrated_chunks;
+    stats.legacy_gpu_fallback_match_chunks += counters.legacy_gpu_fallback_match_chunks;
+    stats.legacy_gpu_fallback_integrated_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_error_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_options_chunks +=
+        counters.legacy_gpu_fallback_integrated_invalid_options_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_stream_chunks +=
+        counters.legacy_gpu_fallback_integrated_invalid_stream_chunks;
+    stats.legacy_gpu_fallback_integrated_numeric_overflow_chunks +=
+        counters.legacy_gpu_fallback_integrated_numeric_overflow_chunks;
+    stats.legacy_gpu_fallback_integrated_gpu_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_gpu_error_chunks;
+    stats.legacy_gpu_fallback_integrated_other_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_other_error_chunks;
+    stats.legacy_gpu_fallback_integrated_output_mismatch_chunks +=
+        counters.legacy_gpu_fallback_integrated_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_error_chunks += counters.legacy_gpu_fallback_match_error_chunks;
+    stats.legacy_gpu_fallback_match_output_mismatch_chunks +=
+        counters.legacy_gpu_fallback_match_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_packed_len_mismatch_chunks +=
+        counters.legacy_gpu_fallback_match_packed_len_mismatch_chunks;
+    stats.legacy_gpu_call_pack_bind_group_ms += counters.legacy_gpu_call_pack_bind_group_ms;
+    stats.legacy_gpu_call_encoder_create_ms += counters.legacy_gpu_call_encoder_create_ms;
+    stats.legacy_gpu_call_table_stream_copy_ms += counters.legacy_gpu_call_table_stream_copy_ms;
+    stats.legacy_gpu_call_match_clear_ms += counters.legacy_gpu_call_match_clear_ms;
+    stats.legacy_gpu_call_sparse_prepare_dispatch_ms +=
+        counters.legacy_gpu_call_sparse_prepare_dispatch_ms;
+    stats.legacy_gpu_call_sparse_pack_dispatch_ms +=
+        counters.legacy_gpu_call_sparse_pack_dispatch_ms;
+    stats.legacy_gpu_call_result_readback_setup_ms +=
+        counters.legacy_gpu_call_result_readback_setup_ms;
+    stats.legacy_gpu_call_payload_readback_setup_ms +=
+        counters.legacy_gpu_call_payload_readback_setup_ms;
+    stats.legacy_gpu_post_total_pack_bytes_ms += counters.legacy_gpu_post_total_pack_bytes_ms;
+    stats.legacy_gpu_post_scale_profiles_ms += counters.legacy_gpu_post_scale_profiles_ms;
+    stats.legacy_gpu_post_chunk_materialize_ms += counters.legacy_gpu_post_chunk_materialize_ms;
     stats.legacy_gpu_table_build_ms += counters.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms += counters.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms += counters.legacy_gpu_section_encode_ms;
@@ -3627,6 +3891,46 @@ fn pdeflate_compress_stream_hybrid_payload_with_context<R: Read + Send, W: Write
     stats.legacy_gpu_profile_call_ms += counters.legacy_gpu_profile_call_ms;
     stats.legacy_gpu_finalize_ms += counters.legacy_gpu_finalize_ms;
     stats.legacy_gpu_match_total_ms += counters.legacy_gpu_match_total_ms;
+    stats.legacy_gpu_match_table_copy_ms += counters.legacy_gpu_match_table_copy_ms;
+    stats.legacy_gpu_match_prepare_dispatch_ms += counters.legacy_gpu_match_prepare_dispatch_ms;
+    stats.legacy_gpu_match_kernel_dispatch_ms += counters.legacy_gpu_match_kernel_dispatch_ms;
+    stats.legacy_gpu_match_submit_ms += counters.legacy_gpu_match_submit_ms;
+    stats.legacy_gpu_integrated_chunks += counters.legacy_gpu_integrated_chunks;
+    stats.legacy_gpu_fallback_match_chunks += counters.legacy_gpu_fallback_match_chunks;
+    stats.legacy_gpu_fallback_integrated_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_error_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_options_chunks +=
+        counters.legacy_gpu_fallback_integrated_invalid_options_chunks;
+    stats.legacy_gpu_fallback_integrated_invalid_stream_chunks +=
+        counters.legacy_gpu_fallback_integrated_invalid_stream_chunks;
+    stats.legacy_gpu_fallback_integrated_numeric_overflow_chunks +=
+        counters.legacy_gpu_fallback_integrated_numeric_overflow_chunks;
+    stats.legacy_gpu_fallback_integrated_gpu_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_gpu_error_chunks;
+    stats.legacy_gpu_fallback_integrated_other_error_chunks +=
+        counters.legacy_gpu_fallback_integrated_other_error_chunks;
+    stats.legacy_gpu_fallback_integrated_output_mismatch_chunks +=
+        counters.legacy_gpu_fallback_integrated_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_error_chunks += counters.legacy_gpu_fallback_match_error_chunks;
+    stats.legacy_gpu_fallback_match_output_mismatch_chunks +=
+        counters.legacy_gpu_fallback_match_output_mismatch_chunks;
+    stats.legacy_gpu_fallback_match_packed_len_mismatch_chunks +=
+        counters.legacy_gpu_fallback_match_packed_len_mismatch_chunks;
+    stats.legacy_gpu_call_pack_bind_group_ms += counters.legacy_gpu_call_pack_bind_group_ms;
+    stats.legacy_gpu_call_encoder_create_ms += counters.legacy_gpu_call_encoder_create_ms;
+    stats.legacy_gpu_call_table_stream_copy_ms += counters.legacy_gpu_call_table_stream_copy_ms;
+    stats.legacy_gpu_call_match_clear_ms += counters.legacy_gpu_call_match_clear_ms;
+    stats.legacy_gpu_call_sparse_prepare_dispatch_ms +=
+        counters.legacy_gpu_call_sparse_prepare_dispatch_ms;
+    stats.legacy_gpu_call_sparse_pack_dispatch_ms +=
+        counters.legacy_gpu_call_sparse_pack_dispatch_ms;
+    stats.legacy_gpu_call_result_readback_setup_ms +=
+        counters.legacy_gpu_call_result_readback_setup_ms;
+    stats.legacy_gpu_call_payload_readback_setup_ms +=
+        counters.legacy_gpu_call_payload_readback_setup_ms;
+    stats.legacy_gpu_post_total_pack_bytes_ms += counters.legacy_gpu_post_total_pack_bytes_ms;
+    stats.legacy_gpu_post_scale_profiles_ms += counters.legacy_gpu_post_scale_profiles_ms;
+    stats.legacy_gpu_post_chunk_materialize_ms += counters.legacy_gpu_post_chunk_materialize_ms;
     stats.legacy_gpu_table_build_ms += counters.legacy_gpu_table_build_ms;
     stats.legacy_gpu_header_pack_ms += counters.legacy_gpu_header_pack_ms;
     stats.legacy_gpu_section_encode_ms += counters.legacy_gpu_section_encode_ms;
@@ -3997,6 +4301,133 @@ fn compress_gpu_stream_worker_pdeflate_payload(
             );
             counters.legacy_gpu_match_total_ns.fetch_add(
                 (breakdown.match_total_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_match_table_copy_ns.fetch_add(
+                (breakdown.gpu_match_table_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_match_prepare_dispatch_ns.fetch_add(
+                (breakdown.gpu_match_prepare_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_match_kernel_dispatch_ns.fetch_add(
+                (breakdown.gpu_match_kernel_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_match_submit_ns.fetch_add(
+                (breakdown.gpu_match_submit_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_integrated_chunks
+                .fetch_add(breakdown.gpu_integrated_chunks, Ordering::Relaxed);
+            counters
+                .legacy_gpu_fallback_match_chunks
+                .fetch_add(breakdown.gpu_fallback_match_chunks, Ordering::Relaxed);
+            counters
+                .legacy_gpu_fallback_integrated_error_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_error_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_invalid_options_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_invalid_options_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_invalid_stream_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_invalid_stream_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_numeric_overflow_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_numeric_overflow_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_gpu_error_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_gpu_error_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_other_error_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_other_error_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_integrated_output_mismatch_chunks
+                .fetch_add(
+                    breakdown.fallback_integrated_output_mismatch_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_match_error_chunks
+                .fetch_add(breakdown.fallback_match_error_chunks, Ordering::Relaxed);
+            counters
+                .legacy_gpu_fallback_match_output_mismatch_chunks
+                .fetch_add(
+                    breakdown.fallback_match_output_mismatch_chunks,
+                    Ordering::Relaxed,
+                );
+            counters
+                .legacy_gpu_fallback_match_packed_len_mismatch_chunks
+                .fetch_add(
+                    breakdown.fallback_match_packed_len_mismatch_chunks,
+                    Ordering::Relaxed,
+                );
+            counters.legacy_gpu_call_pack_bind_group_ns.fetch_add(
+                (breakdown.gpu_call_pack_bind_group_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_call_encoder_create_ns.fetch_add(
+                (breakdown.gpu_call_encoder_create_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_call_table_stream_copy_ns.fetch_add(
+                (breakdown.gpu_call_table_stream_copy_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_call_match_clear_ns.fetch_add(
+                (breakdown.gpu_call_match_clear_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_call_sparse_prepare_dispatch_ns
+                .fetch_add(
+                    (breakdown.gpu_call_sparse_prepare_dispatch_ms * 1_000_000.0) as u64,
+                    Ordering::Relaxed,
+                );
+            counters.legacy_gpu_call_sparse_pack_dispatch_ns.fetch_add(
+                (breakdown.gpu_call_sparse_pack_dispatch_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_call_result_readback_setup_ns.fetch_add(
+                (breakdown.gpu_call_result_readback_setup_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters
+                .legacy_gpu_call_payload_readback_setup_ns
+                .fetch_add(
+                    (breakdown.gpu_call_payload_readback_setup_ms * 1_000_000.0) as u64,
+                    Ordering::Relaxed,
+                );
+            counters.legacy_gpu_post_total_pack_bytes_ns.fetch_add(
+                (breakdown.post_total_pack_bytes_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_post_scale_profiles_ns.fetch_add(
+                (breakdown.post_scale_profiles_ms * 1_000_000.0) as u64,
+                Ordering::Relaxed,
+            );
+            counters.legacy_gpu_post_chunk_materialize_ns.fetch_add(
+                (breakdown.post_chunk_materialize_ms * 1_000_000.0) as u64,
                 Ordering::Relaxed,
             );
             counters.legacy_gpu_table_build_ns.fetch_add(

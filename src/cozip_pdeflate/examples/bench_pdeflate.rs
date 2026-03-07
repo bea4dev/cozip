@@ -102,7 +102,7 @@ impl Default for BenchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RunResult {
     comp_ms: f64,
     decomp_ms: Option<f64>,
@@ -1131,6 +1131,23 @@ fn main() -> Result<(), String> {
         k1_pack_inputs_ms + k2_scratch_ms + k3_match_ms + k4_section_ms + k5_sparse_ms;
     let call_other_ms = (last_hybrid_stats.legacy_gpu_profile_call_ms - call_known_ms).max(0.0);
     let profile_call_ms = last_hybrid_stats.legacy_gpu_profile_call_ms.max(1e-9);
+    let c1_match_profile_ms = last_hybrid_stats.legacy_gpu_match_total_ms;
+    let c2_section_profile_ms = last_hybrid_stats.legacy_gpu_section_encode_ms;
+    let c3_header_pack_ms = last_hybrid_stats.legacy_gpu_header_pack_ms;
+    let c4_sparse_profile_ms = last_hybrid_stats.legacy_gpu_sparse_total_ms;
+    let profile_stage_known_ms =
+        c1_match_profile_ms + c2_section_profile_ms + c3_header_pack_ms + c4_sparse_profile_ms;
+    let profile_stage_other_ms =
+        (last_hybrid_stats.legacy_gpu_profile_call_ms - profile_stage_known_ms).max(0.0);
+    let t1_upload_ms = last_hybrid_stats.legacy_gpu_upload_ms;
+    let t2_wait_ms = last_hybrid_stats.legacy_gpu_wait_ms;
+    let t3_map_copy_ms = last_hybrid_stats.legacy_gpu_map_copy_ms;
+    let profile_transport_known_ms = t1_upload_ms + t2_wait_ms + t3_map_copy_ms;
+    let profile_transport_other_ms =
+        (last_hybrid_stats.legacy_gpu_total_ms - profile_transport_known_ms).max(0.0);
+    let call_minus_profile_total_ms = (last_hybrid_stats.legacy_gpu_profile_call_ms
+        - last_hybrid_stats.legacy_gpu_total_ms)
+        .max(0.0);
     println!(
         "[cozip_pdeflate][timing][hybrid-gpu-call-breakdown] k1_pack_inputs_ms={:.3} k2_scratch_ms={:.3} k3_match_stage_ms={:.3} k4_section_stage_ms={:.3} k5_sparse_stage_ms={:.3} call_other_ms={:.3} k1_pct={:.1} k2_pct={:.1} k3_pct={:.1} k4_pct={:.1} k5_pct={:.1} other_pct={:.1}",
         k1_pack_inputs_ms,
@@ -1145,6 +1162,145 @@ fn main() -> Result<(), String> {
         100.0 * k4_section_ms / profile_call_ms,
         100.0 * k5_sparse_ms / profile_call_ms,
         100.0 * call_other_ms / profile_call_ms
+    );
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-call-accounting] profile_call_ms={:.3} profile_total_ms={:.3} stage_match_ms={:.3} stage_section_ms={:.3} stage_header_pack_ms={:.3} stage_sparse_ms={:.3} stage_other_ms={:.3} upload_ms={:.3} wait_ms={:.3} map_copy_ms={:.3} transport_other_ms={:.3} call_minus_profile_total_ms={:.3}",
+        last_hybrid_stats.legacy_gpu_profile_call_ms,
+        last_hybrid_stats.legacy_gpu_total_ms,
+        c1_match_profile_ms,
+        c2_section_profile_ms,
+        c3_header_pack_ms,
+        c4_sparse_profile_ms,
+        profile_stage_other_ms,
+        t1_upload_ms,
+        t2_wait_ms,
+        t3_map_copy_ms,
+        profile_transport_other_ms,
+        call_minus_profile_total_ms
+    );
+    let post_total_pack_bytes_ms = last_hybrid_stats.legacy_gpu_post_total_pack_bytes_ms;
+    let post_scale_profiles_ms = last_hybrid_stats.legacy_gpu_post_scale_profiles_ms;
+    let post_chunk_materialize_ms = last_hybrid_stats.legacy_gpu_post_chunk_materialize_ms;
+    let post_total_ms =
+        post_total_pack_bytes_ms + post_scale_profiles_ms + post_chunk_materialize_ms;
+    let residual_after_post_ms = (call_minus_profile_total_ms - post_total_ms).max(0.0);
+    let stage_other_after_post_ms = (profile_stage_other_ms - post_total_ms).max(0.0);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-call-post] post_total_pack_bytes_ms={:.3} post_scale_profiles_ms={:.3} post_chunk_materialize_ms={:.3} post_total_ms={:.3} residual_after_post_ms={:.3} stage_other_after_post_ms={:.3}",
+        post_total_pack_bytes_ms,
+        post_scale_profiles_ms,
+        post_chunk_materialize_ms,
+        post_total_ms,
+        residual_after_post_ms,
+        stage_other_after_post_ms
+    );
+    let unaccounted_pack_bind_group_ms = last_hybrid_stats.legacy_gpu_call_pack_bind_group_ms;
+    let unaccounted_encoder_create_ms = last_hybrid_stats.legacy_gpu_call_encoder_create_ms;
+    let unaccounted_table_stream_copy_ms = last_hybrid_stats.legacy_gpu_call_table_stream_copy_ms;
+    let unaccounted_match_clear_ms = last_hybrid_stats.legacy_gpu_call_match_clear_ms;
+    let unaccounted_sparse_prepare_dispatch_ms =
+        last_hybrid_stats.legacy_gpu_call_sparse_prepare_dispatch_ms;
+    let unaccounted_sparse_pack_dispatch_ms =
+        last_hybrid_stats.legacy_gpu_call_sparse_pack_dispatch_ms;
+    let unaccounted_result_readback_setup_ms =
+        last_hybrid_stats.legacy_gpu_call_result_readback_setup_ms;
+    let unaccounted_payload_readback_setup_ms =
+        last_hybrid_stats.legacy_gpu_call_payload_readback_setup_ms;
+    let unaccounted_known_ms = unaccounted_pack_bind_group_ms
+        + unaccounted_encoder_create_ms
+        + unaccounted_table_stream_copy_ms
+        + unaccounted_match_clear_ms
+        + unaccounted_sparse_prepare_dispatch_ms
+        + unaccounted_sparse_pack_dispatch_ms
+        + unaccounted_result_readback_setup_ms
+        + unaccounted_payload_readback_setup_ms;
+    let unaccounted_residual_ms = (call_minus_profile_total_ms - unaccounted_known_ms).max(0.0);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-call-unaccounted] pack_bind_group_ms={:.3} encoder_create_ms={:.3} table_stream_copy_ms={:.3} match_clear_ms={:.3} sparse_prepare_dispatch_ms={:.3} sparse_pack_dispatch_ms={:.3} result_readback_setup_ms={:.3} payload_readback_setup_ms={:.3} known_ms={:.3} residual_ms={:.3}",
+        unaccounted_pack_bind_group_ms,
+        unaccounted_encoder_create_ms,
+        unaccounted_table_stream_copy_ms,
+        unaccounted_match_clear_ms,
+        unaccounted_sparse_prepare_dispatch_ms,
+        unaccounted_sparse_pack_dispatch_ms,
+        unaccounted_result_readback_setup_ms,
+        unaccounted_payload_readback_setup_ms,
+        unaccounted_known_ms,
+        unaccounted_residual_ms
+    );
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-match-breakdown] table_copy_ms={:.3} prepare_dispatch_ms={:.3} kernel_dispatch_ms={:.3} submit_ms={:.3} subtotal_ms={:.3} match_total_ms={:.3} residual_ms={:.3}",
+        last_hybrid_stats.legacy_gpu_match_table_copy_ms,
+        last_hybrid_stats.legacy_gpu_match_prepare_dispatch_ms,
+        last_hybrid_stats.legacy_gpu_match_kernel_dispatch_ms,
+        last_hybrid_stats.legacy_gpu_match_submit_ms,
+        last_hybrid_stats.legacy_gpu_match_table_copy_ms
+            + last_hybrid_stats.legacy_gpu_match_prepare_dispatch_ms
+            + last_hybrid_stats.legacy_gpu_match_kernel_dispatch_ms
+            + last_hybrid_stats.legacy_gpu_match_submit_ms,
+        last_hybrid_stats.legacy_gpu_match_total_ms,
+        (last_hybrid_stats.legacy_gpu_match_total_ms
+            - (last_hybrid_stats.legacy_gpu_match_table_copy_ms
+                + last_hybrid_stats.legacy_gpu_match_prepare_dispatch_ms
+                + last_hybrid_stats.legacy_gpu_match_kernel_dispatch_ms
+                + last_hybrid_stats.legacy_gpu_match_submit_ms))
+            .max(0.0)
+    );
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-paths] gpu_assigned_chunks={} integrated_chunks={} fallback_match_chunks={} integrated_pct_assigned={:.1} fallback_pct_assigned={:.1}",
+        last_hybrid_stats.gpu_chunks,
+        last_hybrid_stats.legacy_gpu_integrated_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_match_chunks,
+        if last_hybrid_stats.gpu_chunks > 0 {
+            100.0 * (last_hybrid_stats.legacy_gpu_integrated_chunks as f64)
+                / (last_hybrid_stats.gpu_chunks as f64)
+        } else {
+            0.0
+        },
+        if last_hybrid_stats.gpu_chunks > 0 {
+            100.0 * (last_hybrid_stats.legacy_gpu_fallback_match_chunks as f64)
+                / (last_hybrid_stats.gpu_chunks as f64)
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-fallbacks] integrated_error_chunks={} invalid_options_chunks={} invalid_stream_chunks={} numeric_overflow_chunks={} gpu_error_chunks={} other_error_chunks={} integrated_output_mismatch_chunks={} fallback_match_error_chunks={} fallback_match_output_mismatch_chunks={} fallback_match_packed_len_mismatch_chunks={}",
+        last_hybrid_stats.legacy_gpu_fallback_integrated_error_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_invalid_options_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_invalid_stream_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_numeric_overflow_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_gpu_error_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_other_error_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_integrated_output_mismatch_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_match_error_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_match_output_mismatch_chunks,
+        last_hybrid_stats.legacy_gpu_fallback_match_packed_len_mismatch_chunks
+    );
+    let pass_match_ms = last_hybrid_stats.legacy_gpu_match_total_ms.max(
+        last_hybrid_stats.legacy_gpu_kernel_match_dispatch_ms
+            + last_hybrid_stats.legacy_gpu_kernel_match_submit_ms,
+    );
+    let pass_section_ms = last_hybrid_stats.legacy_gpu_section_encode_ms.max(
+        last_hybrid_stats.legacy_gpu_kernel_section_dispatch_ms
+            + last_hybrid_stats.legacy_gpu_kernel_section_submit_ms
+            + last_hybrid_stats.legacy_gpu_kernel_section_wait_ms,
+    );
+    let pass_header_pack_ms = last_hybrid_stats.legacy_gpu_header_pack_ms;
+    let pass_sparse_ms = last_hybrid_stats.legacy_gpu_sparse_total_ms;
+    let pass_transport_ms = last_hybrid_stats.legacy_gpu_total_ms;
+    let pass_total_ms =
+        pass_match_ms + pass_section_ms + pass_header_pack_ms + pass_sparse_ms + pass_transport_ms;
+    let pass_residual_ms = (last_hybrid_stats.legacy_gpu_profile_call_ms - pass_total_ms).max(0.0);
+    println!(
+        "[cozip_pdeflate][timing][hybrid-gpu-call-pass-groups] match_ms={:.3} section_ms={:.3} header_pack_ms={:.3} sparse_ms={:.3} transport_ms={:.3} grouped_ms={:.3} residual_ms={:.3}",
+        pass_match_ms,
+        pass_section_ms,
+        pass_header_pack_ms,
+        pass_sparse_ms,
+        pass_transport_ms,
+        pass_total_ms,
+        pass_residual_ms
     );
     let p1_alloc_ms = last_hybrid_stats.legacy_gpu_kernel_pack_alloc_setup_ms;
     let p2_resolve_ms = last_hybrid_stats.legacy_gpu_kernel_pack_resolve_sizes_ms;

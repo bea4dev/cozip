@@ -26,6 +26,7 @@ const EMPTY_CANDIDATES: [usize; 0] = [];
 const PREFIX_BUCKET_COUNT: usize = 256 * 256;
 static PROFILE_DETAIL_GPU_PACK_SEQ: AtomicU64 = AtomicU64::new(0);
 static PROFILE_DETAIL_GPU_BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+static GPU_INTEGRATED_ERROR_SAMPLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Default)]
 struct EncodeScratch {
@@ -291,11 +292,24 @@ struct BuiltTableDispatch {
     build_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct GpuBatchCompressProfile {
     chunks_total: usize,
     gpu_job_chunks: usize,
     gpu_used_chunks: usize,
+    gpu_integrated_chunks: usize,
+    gpu_fallback_match_chunks: usize,
+    fallback_integrated_error_chunks: usize,
+    fallback_integrated_invalid_options_chunks: usize,
+    fallback_integrated_invalid_stream_chunks: usize,
+    fallback_integrated_numeric_overflow_chunks: usize,
+    fallback_integrated_gpu_error_chunks: usize,
+    fallback_integrated_other_error_chunks: usize,
+    fallback_integrated_output_mismatch_chunks: usize,
+    fallback_match_error_chunks: usize,
+    fallback_match_output_mismatch_chunks: usize,
+    fallback_match_packed_len_mismatch_chunks: usize,
+    fallback_integrated_error_example: Option<String>,
     prepare_ms: f64,
     prepare_table_build_ms: f64,
     prepare_table_readback_ms: f64,
@@ -366,11 +380,22 @@ struct GpuBatchCompressProfile {
     gpu_sparse_wait_ms: f64,
     gpu_sparse_copy_ms: f64,
     gpu_sparse_total_ms: f64,
+    gpu_call_pack_bind_group_ms: f64,
+    gpu_call_encoder_create_ms: f64,
+    gpu_call_table_stream_copy_ms: f64,
+    gpu_call_match_clear_ms: f64,
+    gpu_call_sparse_prepare_dispatch_ms: f64,
+    gpu_call_sparse_pack_dispatch_ms: f64,
+    gpu_call_result_readback_setup_ms: f64,
+    gpu_call_payload_readback_setup_ms: f64,
+    gpu_post_total_pack_bytes_ms: f64,
+    gpu_post_scale_profiles_ms: f64,
+    gpu_post_chunk_materialize_ms: f64,
     finalize_ms: f64,
     total_ms: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct HybridCompressSchedulerProfile {
     cpu_chunks: usize,
     gpu_batches: usize,
@@ -378,6 +403,19 @@ struct HybridCompressSchedulerProfile {
     gpu_chunks_encoded: usize,
     gpu_job_chunks: usize,
     gpu_used_chunks: usize,
+    gpu_integrated_chunks: usize,
+    gpu_fallback_match_chunks: usize,
+    fallback_integrated_error_chunks: usize,
+    fallback_integrated_invalid_options_chunks: usize,
+    fallback_integrated_invalid_stream_chunks: usize,
+    fallback_integrated_numeric_overflow_chunks: usize,
+    fallback_integrated_gpu_error_chunks: usize,
+    fallback_integrated_other_error_chunks: usize,
+    fallback_integrated_output_mismatch_chunks: usize,
+    fallback_match_error_chunks: usize,
+    fallback_match_output_mismatch_chunks: usize,
+    fallback_match_packed_len_mismatch_chunks: usize,
+    fallback_integrated_error_example: Option<String>,
     cpu_lock_wait_ms: f64,
     gpu_lock_wait_ms: f64,
     cpu_encode_ms: f64,
@@ -388,6 +426,7 @@ struct HybridCompressSchedulerProfile {
     gpu_no_task_events: usize,
     gpu_prepare_ms: f64,
     gpu_call_ms: f64,
+    gpu_match_total_ms: f64,
     gpu_match_upload_ms: f64,
     gpu_match_wait_ms: f64,
     gpu_match_map_copy_ms: f64,
@@ -450,6 +489,17 @@ struct HybridCompressSchedulerProfile {
     gpu_sparse_wait_ms: f64,
     gpu_sparse_copy_ms: f64,
     gpu_sparse_total_ms: f64,
+    gpu_call_pack_bind_group_ms: f64,
+    gpu_call_encoder_create_ms: f64,
+    gpu_call_table_stream_copy_ms: f64,
+    gpu_call_match_clear_ms: f64,
+    gpu_call_sparse_prepare_dispatch_ms: f64,
+    gpu_call_sparse_pack_dispatch_ms: f64,
+    gpu_call_result_readback_setup_ms: f64,
+    gpu_call_payload_readback_setup_ms: f64,
+    gpu_post_total_pack_bytes_ms: f64,
+    gpu_post_scale_profiles_ms: f64,
+    gpu_post_chunk_materialize_ms: f64,
     gpu_finalize_ms: f64,
     gpu_batch_total_ms: f64,
 }
@@ -696,6 +746,18 @@ pub struct PDeflateChunkPayload {
 pub struct PDeflateGpuBatchBreakdown {
     pub chunks_total: usize,
     pub gpu_used_chunks: usize,
+    pub gpu_integrated_chunks: usize,
+    pub gpu_fallback_match_chunks: usize,
+    pub fallback_integrated_error_chunks: usize,
+    pub fallback_integrated_invalid_options_chunks: usize,
+    pub fallback_integrated_invalid_stream_chunks: usize,
+    pub fallback_integrated_numeric_overflow_chunks: usize,
+    pub fallback_integrated_gpu_error_chunks: usize,
+    pub fallback_integrated_other_error_chunks: usize,
+    pub fallback_integrated_output_mismatch_chunks: usize,
+    pub fallback_match_error_chunks: usize,
+    pub fallback_match_output_mismatch_chunks: usize,
+    pub fallback_match_packed_len_mismatch_chunks: usize,
     pub prepare_ms: f64,
     pub prepare_table_build_ms: f64,
     pub prepare_table_readback_ms: f64,
@@ -704,6 +766,9 @@ pub struct PDeflateGpuBatchBreakdown {
     pub prepare_gpu_table_readback_chunks: usize,
     pub gpu_call_ms: f64,
     pub match_total_ms: f64,
+    pub post_total_pack_bytes_ms: f64,
+    pub post_scale_profiles_ms: f64,
+    pub post_chunk_materialize_ms: f64,
     pub finalize_ms: f64,
     pub total_ms: f64,
     pub gpu_upload_ms: f64,
@@ -722,6 +787,18 @@ pub struct PDeflateGpuBatchBreakdown {
     pub sparse_lens_copy_ms: f64,
     pub sparse_copy_ms: f64,
     pub sparse_total_ms: f64,
+    pub gpu_call_pack_bind_group_ms: f64,
+    pub gpu_call_encoder_create_ms: f64,
+    pub gpu_call_table_stream_copy_ms: f64,
+    pub gpu_call_match_clear_ms: f64,
+    pub gpu_call_sparse_prepare_dispatch_ms: f64,
+    pub gpu_call_sparse_pack_dispatch_ms: f64,
+    pub gpu_call_result_readback_setup_ms: f64,
+    pub gpu_call_payload_readback_setup_ms: f64,
+    pub gpu_match_table_copy_ms: f64,
+    pub gpu_match_prepare_dispatch_ms: f64,
+    pub gpu_match_kernel_dispatch_ms: f64,
+    pub gpu_match_submit_ms: f64,
     pub kernel_pack_inputs_ms: f64,
     pub kernel_pack_alloc_setup_ms: f64,
     pub kernel_pack_resolve_sizes_ms: f64,
@@ -741,6 +818,15 @@ pub struct PDeflateGpuBatchBreakdown {
     pub kernel_section_dispatch_ms: f64,
     pub kernel_section_submit_ms: f64,
     pub kernel_section_wait_ms: f64,
+}
+
+fn classify_integrated_batch_error(err: &PDeflateError) -> &'static str {
+    match err {
+        PDeflateError::InvalidOptions(_) => "invalid_options",
+        PDeflateError::InvalidStream(_) => "invalid_stream",
+        PDeflateError::NumericOverflow => "numeric_overflow",
+        PDeflateError::Gpu(_) => "gpu_error",
+    }
 }
 
 pub(crate) fn pdeflate_compress_chunk_payload_cpu(
@@ -794,6 +880,25 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(
         let mut breakdown = PDeflateGpuBatchBreakdown {
             chunks_total: profile.chunks_total,
             gpu_used_chunks: profile.gpu_used_chunks,
+            gpu_integrated_chunks: profile.gpu_integrated_chunks,
+            gpu_fallback_match_chunks: profile.gpu_fallback_match_chunks,
+            fallback_integrated_error_chunks: profile.fallback_integrated_error_chunks,
+            fallback_integrated_invalid_options_chunks: profile
+                .fallback_integrated_invalid_options_chunks,
+            fallback_integrated_invalid_stream_chunks: profile
+                .fallback_integrated_invalid_stream_chunks,
+            fallback_integrated_numeric_overflow_chunks: profile
+                .fallback_integrated_numeric_overflow_chunks,
+            fallback_integrated_gpu_error_chunks: profile
+                .fallback_integrated_gpu_error_chunks,
+            fallback_integrated_other_error_chunks: profile
+                .fallback_integrated_other_error_chunks,
+            fallback_integrated_output_mismatch_chunks: profile
+                .fallback_integrated_output_mismatch_chunks,
+            fallback_match_error_chunks: profile.fallback_match_error_chunks,
+            fallback_match_output_mismatch_chunks: profile.fallback_match_output_mismatch_chunks,
+            fallback_match_packed_len_mismatch_chunks: profile
+                .fallback_match_packed_len_mismatch_chunks,
             prepare_ms: profile.prepare_ms,
             prepare_table_build_ms: profile.prepare_table_build_ms,
             prepare_table_readback_ms: profile.prepare_table_readback_ms,
@@ -802,6 +907,9 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(
             prepare_gpu_table_readback_chunks: profile.prepare_gpu_table_readback_chunks,
             gpu_call_ms: profile.gpu_call_ms,
             match_total_ms: profile.gpu_match_total_ms,
+            post_total_pack_bytes_ms: profile.gpu_post_total_pack_bytes_ms,
+            post_scale_profiles_ms: profile.gpu_post_scale_profiles_ms,
+            post_chunk_materialize_ms: profile.gpu_post_chunk_materialize_ms,
             finalize_ms: profile.finalize_ms,
             total_ms: profile.total_ms,
             gpu_upload_ms: profile.gpu_upload_ms,
@@ -817,6 +925,18 @@ pub(crate) fn pdeflate_compress_chunks_payload_gpu_batch_with_breakdown(
             sparse_lens_copy_ms: profile.gpu_sparse_lens_copy_ms,
             sparse_copy_ms: profile.gpu_sparse_copy_ms,
             sparse_total_ms: profile.gpu_sparse_total_ms,
+            gpu_call_pack_bind_group_ms: profile.gpu_call_pack_bind_group_ms,
+            gpu_call_encoder_create_ms: profile.gpu_call_encoder_create_ms,
+            gpu_call_table_stream_copy_ms: profile.gpu_call_table_stream_copy_ms,
+            gpu_call_match_clear_ms: profile.gpu_call_match_clear_ms,
+            gpu_call_sparse_prepare_dispatch_ms: profile.gpu_call_sparse_prepare_dispatch_ms,
+            gpu_call_sparse_pack_dispatch_ms: profile.gpu_call_sparse_pack_dispatch_ms,
+            gpu_call_result_readback_setup_ms: profile.gpu_call_result_readback_setup_ms,
+            gpu_call_payload_readback_setup_ms: profile.gpu_call_payload_readback_setup_ms,
+            gpu_match_table_copy_ms: profile.gpu_match_table_copy_ms,
+            gpu_match_prepare_dispatch_ms: profile.gpu_match_prepare_dispatch_ms,
+            gpu_match_kernel_dispatch_ms: profile.gpu_match_kernel_dispatch_ms,
+            gpu_match_submit_ms: profile.gpu_match_submit_ms,
             kernel_pack_inputs_ms: profile.gpu_pack_inputs_ms,
             kernel_pack_alloc_setup_ms: profile.gpu_pack_alloc_setup_ms,
             kernel_pack_resolve_sizes_ms: profile.gpu_pack_resolve_sizes_ms,
@@ -2006,6 +2126,14 @@ fn accumulate_gpu_kernel_profile(
     dst.sparse_wait_ms += src.sparse_wait_ms;
     dst.sparse_copy_ms += src.sparse_copy_ms;
     dst.sparse_total_ms += src.sparse_total_ms;
+    dst.call_pack_bind_group_ms += src.call_pack_bind_group_ms;
+    dst.call_encoder_create_ms += src.call_encoder_create_ms;
+    dst.call_table_stream_copy_ms += src.call_table_stream_copy_ms;
+    dst.call_match_clear_ms += src.call_match_clear_ms;
+    dst.call_sparse_prepare_dispatch_ms += src.call_sparse_prepare_dispatch_ms;
+    dst.call_sparse_pack_dispatch_ms += src.call_sparse_pack_dispatch_ms;
+    dst.call_result_readback_setup_ms += src.call_result_readback_setup_ms;
+    dst.call_payload_readback_setup_ms += src.call_payload_readback_setup_ms;
 }
 
 fn serialize_table_entries(table: &[Vec<u8>]) -> Result<(Vec<u8>, Vec<u8>), PDeflateError> {
@@ -2544,6 +2672,19 @@ fn compress_chunk_gpu_batch(
         .take(prepared.len())
         .collect::<Vec<_>>();
     let mut gpu_used_chunks = 0usize;
+    let mut gpu_integrated_chunks = 0usize;
+    let mut gpu_fallback_match_chunks = 0usize;
+    let mut fallback_integrated_error_chunks = 0usize;
+    let mut fallback_integrated_invalid_options_chunks = 0usize;
+    let mut fallback_integrated_invalid_stream_chunks = 0usize;
+    let mut fallback_integrated_numeric_overflow_chunks = 0usize;
+    let mut fallback_integrated_gpu_error_chunks = 0usize;
+    let mut fallback_integrated_other_error_chunks = 0usize;
+    let mut fallback_integrated_output_mismatch_chunks = 0usize;
+    let mut fallback_match_error_chunks = 0usize;
+    let mut fallback_match_output_mismatch_chunks = 0usize;
+    let mut fallback_match_packed_len_mismatch_chunks = 0usize;
+    let mut fallback_integrated_error_example: Option<String> = None;
     let gpu_job_indices: Vec<usize> = prepared
         .iter()
         .enumerate()
@@ -2577,6 +2718,9 @@ fn compress_chunk_gpu_batch(
     let mut gpu_sparse_wait_ms = 0.0_f64;
     let mut gpu_sparse_copy_ms = 0.0_f64;
     let mut gpu_sparse_total_ms = 0.0_f64;
+    let mut gpu_post_total_pack_bytes_ms = 0.0_f64;
+    let mut gpu_post_scale_profiles_ms = 0.0_f64;
+    let mut gpu_post_chunk_materialize_ms = 0.0_f64;
     let mut kernel_profile = gpu::GpuBatchKernelProfile::default();
 
     let t_gpu_call = Instant::now();
@@ -2608,6 +2752,9 @@ fn compress_chunk_gpu_batch(
             ) {
                 Ok(batch) => {
                     if batch.chunks.len() != prep_indices.len() {
+                        fallback_integrated_output_mismatch_chunks =
+                            fallback_integrated_output_mismatch_chunks
+                                .saturating_add(prep_indices.len());
                         if profile_detail {
                             eprintln!(
                                 "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=output_count_mismatch out={} jobs={}",
@@ -2653,6 +2800,8 @@ fn compress_chunk_gpu_batch(
                     gpu_sparse_wait_ms += batch.sparse_batch_profile.wait_ms;
                     gpu_sparse_copy_ms += batch.sparse_batch_profile.copy_ms;
                     gpu_sparse_total_ms += batch.sparse_batch_profile.total_ms;
+                    gpu_integrated_chunks =
+                        gpu_integrated_chunks.saturating_add(prep_indices.len());
                     accumulate_gpu_kernel_profile(&mut kernel_profile, &batch.kernel_profile);
                     kernel_profile.sparse_lens_submit_ms +=
                         batch.sparse_batch_profile.lens_submit_ms;
@@ -2709,13 +2858,16 @@ fn compress_chunk_gpu_batch(
                         );
                     }
 
+                    let t_post_total_pack_bytes = Instant::now();
                     let total_pack_bytes: usize = prep_indices
                         .iter()
                         .map(|&idx| prepared[idx].chunk.len())
                         .sum();
+                    gpu_post_total_pack_bytes_ms += elapsed_ms(t_post_total_pack_bytes);
                     for (&prep_idx, packed_chunk) in
                         prep_indices.iter().zip(batch.chunks.into_iter())
                     {
+                        let t_post_scale = Instant::now();
                         let pack_scale = if total_pack_bytes == 0 {
                             0.0
                         } else {
@@ -2739,6 +2891,8 @@ fn compress_chunk_gpu_batch(
                                 + section_scaled.total_ms
                                 + pack_scaled.total_ms,
                         };
+                        gpu_post_scale_profiles_ms += elapsed_ms(t_post_scale);
+                        let t_post_materialize = Instant::now();
                         gpu_encoded_chunks[prep_idx] = Some(ChunkCompressed {
                             payload: packed_chunk.payload,
                             table_entries: packed_chunk.table_count,
@@ -2795,10 +2949,56 @@ fn compress_chunk_gpu_batch(
                                 total_ms: prepared[prep_idx].table_build_ms + gpu_profile.total_ms,
                             },
                         });
+                        gpu_post_chunk_materialize_ms += elapsed_ms(t_post_materialize);
                         gpu_used_chunks = gpu_used_chunks.saturating_add(1);
                     }
                 }
                 Err(err) => {
+                    fallback_integrated_error_chunks =
+                        fallback_integrated_error_chunks.saturating_add(prep_indices.len());
+                    let reason_class = classify_integrated_batch_error(&err);
+                    match reason_class {
+                        "invalid_options" => {
+                            fallback_integrated_invalid_options_chunks =
+                                fallback_integrated_invalid_options_chunks
+                                    .saturating_add(prep_indices.len());
+                        }
+                        "invalid_stream" => {
+                            fallback_integrated_invalid_stream_chunks =
+                                fallback_integrated_invalid_stream_chunks
+                                    .saturating_add(prep_indices.len());
+                        }
+                        "numeric_overflow" => {
+                            fallback_integrated_numeric_overflow_chunks =
+                                fallback_integrated_numeric_overflow_chunks
+                                    .saturating_add(prep_indices.len());
+                        }
+                        "gpu_error" => {
+                            fallback_integrated_gpu_error_chunks =
+                                fallback_integrated_gpu_error_chunks
+                                    .saturating_add(prep_indices.len());
+                        }
+                        _ => {
+                            fallback_integrated_other_error_chunks =
+                                fallback_integrated_other_error_chunks
+                                    .saturating_add(prep_indices.len());
+                        }
+                    }
+                    if fallback_integrated_error_example.is_none() {
+                        fallback_integrated_error_example = Some(err.to_string());
+                    }
+                    if profile_enabled()
+                        && GPU_INTEGRATED_ERROR_SAMPLE_LOGGED
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        eprintln!(
+                            "[cozip_pdeflate][timing][gpu-integrated-error-sample] gpu_jobs={} class={} error={}",
+                            prep_indices.len(),
+                            reason_class,
+                            err
+                        );
+                    }
                     if profile_detail {
                         eprintln!(
                             "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason={} ",
@@ -2815,6 +3015,8 @@ fn compress_chunk_gpu_batch(
         if !fallback_match_job_indices.is_empty() {
             fallback_match_job_indices.sort_unstable();
             fallback_match_job_indices.dedup();
+            gpu_fallback_match_chunks =
+                gpu_fallback_match_chunks.saturating_add(fallback_match_job_indices.len());
             let fallback_inputs: Vec<gpu::GpuMatchInput<'_>> = fallback_match_job_indices
                 .iter()
                 .map(|&idx| {
@@ -2836,6 +3038,7 @@ fn compress_chunk_gpu_batch(
                     gpu_match_upload_ms += batch.profile.upload_ms;
                     gpu_match_wait_ms += batch.profile.wait_ms;
                     gpu_match_map_copy_ms += batch.profile.map_copy_ms;
+                    gpu_match_total_ms += batch.profile.total_ms;
                     if batch.chunks.len() == fallback_match_job_indices.len() {
                         let total_gpu_bytes: usize = fallback_match_job_indices
                             .iter()
@@ -2844,6 +3047,8 @@ fn compress_chunk_gpu_batch(
                         for (out_idx, chunk_out) in batch.chunks.into_iter().enumerate() {
                             let prep_idx = fallback_match_job_indices[out_idx];
                             if chunk_out.packed_matches.len() != prepared[prep_idx].chunk.len() {
+                                fallback_match_packed_len_mismatch_chunks =
+                                    fallback_match_packed_len_mismatch_chunks.saturating_add(1);
                                 if profile_detail {
                                     eprintln!(
                                         "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=packed_match_len_mismatch out_len={} src_len={}",
@@ -2865,6 +3070,9 @@ fn compress_chunk_gpu_batch(
                             gpu_used_chunks = gpu_used_chunks.saturating_add(1);
                         }
                     } else if profile_detail {
+                        fallback_match_output_mismatch_chunks =
+                            fallback_match_output_mismatch_chunks
+                                .saturating_add(fallback_match_job_indices.len());
                         eprintln!(
                             "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason=output_count_mismatch out={} jobs={}",
                             indices.len(),
@@ -2875,6 +3083,8 @@ fn compress_chunk_gpu_batch(
                     }
                 }
                 Err(err) => {
+                    fallback_match_error_chunks = fallback_match_error_chunks
+                        .saturating_add(fallback_match_job_indices.len());
                     if profile_detail {
                         eprintln!(
                             "[cozip_pdeflate][timing][gpu-batch-fallback] chunks={} gpu_jobs={} reason={}",
@@ -3001,6 +3211,19 @@ fn compress_chunk_gpu_batch(
             chunks_total: indices.len(),
             gpu_job_chunks: gpu_job_indices.len(),
             gpu_used_chunks,
+            gpu_integrated_chunks,
+            gpu_fallback_match_chunks,
+            fallback_integrated_error_chunks,
+            fallback_integrated_invalid_options_chunks,
+            fallback_integrated_invalid_stream_chunks,
+            fallback_integrated_numeric_overflow_chunks,
+            fallback_integrated_gpu_error_chunks,
+            fallback_integrated_other_error_chunks,
+            fallback_integrated_output_mismatch_chunks,
+            fallback_match_error_chunks,
+            fallback_match_output_mismatch_chunks,
+            fallback_match_packed_len_mismatch_chunks,
+            fallback_integrated_error_example,
             prepare_ms,
             prepare_table_build_ms,
             prepare_table_readback_ms,
@@ -3075,6 +3298,17 @@ fn compress_chunk_gpu_batch(
             gpu_sparse_wait_ms,
             gpu_sparse_copy_ms,
             gpu_sparse_total_ms,
+            gpu_call_pack_bind_group_ms: kernel_profile.call_pack_bind_group_ms,
+            gpu_call_encoder_create_ms: kernel_profile.call_encoder_create_ms,
+            gpu_call_table_stream_copy_ms: kernel_profile.call_table_stream_copy_ms,
+            gpu_call_match_clear_ms: kernel_profile.call_match_clear_ms,
+            gpu_call_sparse_prepare_dispatch_ms: kernel_profile.call_sparse_prepare_dispatch_ms,
+            gpu_call_sparse_pack_dispatch_ms: kernel_profile.call_sparse_pack_dispatch_ms,
+            gpu_call_result_readback_setup_ms: kernel_profile.call_result_readback_setup_ms,
+            gpu_call_payload_readback_setup_ms: kernel_profile.call_payload_readback_setup_ms,
+            gpu_post_total_pack_bytes_ms,
+            gpu_post_scale_profiles_ms,
+            gpu_post_chunk_materialize_ms,
             finalize_ms,
             total_ms: elapsed_ms(t_total),
         },
@@ -3356,6 +3590,7 @@ fn compress_chunks_hybrid(
                                             .saturating_add(batch_prof.gpu_used_chunks);
                                         prof.gpu_prepare_ms += batch_prof.prepare_ms;
                                         prof.gpu_call_ms += batch_prof.gpu_call_ms;
+                                        prof.gpu_match_total_ms += batch_prof.gpu_match_total_ms;
                                         prof.gpu_match_upload_ms += batch_prof.gpu_match_upload_ms;
                                         prof.gpu_match_wait_ms += batch_prof.gpu_match_wait_ms;
                                         prof.gpu_match_map_copy_ms +=
@@ -3471,8 +3706,95 @@ fn compress_chunks_hybrid(
                                         prof.gpu_sparse_wait_ms += batch_prof.gpu_sparse_wait_ms;
                                         prof.gpu_sparse_copy_ms += batch_prof.gpu_sparse_copy_ms;
                                         prof.gpu_sparse_total_ms += batch_prof.gpu_sparse_total_ms;
+                                        prof.gpu_call_pack_bind_group_ms +=
+                                            batch_prof.gpu_call_pack_bind_group_ms;
+                                        prof.gpu_call_encoder_create_ms +=
+                                            batch_prof.gpu_call_encoder_create_ms;
+                                        prof.gpu_call_table_stream_copy_ms +=
+                                            batch_prof.gpu_call_table_stream_copy_ms;
+                                        prof.gpu_call_match_clear_ms +=
+                                            batch_prof.gpu_call_match_clear_ms;
+                                        prof.gpu_call_sparse_prepare_dispatch_ms +=
+                                            batch_prof.gpu_call_sparse_prepare_dispatch_ms;
+                                        prof.gpu_call_sparse_pack_dispatch_ms +=
+                                            batch_prof.gpu_call_sparse_pack_dispatch_ms;
+                                        prof.gpu_call_result_readback_setup_ms +=
+                                            batch_prof.gpu_call_result_readback_setup_ms;
+                                        prof.gpu_call_payload_readback_setup_ms +=
+                                            batch_prof.gpu_call_payload_readback_setup_ms;
+                                        prof.gpu_post_total_pack_bytes_ms +=
+                                            batch_prof.gpu_post_total_pack_bytes_ms;
+                                        prof.gpu_post_scale_profiles_ms +=
+                                            batch_prof.gpu_post_scale_profiles_ms;
+                                        prof.gpu_post_chunk_materialize_ms +=
+                                            batch_prof.gpu_post_chunk_materialize_ms;
                                         prof.gpu_finalize_ms += batch_prof.finalize_ms;
                                         prof.gpu_batch_total_ms += batch_prof.total_ms;
+                                        prof.gpu_integrated_chunks = prof
+                                            .gpu_integrated_chunks
+                                            .saturating_add(batch_prof.gpu_integrated_chunks);
+                                        prof.gpu_fallback_match_chunks = prof
+                                            .gpu_fallback_match_chunks
+                                            .saturating_add(batch_prof.gpu_fallback_match_chunks);
+                                        prof.fallback_integrated_error_chunks = prof
+                                            .fallback_integrated_error_chunks
+                                            .saturating_add(
+                                                batch_prof.fallback_integrated_error_chunks,
+                                            );
+                                        prof.fallback_integrated_invalid_options_chunks = prof
+                                            .fallback_integrated_invalid_options_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_integrated_invalid_options_chunks,
+                                            );
+                                        prof.fallback_integrated_invalid_stream_chunks = prof
+                                            .fallback_integrated_invalid_stream_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_integrated_invalid_stream_chunks,
+                                            );
+                                        prof.fallback_integrated_numeric_overflow_chunks = prof
+                                            .fallback_integrated_numeric_overflow_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_integrated_numeric_overflow_chunks,
+                                            );
+                                        prof.fallback_integrated_gpu_error_chunks = prof
+                                            .fallback_integrated_gpu_error_chunks
+                                            .saturating_add(
+                                                batch_prof.fallback_integrated_gpu_error_chunks,
+                                            );
+                                        prof.fallback_integrated_other_error_chunks = prof
+                                            .fallback_integrated_other_error_chunks
+                                            .saturating_add(
+                                                batch_prof.fallback_integrated_other_error_chunks,
+                                            );
+                                        prof.fallback_integrated_output_mismatch_chunks = prof
+                                            .fallback_integrated_output_mismatch_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_integrated_output_mismatch_chunks,
+                                            );
+                                        prof.fallback_match_error_chunks = prof
+                                            .fallback_match_error_chunks
+                                            .saturating_add(batch_prof.fallback_match_error_chunks);
+                                        prof.fallback_match_output_mismatch_chunks = prof
+                                            .fallback_match_output_mismatch_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_match_output_mismatch_chunks,
+                                            );
+                                        prof.fallback_match_packed_len_mismatch_chunks = prof
+                                            .fallback_match_packed_len_mismatch_chunks
+                                            .saturating_add(
+                                                batch_prof
+                                                    .fallback_match_packed_len_mismatch_chunks,
+                                            );
+                                        if prof.fallback_integrated_error_example.is_none() {
+                                            prof.fallback_integrated_error_example = batch_prof
+                                                .fallback_integrated_error_example
+                                                .clone();
+                                        }
                                     }
                                 }
                                 let t_result_lock = Instant::now();
@@ -3660,6 +3982,9 @@ fn compress_chunks_hybrid(
             let gpu_call_unaccounted_ms = prof.gpu_call_ms - kernel_accounted_ms;
             let gpu_batch_unaccounted_ms = prof.gpu_batch_total_ms
                 - (prof.gpu_prepare_ms + prof.gpu_call_ms + prof.gpu_finalize_ms);
+            let gpu_call_post_ms = prof.gpu_post_total_pack_bytes_ms
+                + prof.gpu_post_scale_profiles_ms
+                + prof.gpu_post_chunk_materialize_ms;
             eprintln!(
                 "[cozip_pdeflate][timing][hybrid-scheduler-kernel] gpu_batch_total_ms={:.3} kernel_accounted_ms={:.3} gpu_call_unaccounted_ms={:.3} gpu_batch_unaccounted_ms={:.3} match_stage_ms={:.3} section_stage_ms={:.3} sparse_stage_ms={:.3} match_stage_pct={:.1} section_stage_pct={:.1} sparse_stage_pct={:.1} pack_inputs_ms={:.3} scratch_acquire_ms={:.3} match_table_copy_ms={:.3} match_prepare_dispatch_ms={:.3} match_kernel_dispatch_ms={:.3} match_submit_ms={:.3} section_setup_ms={:.3} section_pass_dispatch_ms={:.3} section_tok_dispatch_ms={:.3} section_pre_dispatch_ms={:.3} section_scat_dispatch_ms={:.3} section_pack_dispatch_ms={:.3} section_meta_dispatch_ms={:.3} section_copy_dispatch_ms={:.3} section_submit_ms={:.3} section_tok_wait_ms={:.3} section_pre_wait_ms={:.3} section_scat_wait_ms={:.3} section_pack_wait_ms={:.3} section_meta_wait_ms={:.3} section_wrap_ms={:.3} sparse_lens_submit_ms={:.3} sparse_lens_submit_done_wait_ms={:.3} sparse_lens_map_after_done_ms={:.3} sparse_lens_poll_calls={} sparse_lens_yield_calls={} sparse_lens_wait_ms={:.3} sparse_lens_copy_ms={:.3} sparse_prepare_ms={:.3} sparse_table_size_resolve_ms={:.3} sparse_prepare_misc_ms={:.3} sparse_scratch_acquire_ms={:.3} sparse_upload_dispatch_ms={:.3} sparse_submit_ms={:.3} sparse_wait_ms={:.3} sparse_copy_ms={:.3} sparse_total_ms={:.3}",
                 prof.gpu_batch_total_ms,
@@ -3710,6 +4035,34 @@ fn compress_chunks_hybrid(
                 prof.gpu_sparse_copy_ms,
                 prof.gpu_sparse_total_ms
             );
+            eprintln!(
+                "[cozip_pdeflate][timing][hybrid-gpu-call-post] gpu_match_total_ms={:.3} post_total_pack_bytes_ms={:.3} post_scale_profiles_ms={:.3} post_chunk_materialize_ms={:.3} post_total_ms={:.3} residual_after_post_ms={:.3}",
+                prof.gpu_match_total_ms,
+                prof.gpu_post_total_pack_bytes_ms,
+                prof.gpu_post_scale_profiles_ms,
+                prof.gpu_post_chunk_materialize_ms,
+                gpu_call_post_ms,
+                (gpu_call_unaccounted_ms - gpu_call_post_ms).max(0.0)
+            );
+            eprintln!(
+                "[cozip_pdeflate][timing][hybrid-gpu-integrated-fallbacks] integrated_error_chunks={} invalid_options_chunks={} invalid_stream_chunks={} numeric_overflow_chunks={} gpu_error_chunks={} other_error_chunks={} integrated_output_mismatch_chunks={} fallback_match_error_chunks={} fallback_match_output_mismatch_chunks={} fallback_match_packed_len_mismatch_chunks={}",
+                prof.fallback_integrated_error_chunks,
+                prof.fallback_integrated_invalid_options_chunks,
+                prof.fallback_integrated_invalid_stream_chunks,
+                prof.fallback_integrated_numeric_overflow_chunks,
+                prof.fallback_integrated_gpu_error_chunks,
+                prof.fallback_integrated_other_error_chunks,
+                prof.fallback_integrated_output_mismatch_chunks,
+                prof.fallback_match_error_chunks,
+                prof.fallback_match_output_mismatch_chunks,
+                prof.fallback_match_packed_len_mismatch_chunks
+            );
+            if let Some(example) = prof.fallback_integrated_error_example.as_deref() {
+                eprintln!(
+                    "[cozip_pdeflate][timing][hybrid-gpu-integrated-fallback-sample] error={}",
+                    example
+                );
+            }
             eprintln!(
                 "[cozip_pdeflate][timing][hybrid-kernel-pack-breakdown] pack_inputs_ms={:.3} alloc_setup_ms={:.3} resolve_sizes_ms={:.3} resolve_scan_ms={:.3} resolve_readback_setup_ms={:.3} resolve_submit_ms={:.3} resolve_map_wait_ms={:.3} resolve_parse_ms={:.3} src_copy_ms={:.3} metadata_loop_ms={:.3} host_copy_ms={:.3} device_copy_plan_ms={:.3} finalize_ms={:.3}",
                 prof.gpu_pack_inputs_ms,
