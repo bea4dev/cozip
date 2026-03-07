@@ -2780,6 +2780,7 @@ fn compress_chunk_gpu_batch(
                         max_ref_len: p.max_ref_len,
                         min_ref_len: options.min_ref_len,
                         section_count: options.section_count,
+                        compression_mode: options.compression_mode,
                     }
                 })
                 .collect();
@@ -2873,11 +2874,18 @@ fn compress_chunk_gpu_batch(
                     };
                     if emit_pack_batch_detail {
                         let pack_detail = batch.sparse_batch_profile;
+                        let chunks_f = (pack_detail.chunks as f64).max(1.0);
                         eprintln!(
-                            "[cozip_pdeflate][timing][gpu-pack-batch] chunks={} lens_kib={:.2} out_cmd_mib={:.2} t_lens_submit_ms={:.3} t_lens_submit_done_wait_ms={:.3} t_lens_map_after_done_ms={:.3} lens_poll_calls={} lens_yield_calls={} t_lens_wait_ms={:.3} t_lens_copy_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_table_size_resolve_ms={:.3} t_sparse_prepare_misc_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_sparse_total_ms={:.3}",
+                            "[cozip_pdeflate][timing][gpu-pack-batch] chunks={} lens_kib={:.2} out_cmd_mib={:.2} predicted_payload_avg_kib={:.1} actual_payload_avg_kib={:.1} cap_payload_avg_kib={:.1} predicted_under_chunks={} predicted_under_mib={:.3} predicted_over_mib={:.3} t_lens_submit_ms={:.3} t_lens_submit_done_wait_ms={:.3} t_lens_map_after_done_ms={:.3} lens_poll_calls={} lens_yield_calls={} t_lens_wait_ms={:.3} t_lens_copy_ms={:.3} t_sparse_prepare_ms={:.3} t_sparse_table_size_resolve_ms={:.3} t_sparse_prepare_misc_ms={:.3} t_sparse_upload_dispatch_ms={:.3} t_sparse_submit_ms={:.3} t_sparse_wait_ms={:.3} t_sparse_copy_ms={:.3} t_sparse_total_ms={:.3}",
                             pack_detail.chunks,
                             (pack_detail.lens_bytes_total as f64) / 1024.0,
                             (pack_detail.out_cmd_bytes_total as f64) / (1024.0 * 1024.0),
+                            (pack_detail.predicted_payload_bytes_total as f64) / chunks_f / 1024.0,
+                            (pack_detail.actual_payload_bytes_total as f64) / chunks_f / 1024.0,
+                            (pack_detail.cap_payload_bytes_total as f64) / chunks_f / 1024.0,
+                            pack_detail.predicted_underestimate_chunks,
+                            (pack_detail.predicted_underestimate_bytes as f64) / (1024.0 * 1024.0),
+                            (pack_detail.predicted_overestimate_bytes as f64) / (1024.0 * 1024.0),
                             pack_detail.lens_submit_ms,
                             pack_detail.lens_submit_done_wait_ms,
                             pack_detail.lens_map_after_done_ms,
@@ -3068,6 +3076,7 @@ fn compress_chunk_gpu_batch(
                         max_ref_len: p.max_ref_len,
                         min_ref_len: options.min_ref_len,
                         section_count: options.section_count,
+                        compression_mode: options.compression_mode,
                     }
                 })
                 .collect();
@@ -4178,6 +4187,7 @@ fn compress_chunk(
             max_ref_len,
             min_ref_len: options.min_ref_len,
             section_count,
+            compression_mode: options.compression_mode,
         };
         match gpu::compute_matches(&gpu_input) {
             Ok(out) => {

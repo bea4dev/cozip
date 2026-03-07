@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::{PDeflateError, PDeflateOptions};
+use super::{profile_enabled, PDeflateError, PDeflateOptions};
 
 const WORKGROUP_SIZE: u32 = 128;
 const PREFIX2_TABLE_SIZE: usize = 1 << 16;
@@ -1876,7 +1876,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
 "#;
 
 const PACK_CHUNK_SPARSE_SECTION_SHADER: &str = r#"
-const SPARSE_BATCH_DESC_WORDS: u32 = 20u;
+const SPARSE_BATCH_DESC_WORDS: u32 = 23u;
 const SPARSE_BATCH_RESULT_WORDS: u32 = 4u;
 
 @group(0) @binding(0) var<storage, read> desc_words: array<u32>;
@@ -2108,13 +2108,17 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     if (word_idx >= out_words_len) {
         return;
     }
-    let out_base_word = desc_words[desc_base + 15u];
+    let out_base_word = desc_words[desc_base + 21u];
+    let slot_words_len = desc_words[desc_base + 22u];
+    if (word_idx >= slot_words_len) {
+        return;
+    }
     out_words[out_base_word + word_idx] = read_output_word(desc_base, result_base, word_idx * 4u);
 }
 "#;
 
 const PACK_CHUNK_SPARSE_PREPARE_SHADER: &str = r#"
-const SPARSE_BATCH_DESC_WORDS: u32 = 20u;
+const SPARSE_BATCH_DESC_WORDS: u32 = 23u;
 const SPARSE_BATCH_RESULT_WORDS: u32 = 4u;
 
 @group(0) @binding(0) var<storage, read> desc_words: array<u32>;
@@ -2139,6 +2143,7 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
     let section_index_off = desc_words[desc_base + 19u];
     let section_index_cap_len = desc_words[desc_base + 9u];
     let section_cmd_cap_len = desc_words[desc_base + 14u];
+    let slot_cap_words = desc_words[desc_base + 22u];
     let section_cmd_len = section_meta_words[section_meta_base];
     let section_index_len = section_meta_words[section_meta_base + 1u];
     let overflow = section_meta_words[section_meta_base + 2u];
@@ -2154,6 +2159,13 @@ fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
         }
     }
     let total_words = select(max(1u, align_up4(total_len) >> 2u), 1u, total_len == 0xffffffffu);
+    if (total_len != 0xffffffffu && total_words > slot_cap_words) {
+        result_words[result_base] = section_cmd_len;
+        result_words[result_base + 1u] = section_index_len;
+        result_words[result_base + 2u] = 0xffffffffu;
+        result_words[result_base + 3u] = slot_cap_words;
+        return;
+    }
     result_words[result_base] = section_cmd_len;
     result_words[result_base + 1u] = section_index_len;
     result_words[result_base + 2u] = total_len;
@@ -3016,6 +3028,7 @@ pub(crate) struct GpuMatchInput<'a> {
     pub(crate) max_ref_len: usize,
     pub(crate) min_ref_len: usize,
     pub(crate) section_count: usize,
+    pub(crate) compression_mode: super::PDeflateCompressionMode,
 }
 
 pub(crate) struct GpuMatchOutput {
@@ -3111,11 +3124,140 @@ pub(crate) struct GpuSparseSectionHostOutput {
     pub(crate) section_cmd: Vec<u8>,
 }
 
+const GPU_SPARSE_PAYLOAD_CLASS_COUNT: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuSparsePayloadClass {
+    Tiny,
+    Small,
+    Medium,
+    Large,
+    XLarge,
+}
+
+impl GpuSparsePayloadClass {
+    fn idx(self) -> usize {
+        match self {
+            Self::Tiny => 0,
+            Self::Small => 1,
+            Self::Medium => 2,
+            Self::Large => 3,
+            Self::XLarge => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tiny => "tiny",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+            Self::XLarge => "xlarge",
+        }
+    }
+}
+
+const GPU_SPARSE_PAYLOAD_CLASS_ORDER: [GpuSparsePayloadClass; GPU_SPARSE_PAYLOAD_CLASS_COUNT] = [
+    GpuSparsePayloadClass::Tiny,
+    GpuSparsePayloadClass::Small,
+    GpuSparsePayloadClass::Medium,
+    GpuSparsePayloadClass::Large,
+    GpuSparsePayloadClass::XLarge,
+];
+
+fn classify_sparse_payload_bytes(bytes: usize) -> GpuSparsePayloadClass {
+    if bytes <= 256 * 1024 {
+        GpuSparsePayloadClass::Tiny
+    } else if bytes <= 1024 * 1024 {
+        GpuSparsePayloadClass::Small
+    } else if bytes <= 2 * 1024 * 1024 {
+        GpuSparsePayloadClass::Medium
+    } else if bytes <= 4 * 1024 * 1024 {
+        GpuSparsePayloadClass::Large
+    } else {
+        GpuSparsePayloadClass::XLarge
+    }
+}
+
+fn format_sparse_payload_class_counts(counts: &[u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT]) -> String {
+    GPU_SPARSE_PAYLOAD_CLASS_ORDER
+    .into_iter()
+    .map(|class_id| format!("{}:{}", class_id.label(), counts[class_id.idx()]))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+fn sparse_payload_class_capacity_bytes(
+    class_id: GpuSparsePayloadClass,
+    predicted_payload_bytes: usize,
+) -> usize {
+    match class_id {
+        GpuSparsePayloadClass::Tiny => 256 * 1024,
+        GpuSparsePayloadClass::Small => 1024 * 1024,
+        GpuSparsePayloadClass::Medium => 2 * 1024 * 1024,
+        GpuSparsePayloadClass::Large => 4 * 1024 * 1024,
+        GpuSparsePayloadClass::XLarge => align_up4(predicted_payload_bytes.max(4)).div_ceil(1024 * 1024) * (1024 * 1024),
+    }
+}
+
+fn estimate_sparse_payload_bytes(
+    compression_mode: super::PDeflateCompressionMode,
+    chunk_len: usize,
+    section_count: usize,
+    table_count: usize,
+    table_index_len: usize,
+    table_data_len: usize,
+    section_index_cap_len: usize,
+    section_cmd_cap_len: usize,
+) -> usize {
+    let base = PACK_CHUNK_HEADER_SIZE
+        .saturating_add(table_index_len)
+        .saturating_add(table_data_len)
+        .saturating_add(section_index_cap_len);
+    let section_meta_bias = section_count.saturating_mul(16);
+    let table_bias = table_count.saturating_mul(8);
+    let chunk_bias = match compression_mode {
+        super::PDeflateCompressionMode::Speed => chunk_len / 2,
+        super::PDeflateCompressionMode::Balanced => (chunk_len / 4).saturating_mul(3),
+        super::PDeflateCompressionMode::Ratio => chunk_len,
+    };
+    let cmd_estimate = section_cmd_cap_len.min(
+        chunk_bias
+            .saturating_add(section_meta_bias)
+            .saturating_add(table_bias),
+    );
+    align_up4(base.saturating_add(cmd_estimate))
+}
+
+fn planned_sparse_payload_readback_bytes(
+    predicted_payload_bytes: usize,
+    slot_cap_bytes: u64,
+) -> u64 {
+    let predicted = align_up4(predicted_payload_bytes.max(4));
+    let guarded = predicted
+        .saturating_add(predicted / 4)
+        .saturating_add(64 * 1024);
+    let planned = align_up4(guarded);
+    u64::try_from(planned)
+        .unwrap_or(u64::MAX)
+        .min(slot_cap_bytes.max(4))
+        .max(4)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct GpuSparsePackBatchProfile {
     pub(crate) chunks: usize,
     pub(crate) lens_bytes_total: u64,
     pub(crate) out_cmd_bytes_total: u64,
+    pub(crate) predicted_payload_bytes_total: u64,
+    pub(crate) cap_payload_bytes_total: u64,
+    pub(crate) actual_payload_bytes_total: u64,
+    pub(crate) predicted_class_counts: [u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+    pub(crate) cap_class_counts: [u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+    pub(crate) actual_class_counts: [u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+    pub(crate) predicted_underestimate_chunks: u32,
+    pub(crate) predicted_underestimate_bytes: u64,
+    pub(crate) predicted_overestimate_bytes: u64,
     pub(crate) lens_submit_ms: f64,
     pub(crate) lens_submit_done_wait_ms: f64,
     pub(crate) lens_map_after_done_ms: f64,
@@ -3659,7 +3801,7 @@ const GPU_SPARSE_PACK_POOL_LIMIT: usize = 4;
 const GPU_DECODE_V2_TRUE_BATCH_POOL_LIMIT: usize = 16;
 const GPU_DECODE_LARGE_SLOT_INDEX_BASE: usize = 1 << 30;
 const GPU_DECODE_V2_BATCH_DESC_WORDS: usize = 12;
-const GPU_SPARSE_PACK_BATCH_DESC_WORDS: usize = 20;
+const GPU_SPARSE_PACK_BATCH_DESC_WORDS: usize = 23;
 const GPU_SPARSE_PACK_BATCH_RESULT_WORDS: usize = 4;
 // Command stream cap heuristic for GPU section encode.
 // If this underestimates a pathological section, kernel marks overflow and
@@ -7786,8 +7928,8 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             .map_err(|_| PDeflateError::NumericOverflow)?;
         let out_cmd_off =
             usize::try_from(out_cmd_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
-        let out_base_word =
-            usize::try_from(out_total_bytes / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_base_word = usize::try_from(out_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
         host_jobs.push(SparsePackHostJob {
             section_meta_words_off,
             table_index_off,
@@ -7995,6 +8137,11 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
         desc_words[base + 18] = u32::try_from(prep.table_data_stream_offset)
             .map_err(|_| PDeflateError::NumericOverflow)?;
         desc_words[base + 19] = u32::try_from(prep.section_index_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 20] = 0;
+        desc_words[base + 21] =
+            u32::try_from(host.out_base_word).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 22] = u32::try_from(prep.total_bytes_cap / 4)
             .map_err(|_| PDeflateError::NumericOverflow)?;
     }
 
@@ -8817,6 +8964,15 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             chunks: inputs.len(),
             lens_bytes_total,
             out_cmd_bytes_total,
+            predicted_payload_bytes_total: 0,
+            cap_payload_bytes_total: 0,
+            actual_payload_bytes_total: 0,
+            predicted_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            cap_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            actual_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            predicted_underestimate_chunks: 0,
+            predicted_underestimate_bytes: 0,
+            predicted_overestimate_bytes: 0,
             lens_submit_ms,
             lens_submit_done_wait_ms,
             lens_map_after_done_ms,
@@ -9253,6 +9409,15 @@ pub(crate) fn read_section_commands_from_device_batch(
             chunks: inputs.len(),
             lens_bytes_total,
             out_cmd_bytes_total: copied_cmd_bytes_total,
+            predicted_payload_bytes_total: 0,
+            cap_payload_bytes_total: 0,
+            actual_payload_bytes_total: 0,
+            predicted_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            cap_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            actual_class_counts: [0; GPU_SPARSE_PAYLOAD_CLASS_COUNT],
+            predicted_underestimate_chunks: 0,
+            predicted_underestimate_bytes: 0,
+            predicted_overestimate_bytes: 0,
             lens_submit_ms,
             lens_submit_done_wait_ms,
             lens_map_after_done_ms,
@@ -15435,6 +15600,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             "gpu section encode requires section_count > 0",
         ));
     }
+    let compression_mode = inputs[0].compression_mode;
 
     struct SparsePackPrepared {
         chunk_len: usize,
@@ -15470,6 +15636,10 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         out_cmd_bytes: u64,
         max_tokens_per_section: u32,
         max_cmd_words_per_section: u32,
+        predicted_payload_bytes: usize,
+        predicted_payload_class: GpuSparsePayloadClass,
+        slot_cap_bytes: u64,
+        cap_payload_class: GpuSparsePayloadClass,
         prep: SparsePackPrepared,
         host: SparsePackHostJob,
         section_offsets_local: Vec<u32>,
@@ -15607,7 +15777,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
     let mut section_prefix_total_bytes = 0u64;
     let mut section_offsets_total_bytes = 0u64;
     let mut out_cmd_total_bytes = 0u64;
-    let mut out_total_bytes = 0u64;
+    let mut legacy_out_total_bytes = 0u64;
     let mut direct_states = Vec::<DirectSectionState>::with_capacity(inputs.len());
 
     for (chunk_idx, (input, &(table_count, table_index_len, table_data_len))) in
@@ -15708,6 +15878,26 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             table_index_len,
             table_data_len,
         };
+        let predicted_payload_bytes = estimate_sparse_payload_bytes(
+            compression_mode,
+            chunk_len,
+            section_count,
+            table_count,
+            table_index_len,
+            table_data_len,
+            prep.section_index_cap_len,
+            prep.section_cmd_cap_len,
+        );
+        let predicted_payload_class = classify_sparse_payload_bytes(predicted_payload_bytes);
+        let slot_cap_bytes = u64::try_from(sparse_payload_class_capacity_bytes(
+            predicted_payload_class,
+            predicted_payload_bytes,
+        ))
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .max(4);
+        let cap_payload_class = classify_sparse_payload_bytes(
+            usize::try_from(slot_cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
+        );
 
         let section_meta_words_off = usize::try_from(section_meta_total_bytes / 4)
             .map_err(|_| PDeflateError::NumericOverflow)?;
@@ -15727,8 +15917,8 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             .map_err(|_| PDeflateError::NumericOverflow)?;
         let out_cmd_off =
             usize::try_from(out_cmd_total_bytes).map_err(|_| PDeflateError::NumericOverflow)?;
-        let out_base_word =
-            usize::try_from(out_total_bytes / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        let out_base_word = usize::try_from(legacy_out_total_bytes / 4)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
         let host = SparsePackHostJob {
             section_meta_words_off,
             table_index_off,
@@ -15776,7 +15966,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         section_offsets_total_bytes =
             section_offsets_total_bytes.saturating_add(out_lens_bytes.max(4));
         out_cmd_total_bytes = out_cmd_total_bytes.saturating_add(out_cmd_bytes.max(4));
-        out_total_bytes = out_total_bytes.saturating_add(prep.total_bytes_cap.max(4));
+        legacy_out_total_bytes = legacy_out_total_bytes.saturating_add(prep.total_bytes_cap.max(4));
 
         direct_states.push(DirectSectionState {
             chunk_len,
@@ -15787,6 +15977,10 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                 .map_err(|_| PDeflateError::NumericOverflow)?,
             max_cmd_words_per_section: u32::try_from(max_cmd_words_per_section)
                 .map_err(|_| PDeflateError::NumericOverflow)?,
+            predicted_payload_bytes,
+            predicted_payload_class,
+            slot_cap_bytes,
+            cap_payload_class,
             prep,
             host,
             section_offsets_local,
@@ -15796,6 +15990,62 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             section_token_caps,
         });
         let _ = input;
+    }
+
+    let mut class_counts = [0usize; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+    for state in &direct_states {
+        class_counts[state.predicted_payload_class.idx()] =
+            class_counts[state.predicted_payload_class.idx()].saturating_add(1);
+    }
+    let mut class_region_offsets = [0u64; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+    let mut class_region_bytes = [0u64; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+    let mut class_running_base = 0u64;
+    for class_id in GPU_SPARSE_PAYLOAD_CLASS_ORDER {
+        let idx = class_id.idx();
+        class_region_offsets[idx] = class_running_base;
+        class_region_bytes[idx] = direct_states
+            .iter()
+            .filter(|state| state.predicted_payload_class == class_id)
+            .fold(0u64, |acc, state| acc.saturating_add(state.slot_cap_bytes));
+        class_running_base = class_running_base.saturating_add(class_region_bytes[idx]);
+    }
+    let mut class_slot_indices = [0usize; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+    let mut class_slot_offsets = class_region_offsets;
+    for state in &mut direct_states {
+        let class_idx = state.predicted_payload_class.idx();
+        let slot_off = class_slot_offsets[class_idx];
+        state.host.out_base_word =
+            usize::try_from(slot_off / 4).map_err(|_| PDeflateError::NumericOverflow)?;
+        state.prep.total_bytes_cap = state.slot_cap_bytes.max(4);
+        class_slot_indices[class_idx] = class_slot_indices[class_idx].saturating_add(1);
+        class_slot_offsets[class_idx] =
+            class_slot_offsets[class_idx].saturating_add(state.slot_cap_bytes);
+    }
+    let out_total_bytes = class_running_base.max(4);
+    if profile_enabled() {
+        eprintln!(
+            "[cozip_pdeflate][timing][sparse-class-layout] chunks={} class_counts={} class_region_mib=tiny:{:.2},small:{:.2},medium:{:.2},large:{:.2},xlarge:{:.2} out_total_mib={:.2} legacy_out_total_mib={:.2} reduction_pct={:.1}",
+            inputs.len(),
+            format_sparse_payload_class_counts(&[
+                class_counts[0] as u32,
+                class_counts[1] as u32,
+                class_counts[2] as u32,
+                class_counts[3] as u32,
+                class_counts[4] as u32,
+            ]),
+            (class_region_bytes[GpuSparsePayloadClass::Tiny.idx()] as f64) / (1024.0 * 1024.0),
+            (class_region_bytes[GpuSparsePayloadClass::Small.idx()] as f64) / (1024.0 * 1024.0),
+            (class_region_bytes[GpuSparsePayloadClass::Medium.idx()] as f64) / (1024.0 * 1024.0),
+            (class_region_bytes[GpuSparsePayloadClass::Large.idx()] as f64) / (1024.0 * 1024.0),
+            (class_region_bytes[GpuSparsePayloadClass::XLarge.idx()] as f64) / (1024.0 * 1024.0),
+            (out_total_bytes as f64) / (1024.0 * 1024.0),
+            (legacy_out_total_bytes as f64) / (1024.0 * 1024.0),
+            if legacy_out_total_bytes > 0 {
+                100.0 * (1.0 - (out_total_bytes as f64 / legacy_out_total_bytes as f64))
+            } else {
+                0.0
+            },
+        );
     }
 
     let t_sparse_scratch = Instant::now();
@@ -15911,6 +16161,12 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         desc_words[base + 18] = u32::try_from(prep.table_data_stream_offset)
             .map_err(|_| PDeflateError::NumericOverflow)?;
         desc_words[base + 19] = u32::try_from(prep.section_index_stream_offset)
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 20] = u32::try_from(state.predicted_payload_class.idx())
+            .map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 21] =
+            u32::try_from(host.out_base_word).map_err(|_| PDeflateError::NumericOverflow)?;
+        desc_words[base + 22] = u32::try_from(prep.total_bytes_cap / 4)
             .map_err(|_| PDeflateError::NumericOverflow)?;
     }
 
@@ -16872,6 +17128,32 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
         )
         .map_err(|_| PDeflateError::NumericOverflow)?
         .max(4);
+        let payload_readback_plan_bytes: Vec<u64> = direct_states
+            .iter()
+            .map(|state| {
+                planned_sparse_payload_readback_bytes(
+                    state.predicted_payload_bytes,
+                    state.slot_cap_bytes,
+                )
+            })
+            .collect();
+        let mut payload_readback_offsets = Vec::<u64>::with_capacity(direct_states.len());
+        let mut payload_readback_bytes = 0u64;
+        for &copy_bytes in &payload_readback_plan_bytes {
+            payload_readback_offsets.push(payload_readback_bytes);
+            payload_readback_bytes = payload_readback_bytes
+                .checked_add(copy_bytes.max(4))
+                .ok_or(PDeflateError::NumericOverflow)?;
+        }
+        let payload_readback_bytes = payload_readback_bytes.max(4);
+        let t_payload_readback_setup = Instant::now();
+        let payload_readback_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cozip-pdeflate-pack-sparse-direct-payload-readback"),
+            size: payload_readback_bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        payload_readback_setup_ms = elapsed_ms(t_payload_readback_setup);
         let max_total_words_cap = direct_states.iter().fold(1u32, |acc, state| {
             acc.max(u32::try_from(state.prep.total_bytes_cap / 4).unwrap_or(u32::MAX))
         });
@@ -16913,6 +17195,21 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             drop(pass);
             sparse_pack_dispatch_ms = elapsed_ms(t_stage);
         }
+        for ((state, &dst_off), &copy_bytes) in direct_states
+            .iter()
+            .zip(payload_readback_offsets.iter())
+            .zip(payload_readback_plan_bytes.iter())
+        {
+            encoder.copy_buffer_to_buffer(
+                &scratch.out_buffer,
+                u64::try_from(state.host.out_base_word)
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                    .saturating_mul(4),
+                &payload_readback_buffer,
+                dst_off,
+                copy_bytes.max(4),
+            );
+        }
 
         let t_submit = Instant::now();
         r.queue.submit(Some(encoder.finish()));
@@ -16925,6 +17222,11 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             let _ = result_tx.send(res);
         });
         result_readback_setup_ms = elapsed_ms(t_result_readback_setup);
+        let payload_slice = payload_readback_buffer.slice(..payload_readback_bytes);
+        let (out_tx, out_rx) = mpsc::channel();
+        payload_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = out_tx.send(res);
+        });
         let t_wait1 = Instant::now();
         r.device.poll(wgpu::Maintain::Wait);
         result_rx
@@ -16939,86 +17241,6 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                     "integrated/result-readback-map: map_async failed: {e}"
                 ))
             })?;
-        let phase1_wait_ms = elapsed_ms(t_wait1);
-
-        let t_lens_copy = Instant::now();
-        let result_mapped = result_slice.get_mapped_range();
-        let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
-        let mut payload_lens = Vec::<usize>::with_capacity(inputs.len());
-        let mut payload_table_counts = Vec::<usize>::with_capacity(inputs.len());
-        let mut payload_copy_offsets = Vec::<u64>::with_capacity(inputs.len());
-        let mut payload_copy_bytes = Vec::<u64>::with_capacity(inputs.len());
-        let mut payload_readback_bytes = 0u64;
-        for (idx, state) in direct_states.iter().enumerate() {
-            let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
-            let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
-            let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
-            if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
-                return Err(PDeflateError::Gpu(
-                    "integrated/result-parse: sparse size prepare overflow while packing"
-                        .to_string(),
-                ));
-            }
-            let total_len =
-                usize::try_from(total_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-            let total_copy_len = align_up4(total_len);
-            let total_copy_bytes =
-                u64::try_from(total_copy_len).map_err(|_| PDeflateError::NumericOverflow)?;
-            if total_copy_bytes > state.prep.total_bytes_cap {
-                return Err(PDeflateError::Gpu(
-                    "gpu sparse pack produced oversized aligned payload".to_string(),
-                ));
-            }
-            payload_copy_offsets.push(payload_readback_bytes);
-            payload_copy_bytes.push(total_copy_bytes);
-            payload_readback_bytes = payload_readback_bytes
-                .checked_add(total_copy_bytes.max(4))
-                .ok_or(PDeflateError::NumericOverflow)?;
-            payload_lens.push(total_len);
-            payload_table_counts.push(state.prep.table_count);
-        }
-        drop(result_mapped);
-        scratch.result_readback_buffer.unmap();
-        let lens_copy_ms = elapsed_ms(t_lens_copy);
-        let payload_readback_bytes = payload_readback_bytes.max(4);
-
-        let t_payload_readback_setup = Instant::now();
-        let payload_readback_buffer = r.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cozip-pdeflate-pack-sparse-direct-payload-readback"),
-            size: payload_readback_bytes,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut payload_encoder =
-            r.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("cozip-pdeflate-pack-sparse-direct-payload-encoder"),
-                });
-        for (state, (&dst_off, &copy_bytes)) in direct_states
-            .iter()
-            .zip(payload_copy_offsets.iter().zip(payload_copy_bytes.iter()))
-        {
-            payload_encoder.copy_buffer_to_buffer(
-                &scratch.out_buffer,
-                u64::try_from(state.host.out_base_word)
-                    .map_err(|_| PDeflateError::NumericOverflow)?
-                    .saturating_mul(4),
-                &payload_readback_buffer,
-                dst_off,
-                copy_bytes.max(4),
-            );
-        }
-        let t_submit2 = Instant::now();
-        r.queue.submit(Some(payload_encoder.finish()));
-        let payload_submit_ms = elapsed_ms(t_submit2);
-        let payload_slice = payload_readback_buffer.slice(..payload_readback_bytes);
-        let (out_tx, out_rx) = mpsc::channel();
-        payload_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = out_tx.send(res);
-        });
-        payload_readback_setup_ms = elapsed_ms(t_payload_readback_setup);
-        let t_wait2 = Instant::now();
-        r.device.poll(wgpu::Maintain::Wait);
         out_rx
             .recv()
             .map_err(|_| {
@@ -17031,94 +17253,205 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                     "integrated/payload-readback-map: map_async failed: {e}"
                 ))
             })?;
-        let phase2_wait_ms = elapsed_ms(t_wait2);
+        let phase1_wait_ms = elapsed_ms(t_wait1);
+
+        let t_lens_copy = Instant::now();
+        let (
+            payload_lens,
+            payload_table_counts,
+            payload_copy_bytes,
+        ) = {
+            let result_mapped = result_slice.get_mapped_range();
+            let result_words: &[u32] = bytemuck::cast_slice(&result_mapped);
+            let parse_result = (|| -> Result<_, PDeflateError> {
+                let mut payload_lens = Vec::<usize>::with_capacity(inputs.len());
+                let mut payload_table_counts = Vec::<usize>::with_capacity(inputs.len());
+                let mut payload_copy_bytes = Vec::<u64>::with_capacity(inputs.len());
+                for (idx, state) in direct_states.iter().enumerate() {
+                    let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
+                    let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
+                    let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
+                    if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
+                        return Err(PDeflateError::Gpu(
+                            "integrated/result-parse: sparse size prepare overflow while packing"
+                                .to_string(),
+                        ));
+                    }
+                    let total_len = usize::try_from(total_len_u32)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let total_copy_len = align_up4(total_len);
+                    let total_copy_bytes = u64::try_from(total_copy_len)
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    if total_copy_bytes > state.prep.total_bytes_cap {
+                        return Err(PDeflateError::Gpu(
+                            "gpu sparse pack produced oversized aligned payload".to_string(),
+                        ));
+                    }
+                    if total_copy_bytes > payload_readback_plan_bytes[idx] {
+                        return Err(PDeflateError::Gpu(format!(
+                            "integrated/result-parse: planned payload readback too small idx={} planned={} actual={}",
+                            idx,
+                            payload_readback_plan_bytes[idx],
+                            total_copy_bytes,
+                        )));
+                    }
+                    payload_copy_bytes.push(total_copy_bytes);
+                    payload_lens.push(total_len);
+                    payload_table_counts.push(state.prep.table_count);
+                }
+                Ok((
+                    payload_lens,
+                    payload_table_counts,
+                    payload_copy_bytes,
+                ))
+            })();
+            drop(result_mapped);
+            scratch.result_readback_buffer.unmap();
+            parse_result?
+        };
+        let lens_copy_ms = elapsed_ms(t_lens_copy);
+        let phase2_wait_ms = 0.0_f64;
 
         let t_copy = Instant::now();
-        let payload_mapped = payload_slice.get_mapped_range();
-        let payload_bytes: &[u8] = &payload_mapped;
-        let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(inputs.len());
-        for (idx, state) in direct_states.iter().enumerate() {
-            let chunk_base = usize::try_from(payload_copy_offsets[idx])
-                .map_err(|_| PDeflateError::NumericOverflow)?;
-            let chunk_end = chunk_base
-                .checked_add(
-                    usize::try_from(payload_copy_bytes[idx])
-                        .map_err(|_| PDeflateError::NumericOverflow)?,
-                )
-                .ok_or(PDeflateError::NumericOverflow)?;
-            let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
-                PDeflateError::Gpu(
-                    format!(
-                        "integrated/payload-readback-copy: payload batch readback truncated idx={} chunk_base={} chunk_copy_len={} payload_len={} payload_readback_bytes={} mapped_len={} out_base_word={}",
-                        idx,
-                        chunk_base,
-                        payload_copy_bytes[idx],
-                        payload_lens[idx],
-                        payload_readback_bytes,
-                        payload_bytes.len(),
-                        state.host.out_base_word,
-                    ),
-                )
-            })?;
-            let payload_len = payload_lens[idx];
-            let mut payload = vec![0u8; payload_len];
-            payload.copy_from_slice(&mapped[..payload_len]);
-            ensure_sparse_packed_chunk_huff_lut(&mut payload)
-                .map_err(|err| with_gpu_stage("integrated/ensure-huff-lut", err))?;
-            if gpu_sparse_payload_validate_enabled() {
-                let mut validate_out = vec![0u8; state.chunk_len];
-                if let Err(err) = super::decompress_chunk_into(&payload, &mut validate_out) {
-                    match validate_integrated_section_state(idx, state) {
-                        Ok(()) => {
-                            if GPU_INTEGRATED_FINAL_PROBE_LOGGED
-                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                                .is_ok()
-                            {
-                                let table_data_offset =
-                                    usize::try_from(read_le_u32_at(&payload, 20).unwrap_or(0))
-                                        .unwrap_or(0);
-                                let huff_lut_offset =
-                                    usize::try_from(read_le_u32_at(&payload, 24).unwrap_or(0))
-                                        .unwrap_or(0);
-                                let section_index_offset =
-                                    usize::try_from(read_le_u32_at(&payload, 28).unwrap_or(0))
-                                        .unwrap_or(0);
-                                let section_bitstream_offset =
-                                    usize::try_from(read_le_u32_at(&payload, 32).unwrap_or(0))
-                                        .unwrap_or(0);
-                                let section_index = payload
-                                    .get(section_index_offset..section_bitstream_offset)
-                                    .unwrap_or(&[]);
-                                let section_cmd =
-                                    payload.get(section_bitstream_offset..).unwrap_or(&[]);
-                                let mut section_idx_cursor = 0usize;
-                                let mut cmd_cursor = 0usize;
-                                let mut fail_sec = usize::MAX;
-                                let mut fail_bit_len = 0usize;
-                                for sec in 0..state.prep.section_count {
-                                    match super::read_varint_u32(
-                                        section_index,
-                                        &mut section_idx_cursor,
-                                    ) {
-                                        Ok(sec_bit_len_u32) => {
-                                            let sec_bit_len = usize::try_from(sec_bit_len_u32)
-                                                .unwrap_or(usize::MAX);
-                                            fail_bit_len = sec_bit_len;
-                                            match super::section_bit_len_to_byte_len(
-                                                sec_bit_len_u32 as usize,
+        let (
+            out,
+            predicted_payload_bytes_total,
+            cap_payload_bytes_total,
+            actual_payload_bytes_total,
+            predicted_class_counts,
+            cap_class_counts,
+            actual_class_counts,
+            predicted_underestimate_chunks,
+            predicted_underestimate_bytes,
+            predicted_overestimate_bytes,
+        ) = {
+            let payload_mapped = payload_slice.get_mapped_range();
+            let payload_bytes: &[u8] = &payload_mapped;
+            let copy_result = (|| -> Result<_, PDeflateError> {
+                let mut out = Vec::<GpuSparsePackChunkOutput>::with_capacity(inputs.len());
+                let mut predicted_payload_bytes_total = 0u64;
+                let mut cap_payload_bytes_total = 0u64;
+                let mut actual_payload_bytes_total = 0u64;
+                let mut predicted_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+                let mut cap_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+                let mut actual_class_counts = [0u32; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
+                let mut predicted_underestimate_chunks = 0u32;
+                let mut predicted_underestimate_bytes = 0u64;
+                let mut predicted_overestimate_bytes = 0u64;
+                for (idx, state) in direct_states.iter().enumerate() {
+                    let chunk_base = usize::try_from(payload_readback_offsets[idx])
+                        .map_err(|_| PDeflateError::NumericOverflow)?;
+                    let chunk_end = chunk_base
+                        .checked_add(
+                            usize::try_from(payload_copy_bytes[idx])
+                                .map_err(|_| PDeflateError::NumericOverflow)?,
+                        )
+                        .ok_or(PDeflateError::NumericOverflow)?;
+                    let mapped = payload_bytes.get(chunk_base..chunk_end).ok_or_else(|| {
+                        PDeflateError::Gpu(
+                            format!(
+                                "integrated/payload-readback-copy: payload batch readback truncated idx={} chunk_base={} chunk_copy_len={} payload_len={} payload_readback_bytes={} mapped_len={} out_base_word={}",
+                                idx,
+                                chunk_base,
+                                payload_copy_bytes[idx],
+                                payload_lens[idx],
+                                payload_readback_bytes,
+                                payload_bytes.len(),
+                                state.host.out_base_word,
+                            ),
+                        )
+                    })?;
+                    let payload_len = payload_lens[idx];
+                    let actual_payload_class = classify_sparse_payload_bytes(payload_len);
+                    predicted_payload_bytes_total = predicted_payload_bytes_total
+                        .saturating_add(u64::try_from(state.predicted_payload_bytes).unwrap_or(u64::MAX));
+                    cap_payload_bytes_total = cap_payload_bytes_total
+                        .saturating_add(state.prep.total_bytes_cap);
+                    actual_payload_bytes_total = actual_payload_bytes_total
+                        .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+                    predicted_class_counts[state.predicted_payload_class.idx()] =
+                        predicted_class_counts[state.predicted_payload_class.idx()].saturating_add(1);
+                    cap_class_counts[state.cap_payload_class.idx()] =
+                        cap_class_counts[state.cap_payload_class.idx()].saturating_add(1);
+                    actual_class_counts[actual_payload_class.idx()] =
+                        actual_class_counts[actual_payload_class.idx()].saturating_add(1);
+                    if state.predicted_payload_bytes < payload_len {
+                        predicted_underestimate_chunks =
+                            predicted_underestimate_chunks.saturating_add(1);
+                        predicted_underestimate_bytes = predicted_underestimate_bytes.saturating_add(
+                            u64::try_from(payload_len - state.predicted_payload_bytes)
+                                .unwrap_or(u64::MAX),
+                        );
+                    } else {
+                        predicted_overestimate_bytes = predicted_overestimate_bytes.saturating_add(
+                            u64::try_from(state.predicted_payload_bytes - payload_len)
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
+                    let mut payload = vec![0u8; payload_len];
+                    payload.copy_from_slice(&mapped[..payload_len]);
+                    ensure_sparse_packed_chunk_huff_lut(&mut payload)
+                        .map_err(|err| with_gpu_stage("integrated/ensure-huff-lut", err))?;
+                    if gpu_sparse_payload_validate_enabled() {
+                        let mut validate_out = vec![0u8; state.chunk_len];
+                        if let Err(err) = super::decompress_chunk_into(&payload, &mut validate_out) {
+                            match validate_integrated_section_state(idx, state) {
+                                Ok(()) => {
+                                    if GPU_INTEGRATED_FINAL_PROBE_LOGGED
+                                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                        .is_ok()
+                                    {
+                                        let table_data_offset =
+                                            usize::try_from(read_le_u32_at(&payload, 20).unwrap_or(0))
+                                                .unwrap_or(0);
+                                        let huff_lut_offset =
+                                            usize::try_from(read_le_u32_at(&payload, 24).unwrap_or(0))
+                                                .unwrap_or(0);
+                                        let section_index_offset =
+                                            usize::try_from(read_le_u32_at(&payload, 28).unwrap_or(0))
+                                                .unwrap_or(0);
+                                        let section_bitstream_offset =
+                                            usize::try_from(read_le_u32_at(&payload, 32).unwrap_or(0))
+                                                .unwrap_or(0);
+                                        let section_index = payload
+                                            .get(section_index_offset..section_bitstream_offset)
+                                            .unwrap_or(&[]);
+                                        let section_cmd =
+                                            payload.get(section_bitstream_offset..).unwrap_or(&[]);
+                                        let mut section_idx_cursor = 0usize;
+                                        let mut cmd_cursor = 0usize;
+                                        let mut fail_sec = usize::MAX;
+                                        let mut fail_bit_len = 0usize;
+                                        for sec in 0..state.prep.section_count {
+                                            match super::read_varint_u32(
+                                                section_index,
+                                                &mut section_idx_cursor,
                                             ) {
-                                                Ok(sec_cmd_len) => {
-                                                    if let Some(next) =
-                                                        cmd_cursor.checked_add(sec_cmd_len)
-                                                    {
-                                                        if next > section_cmd.len() {
+                                                Ok(sec_bit_len_u32) => {
+                                                    let sec_bit_len = usize::try_from(sec_bit_len_u32)
+                                                        .unwrap_or(usize::MAX);
+                                                    fail_bit_len = sec_bit_len;
+                                                    match super::section_bit_len_to_byte_len(
+                                                        sec_bit_len_u32 as usize,
+                                                    ) {
+                                                        Ok(sec_cmd_len) => {
+                                                            if let Some(next) =
+                                                                cmd_cursor.checked_add(sec_cmd_len)
+                                                            {
+                                                                if next > section_cmd.len() {
+                                                                    fail_sec = sec;
+                                                                    break;
+                                                                }
+                                                                cmd_cursor = next;
+                                                            } else {
+                                                                fail_sec = sec;
+                                                                break;
+                                                            }
+                                                        }
+                                                        Err(_) => {
                                                             fail_sec = sec;
                                                             break;
                                                         }
-                                                        cmd_cursor = next;
-                                                    } else {
-                                                        fail_sec = sec;
-                                                        break;
                                                     }
                                                 }
                                                 Err(_) => {
@@ -17127,47 +17460,56 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                                                 }
                                             }
                                         }
-                                        Err(_) => {
-                                            fail_sec = sec;
-                                            break;
-                                        }
+                                        eprintln!(
+                                            "[cozip_pdeflate][timing][gpu-integrated-final-probe] chunk_len={} section_count={} payload_len={} table_data_off={} huff_lut_off={} section_index_off={} section_bitstream_off={} section_index_len={} section_cmd_len={} section_idx_cursor={} cmd_cursor={} fail_sec={} fail_bit_len={}",
+                                            state.chunk_len,
+                                            state.prep.section_count,
+                                            payload.len(),
+                                            table_data_offset,
+                                            huff_lut_offset,
+                                            section_index_offset,
+                                            section_bitstream_offset,
+                                            section_index.len(),
+                                            section_cmd.len(),
+                                            section_idx_cursor,
+                                            cmd_cursor,
+                                            fail_sec,
+                                            fail_bit_len,
+                                        );
                                     }
+                                    return Err(with_gpu_stage("integrated/validate-final-payload", err));
                                 }
-                                eprintln!(
-                                    "[cozip_pdeflate][timing][gpu-integrated-final-probe] chunk_len={} section_count={} payload_len={} table_data_off={} huff_lut_off={} section_index_off={} section_bitstream_off={} section_index_len={} section_cmd_len={} section_idx_cursor={} cmd_cursor={} fail_sec={} fail_bit_len={}",
-                                    state.chunk_len,
-                                    state.prep.section_count,
-                                    payload.len(),
-                                    table_data_offset,
-                                    huff_lut_offset,
-                                    section_index_offset,
-                                    section_bitstream_offset,
-                                    section_index.len(),
-                                    section_cmd.len(),
-                                    section_idx_cursor,
-                                    cmd_cursor,
-                                    fail_sec,
-                                    fail_bit_len,
-                                );
+                                Err(section_err) => {
+                                    return Err(with_gpu_stage(
+                                        "integrated/validate-section-cmds",
+                                        section_err,
+                                    ));
+                                }
                             }
-                            return Err(with_gpu_stage("integrated/validate-final-payload", err));
-                        }
-                        Err(section_err) => {
-                            return Err(with_gpu_stage(
-                                "integrated/validate-section-cmds",
-                                section_err,
-                            ));
                         }
                     }
+                    out.push(GpuSparsePackChunkOutput {
+                        payload,
+                        table_count: payload_table_counts[idx],
+                    });
                 }
-            }
-            out.push(GpuSparsePackChunkOutput {
-                payload,
-                table_count: payload_table_counts[idx],
-            });
-        }
-        drop(payload_mapped);
-        payload_readback_buffer.unmap();
+                Ok((
+                    out,
+                    predicted_payload_bytes_total,
+                    cap_payload_bytes_total,
+                    actual_payload_bytes_total,
+                    predicted_class_counts,
+                    cap_class_counts,
+                    actual_class_counts,
+                    predicted_underestimate_chunks,
+                    predicted_underestimate_bytes,
+                    predicted_overestimate_bytes,
+                ))
+            })();
+            drop(payload_mapped);
+            payload_readback_buffer.unmap();
+            copy_result?
+        };
         let sparse_copy_ms = elapsed_ms(t_copy);
 
         let match_stage_weight =
@@ -17191,7 +17533,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             0.0
         };
         let sparse_wait_ms = phase1_wait_ms + phase2_wait_ms;
-        let sparse_submit_ms = sparse_first_submit_ms + payload_submit_ms;
+        let sparse_submit_ms = sparse_first_submit_ms;
         let sparse_total_ms = sparse_prepare_ms
             + sparse_scratch_acquire_ms
             + sparse_submit_ms
@@ -17212,6 +17554,15 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
             out_cmd_bytes_total: direct_states
                 .iter()
                 .fold(0u64, |acc, s| acc.saturating_add(s.out_cmd_bytes.max(4))),
+            predicted_payload_bytes_total,
+            cap_payload_bytes_total,
+            actual_payload_bytes_total,
+            predicted_class_counts,
+            cap_class_counts,
+            actual_class_counts,
+            predicted_underestimate_chunks,
+            predicted_underestimate_bytes,
+            predicted_overestimate_bytes,
             lens_submit_ms: sparse_submit_ms,
             lens_submit_done_wait_ms: sparse_wait_ms,
             lens_map_after_done_ms: 0.0,
@@ -17264,7 +17615,7 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                     .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
                     .unwrap_or((0, 0));
                 eprintln!(
-                    "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq=0 sparse_submit_seq_last=0 sparse_submit_count=2 payload_submit_seq=0 pre_wait_latest_build_submit_ms=0.000 submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms=0.000 map_callback_wait_payload_ms=0.000 map_callback_wait_ms=0.000 sparse_wait_calls=0 payload_wait_calls=0 sparse_wait_max_ms=0.000 payload_wait_max_ms=0.000 sparse_wait_ready=0 payload_wait_ready=0 sparse_ts_prepare_kernel_ms=0.000 sparse_ts_kernel_ms=0.000 sparse_ts_kernel_total_ms=0.000 sparse_ts_parse_ms=0.000 sparse_ts_queue_stall_est_ms=0.000 sparse_ts_status={} lens_wait_ms={:.3}",
+                    "[cozip_pdeflate][timing][sparse-lens-wait-breakdown] seq={} chunks={} pending_maps={} readback_kib={:.1} payload_readback_kib={:.1} build_id_range={} build_submit_seq_range={} build_ids={} latest_build_submit_seq={} latest_build_id={} sparse_submit_seq=0 sparse_submit_seq_last=0 sparse_submit_count=1 payload_submit_seq=0 pre_wait_latest_build_submit_ms=0.000 submit_done_wait_sparse_ms={:.3} submit_done_wait_payload_ms={:.3} submit_done_wait_ms={:.3} map_callback_wait_sparse_ms=0.000 map_callback_wait_payload_ms=0.000 map_callback_wait_ms=0.000 sparse_wait_calls=0 payload_wait_calls=0 sparse_wait_max_ms=0.000 payload_wait_max_ms=0.000 sparse_wait_ready=0 payload_wait_ready=0 sparse_ts_prepare_kernel_ms=0.000 sparse_ts_kernel_ms=0.000 sparse_ts_kernel_total_ms=0.000 sparse_ts_parse_ms=0.000 sparse_ts_queue_stall_est_ms=0.000 sparse_ts_status={} lens_wait_ms={:.3}",
                     seq,
                     inputs.len(),
                     2,
@@ -17276,12 +17627,29 @@ pub(crate) fn compute_matches_encode_and_pack_sparse_batch(
                     latest_build_submit_seq,
                     latest_build_id,
                     phase1_wait_ms,
-                    phase2_wait_ms,
+                    0.0,
                     phase1_wait_ms + phase2_wait_ms,
                     if sparse_kernel_ts_probe { "on" } else { "off" },
                     phase1_wait_ms + phase2_wait_ms,
                 );
             }
+        }
+        if profile_enabled() {
+            let chunks_f = (inputs.len() as f64).max(1.0);
+            eprintln!(
+                "[cozip_pdeflate][timing][sparse-class-breakdown] chunks={} mode={:?} predicted_hist={} actual_hist={} cap_hist={} predicted_avg_kib={:.1} actual_avg_kib={:.1} cap_avg_kib={:.1} predicted_under_chunks={} predicted_under_mib={:.3} predicted_over_mib={:.3}",
+                inputs.len(),
+                compression_mode,
+                format_sparse_payload_class_counts(&predicted_class_counts),
+                format_sparse_payload_class_counts(&actual_class_counts),
+                format_sparse_payload_class_counts(&cap_class_counts),
+                (predicted_payload_bytes_total as f64) / chunks_f / 1024.0,
+                (actual_payload_bytes_total as f64) / chunks_f / 1024.0,
+                (cap_payload_bytes_total as f64) / chunks_f / 1024.0,
+                predicted_underestimate_chunks,
+                (predicted_underestimate_bytes as f64) / (1024.0 * 1024.0),
+                (predicted_overestimate_bytes as f64) / (1024.0 * 1024.0),
+            );
         }
         if gpu_call_unaccounted_probe {
             let seq = GPU_CALL_UNACCOUNTED_SEQ.fetch_add(1, Ordering::Relaxed);

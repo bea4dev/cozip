@@ -1894,3 +1894,59 @@ mode別GPU品質パラメータ:
 
 確認:
 - `cargo test -p cozip_gdeflate` 通過（4 tests）。
+
+## 2026-03-07 - PDeflate GPU sparse direct output の設計分解を追加
+
+背景:
+- `speed` モードでは GPU table build を無効化済み。
+- それでも GPU圧縮の主要律速が `sparse_lens_wait` に残っている。
+- 現行 integrated sparse path は `result readback -> payload readback` の 2 段 readback で、`device.poll(Maintain::Wait)` が強い待ちを作っている。
+
+決定:
+- 全面 worst-case 固定長ではなく、サイズクラス別 direct output を本命案とする。
+- まずは `docs/pdeflate-gpu-sparse-direct-output-design.md` と `docs/tasks/pdeflate-gpu-sparse-direct-output-tasks.md` で、段階導入の設計とフェーズを定義した。
+
+狙い:
+- `sparse_lens_wait` の根本原因である「長さ待ち後に payload 回収計画を作る」依存を壊す。
+- VRAM 悪化を避けつつ、2 段 readback を解消する。
+
+## 2026-03-07 - PDeflate GPU sparse direct output Phase 0/1 を実装
+
+実装:
+- `GpuMatchInput` に `compression_mode` を追加し、legacy 側の GPU圧縮経路へ伝搬。
+- `legacy_pdeflate_cpu::gpu` に sparse payload size class を追加。
+  - `Tiny <= 256KiB`
+  - `Small <= 1MiB`
+  - `Medium <= 2MiB`
+  - `Large <= 4MiB`
+  - `XLarge > 4MiB`
+- `compute_matches_encode_and_pack_sparse_batch` で、chunk ごとに conservative な sparse payload 推定値と class を計算するようにした。
+- 実 payload 回収時に、予測 class / cap class / 実 class のヒストグラムと、under/over estimate 量を集計するようにした。
+- 新しい計測ログを追加:
+  - `sparse-class-breakdown`
+  - `gpu-pack-batch` への predicted/actual/cap average と under/over 量の追加
+
+狙い:
+- Phase 2 以降の classed direct output 設計に必要な実分布を取る。
+- 「VRAM を爆発させずに事前 slot 割当できる class 境界」を決める。
+
+確認:
+- `cargo check -p cozip_pdeflate` 通過。
+- `cargo build --release --example bench_pdeflate -p cozip_pdeflate` 通過。
+
+## 2026-03-07 - PDeflate GPU sparse direct output Phase 2 を実装
+
+実装:
+- integrated sparse path の `out_buffer` 配置を、予測 class ベースの slot layout へ変更。
+- `GPU_SPARSE_PACK_BATCH_DESC_WORDS` を拡張し、class/slot 情報を desc へ載せる土台を追加。
+- chunk ごとの `slot_cap_bytes` を class 容量から決め、`out_base_word` と `total_bytes_cap` を classed slot に合わせて再配置するようにした。
+- `sparse-class-layout` ログを追加し、旧レイアウト比の `out_total_mib` 縮小率を見えるようにした。
+
+注意:
+- この段階では 2 段 readback 自体はまだ残っている。
+- したがって `sparse_lens_wait` の本体削減は Phase 4 以降。
+- 期待値は「まず VRAM と output slot 容量を削る」であり、速度改善は副次的。
+
+確認:
+- `cargo check -p cozip_pdeflate` 通過。
+- `cargo build --release --example bench_pdeflate -p cozip_pdeflate` 通過。
