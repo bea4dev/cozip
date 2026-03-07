@@ -7,6 +7,7 @@ use cozip_deflate::{
     CoZipDeflate, CompressionMode, CozipDeflateError, DeflateChunkIndex, HybridOptions,
     deflate_decompress_on_cpu, deflate_decompress_stream_on_cpu,
 };
+use cozip_pdeflate::{CoZipPDeflate, CoZipPDeflateError, PDeflateOptions};
 use thiserror::Error;
 
 const LOCAL_FILE_HEADER_SIG: u32 = 0x0403_4b50;
@@ -302,6 +303,7 @@ fn parse_czdi_extra_field(extra: &[u8]) -> Result<Option<CzdiParsedExtra>, CoZip
 #[derive(Debug, Clone)]
 pub enum CoZipOptions {
     Zip { options: ZipOptions },
+    PDeflate { options: PDeflateOptions },
 }
 
 impl Default for CoZipOptions {
@@ -335,6 +337,8 @@ pub enum CoZipError {
     InvalidEntryName(&'static str),
     #[error("deflate error: {0}")]
     Deflate(#[from] CozipDeflateError),
+    #[error("pdeflate error: {0}")]
+    PDeflate(#[from] CoZipPDeflateError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("path contains non-utf8 bytes")]
@@ -355,6 +359,7 @@ pub struct CoZip {
 #[derive(Debug, Clone)]
 enum CoZipBackend {
     Zip { deflate: CoZipDeflate },
+    PDeflate { pdeflate: CoZipPDeflate },
 }
 
 impl CoZip {
@@ -368,6 +373,10 @@ impl CoZip {
                 hybrid_opts.prefer_gpu = matches!(options.deflate_mode, ZipDeflateMode::Hybrid);
                 let deflate = CoZipDeflate::init(hybrid_opts)?;
                 CoZipBackend::Zip { deflate }
+            }
+            CoZipOptions::PDeflate { options } => {
+                let pdeflate = CoZipPDeflate::init(options)?;
+                CoZipBackend::PDeflate { pdeflate }
             }
         };
         Ok(Self { backend })
@@ -387,16 +396,28 @@ impl CoZip {
         output_file: StdFile,
         entry_name: &str,
     ) -> Result<CoZipStats, CoZipError> {
-        let deflate = self.zip_deflate();
-        let entry_name = normalize_zip_entry_name(entry_name)?;
+        match &self.backend {
+            CoZipBackend::Zip { deflate } => {
+                let entry_name = normalize_zip_entry_name(entry_name)?;
 
-        let mut reader = BufReader::new(input_file);
-        let mut writer = BufWriter::new(output_file);
-        let mut state = ZipWriteState::default();
-        state.write_entry_from_reader(&mut writer, &entry_name, &mut reader, deflate)?;
-        let stats = state.finish(&mut writer)?;
-        writer.flush()?;
-        Ok(stats)
+                let mut reader = BufReader::new(input_file);
+                let mut writer = BufWriter::new(output_file);
+                let mut state = ZipWriteState::default();
+                state.write_entry_from_reader(&mut writer, &entry_name, &mut reader, deflate)?;
+                let stats = state.finish(&mut writer)?;
+                writer.flush()?;
+                Ok(stats)
+            }
+            CoZipBackend::PDeflate { pdeflate } => {
+                let _ = entry_name;
+                let stats = pdeflate.compress_file(input_file, output_file)?;
+                Ok(CoZipStats {
+                    entries: 1,
+                    input_bytes: stats.input_bytes,
+                    output_bytes: stats.output_bytes,
+                })
+            }
+        }
     }
 
     pub fn compress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
@@ -455,6 +476,11 @@ impl CoZip {
         input_dir: PIn,
         output_path: POut,
     ) -> Result<CoZipStats, CoZipError> {
+        if matches!(self.backend, CoZipBackend::PDeflate { .. }) {
+            return Err(CoZipError::Unsupported(
+                "pdeflate backend does not support directory/archive mode",
+            ));
+        }
         let deflate = self.zip_deflate();
         let input_dir = input_dir.as_ref();
         if !input_dir.is_dir() {
@@ -496,24 +522,36 @@ impl CoZip {
         input_file: StdFile,
         output_file: StdFile,
     ) -> Result<CoZipStats, CoZipError> {
-        let mut reader = BufReader::new(input_file);
-        let mut writer = BufWriter::new(output_file);
-        let (entries, input_len) = read_central_directory_entries(&mut reader)?;
-        if entries.len() != 1 {
-            return Err(CoZipError::Unsupported(
-                "decompress_file expects exactly one file in archive",
-            ));
+        match &self.backend {
+            CoZipBackend::Zip { deflate } => {
+                let mut reader = BufReader::new(input_file);
+                let mut writer = BufWriter::new(output_file);
+                let (entries, input_len) = read_central_directory_entries(&mut reader)?;
+                if entries.len() != 1 {
+                    return Err(CoZipError::Unsupported(
+                        "decompress_file expects exactly one file in archive",
+                    ));
+                }
+
+                let output_bytes =
+                    extract_entry_to_writer(&mut reader, &entries[0], &mut writer, deflate)?;
+                writer.flush()?;
+
+                Ok(CoZipStats {
+                    entries: 1,
+                    input_bytes: input_len,
+                    output_bytes,
+                })
+            }
+            CoZipBackend::PDeflate { pdeflate } => {
+                let stats = pdeflate.decompress_file(input_file, output_file)?;
+                Ok(CoZipStats {
+                    entries: 1,
+                    input_bytes: stats.input_bytes,
+                    output_bytes: stats.output_bytes,
+                })
+            }
         }
-
-        let deflate = self.zip_deflate();
-        let output_bytes = extract_entry_to_writer(&mut reader, &entries[0], &mut writer, deflate)?;
-        writer.flush()?;
-
-        Ok(CoZipStats {
-            entries: 1,
-            input_bytes: input_len,
-            output_bytes,
-        })
     }
 
     pub fn decompress_file_from_name<PIn: AsRef<Path>, POut: AsRef<Path>>(
@@ -552,6 +590,11 @@ impl CoZip {
         input_file: StdFile,
         output_dir: POut,
     ) -> Result<CoZipStats, CoZipError> {
+        if matches!(self.backend, CoZipBackend::PDeflate { .. }) {
+            return Err(CoZipError::Unsupported(
+                "pdeflate backend does not support directory/archive mode",
+            ));
+        }
         let output_dir = output_dir.as_ref();
         std::fs::create_dir_all(output_dir)?;
 
@@ -621,6 +664,9 @@ impl CoZip {
     fn zip_deflate(&self) -> &CoZipDeflate {
         match &self.backend {
             CoZipBackend::Zip { deflate } => deflate,
+            CoZipBackend::PDeflate { .. } => {
+                panic!("zip_deflate called for non-zip backend")
+            }
         }
     }
 }

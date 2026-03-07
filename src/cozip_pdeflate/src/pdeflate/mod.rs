@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +18,7 @@ mod shaders;
 const STREAM_MAGIC: [u8; 4] = *b"PDS0";
 const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
 const PDEFLATE_VERSION: u16 = 0;
+const CHUNK_FLAG_HUFFMAN: u16 = 1 << 0;
 const LITERAL_TAG: u16 = 0x0fff;
 const MAX_TABLE_ID: usize = (LITERAL_TAG as usize) - 1;
 const CHUNK_HEADER_SIZE: usize = 36;
@@ -195,6 +198,7 @@ pub struct PDeflateOptions {
     pub gpu_pipelined_submit_chunks: usize,
     pub gpu_min_chunk_size: usize,
     pub gpu_tail_stop_ratio: f32,
+    pub huffman_encode_enabled: bool,
     pub compression_mode: PDeflateCompressionMode,
     pub hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy,
 }
@@ -221,6 +225,7 @@ impl Default for PDeflateOptions {
             gpu_pipelined_submit_chunks: 4,
             gpu_min_chunk_size: 64 * 1024,
             gpu_tail_stop_ratio: 1.0,
+            huffman_encode_enabled: false,
             compression_mode: PDeflateCompressionMode::Speed,
             hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
         }
@@ -242,6 +247,8 @@ pub enum PDeflateError {
     InvalidOptions(&'static str),
     #[error("invalid stream: {0}")]
     InvalidStream(&'static str),
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("numeric overflow")]
     NumericOverflow,
     #[error("gpu error: {0}")]
@@ -624,6 +631,185 @@ pub fn pdeflate_compress(
     pdeflate_compress_with_stats(input, options).map(|(out, _)| out)
 }
 
+fn create_temp_spool_file() -> Result<File, PDeflateError> {
+    let mut base = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| PDeflateError::InvalidOptions("system clock before unix epoch"))?
+        .as_nanos();
+    for salt in 0..64u32 {
+        base.push(format!("cozip-pdeflate-{pid}-{nanos}-{salt}.tmp"));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&base)
+        {
+            Ok(file) => return Ok(file),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                base.pop();
+            }
+            Err(err) => return Err(PDeflateError::Io(err)),
+        }
+    }
+    Err(PDeflateError::InvalidOptions(
+        "failed to create temporary spool file",
+    ))
+}
+
+pub(crate) fn pdeflate_compress_reader_with_stats<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    options: &PDeflateOptions,
+) -> Result<PDeflateStats, PDeflateError> {
+    validate_options(options)?;
+
+    let mut spool = create_temp_spool_file()?;
+    let mut input_bytes = 0u64;
+    let mut chunk_count = 0usize;
+    let mut table_entries_total = 0usize;
+    let mut section_count_total = 0usize;
+    let mut buffer = vec![0u8; options.chunk_size.max(1)];
+
+    loop {
+        let mut filled = 0usize;
+        while filled < buffer.len() {
+            let read = reader.read(&mut buffer[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled = filled.saturating_add(read);
+        }
+        if filled == 0 {
+            break;
+        }
+
+        input_bytes = input_bytes
+            .checked_add(u64::try_from(filled).map_err(|_| PDeflateError::NumericOverflow)?)
+            .ok_or(PDeflateError::NumericOverflow)?;
+
+        let encoded = compress_chunk(&buffer[..filled], options)?;
+        spool.write_all(
+            &u32::try_from(encoded.payload.len())
+                .map_err(|_| PDeflateError::NumericOverflow)?
+                .to_le_bytes(),
+        )?;
+        spool.write_all(&encoded.payload)?;
+        chunk_count = chunk_count.saturating_add(1);
+        table_entries_total = table_entries_total.saturating_add(encoded.table_entries);
+        section_count_total = section_count_total.saturating_add(encoded.section_count);
+    }
+
+    let mut header = Vec::with_capacity(24);
+    header.extend_from_slice(&STREAM_MAGIC);
+    write_u16_le(&mut header, PDEFLATE_VERSION);
+    write_u16_le(&mut header, 0);
+    write_u32_le(
+        &mut header,
+        u32::try_from(options.chunk_size).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    write_u64_le(&mut header, input_bytes);
+    write_u32_le(
+        &mut header,
+        u32::try_from(chunk_count).map_err(|_| PDeflateError::NumericOverflow)?,
+    );
+    writer.write_all(&header)?;
+    spool.seek(SeekFrom::Start(0))?;
+    std::io::copy(&mut spool, writer)?;
+
+    let output_bytes = u64::try_from(header.len())
+        .map_err(|_| PDeflateError::NumericOverflow)?
+        .checked_add(spool.metadata()?.len())
+        .ok_or(PDeflateError::NumericOverflow)?;
+    Ok(PDeflateStats {
+        input_bytes,
+        output_bytes,
+        chunk_count,
+        table_entries_total,
+        section_count_total,
+    })
+}
+
+pub(crate) fn pdeflate_decompress_reader_with_stats<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    options: &PDeflateOptions,
+) -> Result<PDeflateStats, PDeflateError> {
+    validate_options(options)?;
+
+    let mut header = [0u8; 24];
+    reader.read_exact(&mut header)?;
+    let mut cursor = 0usize;
+    let magic = read_exact(&header, &mut cursor, 4)?;
+    if magic != STREAM_MAGIC {
+        return Err(PDeflateError::InvalidStream("bad stream magic"));
+    }
+    let version = read_u16_le(&header, &mut cursor)?;
+    if version != PDEFLATE_VERSION {
+        return Err(PDeflateError::InvalidStream("unsupported stream version"));
+    }
+    let _flags = read_u16_le(&header, &mut cursor)?;
+    let _chunk_size = read_u32_le(&header, &mut cursor)? as usize;
+    let original_len = read_u64_le(&header, &mut cursor)? as usize;
+    let chunk_count = read_u32_le(&header, &mut cursor)? as usize;
+
+    let mut input_bytes =
+        u64::try_from(header.len()).map_err(|_| PDeflateError::NumericOverflow)?;
+    let mut output_bytes = 0u64;
+    let mut table_entries_total = 0usize;
+    let mut section_count_total = 0usize;
+
+    for _ in 0..chunk_count {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        input_bytes = input_bytes
+            .checked_add(4)
+            .ok_or(PDeflateError::NumericOverflow)?;
+        let mut len_cursor = 0usize;
+        let payload_len = read_u32_le(&len_buf, &mut len_cursor)? as usize;
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload)?;
+        input_bytes = input_bytes
+            .checked_add(u64::try_from(payload_len).map_err(|_| PDeflateError::NumericOverflow)?)
+            .ok_or(PDeflateError::NumericOverflow)?;
+
+        if payload.len() < CHUNK_HEADER_SIZE {
+            return Err(PDeflateError::InvalidStream("chunk header truncated"));
+        }
+        let chunk_uncompressed_len = usize::try_from(u32::from_le_bytes(
+            payload[8..12]
+                .try_into()
+                .map_err(|_| PDeflateError::InvalidStream("chunk length parse failed"))?,
+        ))
+        .map_err(|_| PDeflateError::NumericOverflow)?;
+        let mut restored = vec![0u8; chunk_uncompressed_len];
+        let stats = decompress_chunk_into(&payload, &mut restored)?;
+        writer.write_all(&restored)?;
+        output_bytes = output_bytes
+            .checked_add(
+                u64::try_from(restored.len()).map_err(|_| PDeflateError::NumericOverflow)?,
+            )
+            .ok_or(PDeflateError::NumericOverflow)?;
+        table_entries_total = table_entries_total.saturating_add(stats.table_entries);
+        section_count_total = section_count_total.saturating_add(stats.section_count);
+    }
+
+    if output_bytes
+        != u64::try_from(original_len).map_err(|_| PDeflateError::NumericOverflow)?
+    {
+        return Err(PDeflateError::InvalidStream("decompressed size mismatch"));
+    }
+
+    Ok(PDeflateStats {
+        input_bytes,
+        output_bytes,
+        chunk_count,
+        table_entries_total,
+        section_count_total,
+    })
+}
+
 pub fn pdeflate_decompress(stream: &[u8]) -> Result<Vec<u8>, PDeflateError> {
     pdeflate_decompress_with_stats(stream).map(|(out, _)| out)
 }
@@ -641,6 +827,7 @@ fn classify_integrated_batch_error(err: &PDeflateError) -> &'static str {
         PDeflateError::InvalidOptions(_) => "invalid_options",
         PDeflateError::InvalidStream(_) => "invalid_stream",
         PDeflateError::NumericOverflow => "numeric_overflow",
+        PDeflateError::Io(_) => "io_error",
         PDeflateError::Gpu(_) => "gpu_error",
     }
 }
@@ -1755,6 +1942,7 @@ fn materialize_table_entries(
 
 fn pack_chunk_payload_cpu(
     chunk_len: usize,
+    flags: u16,
     table_count: usize,
     section_count: usize,
     table_index: &[u8],
@@ -1783,7 +1971,7 @@ fn pack_chunk_payload_cpu(
     let mut payload = Vec::with_capacity(total_len);
     payload.extend_from_slice(&CHUNK_MAGIC);
     write_u16_le(&mut payload, PDEFLATE_VERSION);
-    write_u16_le(&mut payload, 0);
+    write_u16_le(&mut payload, flags);
     write_u32_le(
         &mut payload,
         u32::try_from(chunk_len).map_err(|_| PDeflateError::NumericOverflow)?,
@@ -1831,6 +2019,7 @@ fn pack_chunk_payload_cpu(
 
 fn pack_chunk_payload(
     chunk_len: usize,
+    flags: u16,
     table_count: usize,
     section_count: usize,
     table_index: &[u8],
@@ -1843,6 +2032,7 @@ fn pack_chunk_payload(
     let t0 = Instant::now();
     let payload = pack_chunk_payload_cpu(
         chunk_len,
+        flags,
         table_count,
         section_count,
         table_index,
@@ -1866,6 +2056,11 @@ fn build_identity_huffman_lut_block() -> Result<Vec<u8>, PDeflateError> {
         subtables: Vec::new(),
     };
     serialize_huffman_lut(&lut)
+}
+
+#[inline]
+fn chunk_huffman_enabled(flags: u16) -> bool {
+    (flags & CHUNK_FLAG_HUFFMAN) != 0
 }
 
 fn finalize_chunk_from_table(
@@ -1978,6 +2173,7 @@ fn finalize_chunk_from_table(
             let mut scratch = scratch.borrow_mut();
             scratch.section_index.clear();
             scratch.section_bitstream.clear();
+            let huffman_enabled = options.huffman_encode_enabled;
             let mut section_cmd_cursor = 0usize;
             for &len_u32 in &section_cmd_lens {
                 let sec_cmd_len =
@@ -1990,9 +2186,18 @@ fn finalize_chunk_from_table(
                         "section command range out of bounds during bitstream encode",
                     ),
                 )?;
-                let symbols = logical_commands_to_huffman_symbols(sec_cmd);
-                let bit_len =
-                    encode_huffman_symbols_to_bitstream(symbols, &mut scratch.section_bitstream)?;
+                let bit_len = if huffman_enabled {
+                    let symbols = logical_commands_to_huffman_symbols(sec_cmd);
+                    encode_huffman_symbols_to_bitstream(symbols, &mut scratch.section_bitstream)?
+                } else {
+                    scratch.section_bitstream.extend_from_slice(sec_cmd);
+                    u32::try_from(
+                        sec_cmd_len
+                            .checked_mul(8)
+                            .ok_or(PDeflateError::NumericOverflow)?,
+                    )
+                    .map_err(|_| PDeflateError::NumericOverflow)?
+                };
                 write_varint_u32(&mut scratch.section_index, bit_len);
                 section_cmd_cursor = sec_cmd_end;
             }
@@ -2020,13 +2225,25 @@ fn finalize_chunk_from_table(
                 }
                 (&scratch.table_index, &scratch.table_data)
             };
+            let huff_lut_storage = if huffman_enabled {
+                Some(build_identity_huffman_lut_block()?)
+            } else {
+                None
+            };
+            let huff_lut = huff_lut_storage.as_deref().unwrap_or(&[]);
+            let chunk_flags = if huffman_enabled {
+                CHUNK_FLAG_HUFFMAN
+            } else {
+                0
+            };
             pack_chunk_payload(
                 chunk.len(),
+                chunk_flags,
                 table_index.len(),
                 section_count,
                 table_index,
                 table_data,
-                &build_identity_huffman_lut_block()?,
+                huff_lut,
                 &scratch.section_index,
                 &scratch.section_bitstream,
                 gpu_used,
@@ -2710,6 +2927,7 @@ fn compress_chunk_gpu_batch(
                         max_ref_len: p.max_ref_len,
                         min_ref_len: options.min_ref_len,
                         section_count: options.section_count,
+                        huffman_encode_enabled: options.huffman_encode_enabled,
                         compression_mode: options.compression_mode,
                     }
                 })
@@ -2773,6 +2991,7 @@ fn compress_chunk_gpu_batch(
                         max_ref_len: p.max_ref_len,
                         min_ref_len: options.min_ref_len,
                         section_count: options.section_count,
+                        huffman_encode_enabled: options.huffman_encode_enabled,
                         compression_mode: options.compression_mode,
                     }
                 })
@@ -3884,6 +4103,7 @@ fn compress_chunk(
             max_ref_len,
             min_ref_len: options.min_ref_len,
             section_count,
+            huffman_encode_enabled: options.huffman_encode_enabled,
             compression_mode: options.compression_mode,
         };
         match gpu::compute_matches(&gpu_input) {
@@ -4020,7 +4240,11 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
         return Err(PDeflateError::InvalidStream("unsupported chunk version"));
     }
 
-    let _flags = read_u16_le(payload, &mut cursor)?;
+    let flags = read_u16_le(payload, &mut cursor)?;
+    if (flags & !CHUNK_FLAG_HUFFMAN) != 0 {
+        return Err(PDeflateError::InvalidStream("unsupported chunk flags"));
+    }
+    let huffman_enabled = chunk_huffman_enabled(flags);
     let chunk_uncompressed_len = read_u32_le(payload, &mut cursor)? as usize;
     let table_count = read_u16_le(payload, &mut cursor)? as usize;
     let section_count = read_u16_le(payload, &mut cursor)? as usize;
@@ -4056,7 +4280,9 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
         return Err(PDeflateError::InvalidStream("table index length mismatch"));
     }
     let section_index = &payload[section_index_offset..section_bitstream_offset];
-    let _huff_lut = deserialize_huffman_lut(&payload[huff_lut_offset..section_index_offset])?;
+    if huffman_enabled {
+        let _ = deserialize_huffman_lut(&payload[huff_lut_offset..section_index_offset])?;
+    }
     let section_cmd = &payload[section_bitstream_offset..];
 
     let mut section_idx_cursor = 0usize;
@@ -4119,7 +4345,11 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
         return Err(PDeflateError::InvalidStream("unsupported chunk version"));
     }
 
-    let _flags = read_u16_le(payload, &mut cursor)?;
+    let flags = read_u16_le(payload, &mut cursor)?;
+    if (flags & !CHUNK_FLAG_HUFFMAN) != 0 {
+        return Err(PDeflateError::InvalidStream("unsupported chunk flags"));
+    }
+    let huffman_enabled = chunk_huffman_enabled(flags);
     let chunk_uncompressed_len = read_u32_le(payload, &mut cursor)? as usize;
     let table_count = read_u16_le(payload, &mut cursor)? as usize;
     let section_count = read_u16_le(payload, &mut cursor)? as usize;
@@ -4163,7 +4393,13 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
     let mut decode_profile = ChunkDecodeProfile::default();
     let table_t0 = Instant::now();
     let table_data = &payload[table_data_offset..huff_lut_offset];
-    let huff_lut = deserialize_huffman_lut(&payload[huff_lut_offset..section_index_offset])?;
+    let huff_lut = if huffman_enabled {
+        Some(deserialize_huffman_lut(
+            &payload[huff_lut_offset..section_index_offset],
+        )?)
+    } else {
+        None
+    };
     let section_index = &payload[section_index_offset..section_bitstream_offset];
     let section_cmd = &payload[section_bitstream_offset..];
     DECODE_SCRATCH.with(|scratch| -> Result<(), PDeflateError> {
@@ -4273,12 +4509,22 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
                     .ok_or(PDeflateError::InvalidStream(
                         "section cmd range out of bounds",
                     ))?;
-            let sec_symbols = decode_section_bitstream_to_huffman_symbols_with_lut(
-                sec_cmd,
-                section_bit_lens[sec] as usize,
-                &huff_lut,
-            )?;
-            let sec_logical_cmd = huffman_symbols_to_logical_commands(sec_symbols);
+            let sec_logical_cmd = if let Some(huff_lut) = huff_lut.as_ref() {
+                let sec_symbols = decode_section_bitstream_to_huffman_symbols_with_lut(
+                    sec_cmd,
+                    section_bit_lens[sec] as usize,
+                    huff_lut,
+                )?;
+                huffman_symbols_to_logical_commands(sec_symbols)
+            } else {
+                let byte_len = section_bit_len_to_byte_len(section_bit_lens[sec] as usize)?;
+                if byte_len != sec_cmd.len() {
+                    return Err(PDeflateError::InvalidStream(
+                        "section bitstream length mismatch",
+                    ));
+                }
+                sec_cmd.to_vec()
+            };
             decode_section(
                 &sec_logical_cmd,
                 out_len,
@@ -6692,16 +6938,25 @@ mod tests {
         payloads
     }
 
-    fn compress_single_chunk_payload(input: &[u8], section_count: usize) -> Vec<u8> {
+    fn compress_single_chunk_payload_with_huffman(
+        input: &[u8],
+        section_count: usize,
+        huffman_encode_enabled: bool,
+    ) -> Vec<u8> {
         let opts = PDeflateOptions {
             chunk_size: input.len().max(1),
             section_count,
+            huffman_encode_enabled,
             ..PDeflateOptions::default()
         };
         let stream = pdeflate_compress(input, &opts).expect("compress single chunk");
         let payloads = extract_chunk_payloads(&stream);
         assert_eq!(payloads.len(), 1, "single chunk expected");
         payloads.into_iter().next().expect("single payload")
+    }
+
+    fn compress_single_chunk_payload(input: &[u8], section_count: usize) -> Vec<u8> {
+        compress_single_chunk_payload_with_huffman(input, section_count, false)
     }
 
     fn make_gpu_decode_job<'a>(chunk_index: usize, payload: &'a [u8]) -> gpu::GpuDecodeJob<'a> {
@@ -6861,7 +7116,7 @@ mod tests {
     #[test]
     fn chunk_contains_identity_huffman_lut_block() {
         let input = b"ABABABABABABABAB".to_vec();
-        let payload = compress_single_chunk_payload(&input, 1);
+        let payload = compress_single_chunk_payload_with_huffman(&input, 1, true);
         let (
             table_index_offset,
             table_data_offset,
@@ -6897,7 +7152,7 @@ mod tests {
     #[test]
     fn reject_corrupted_chunk_huffman_lut_block() {
         let input = b"ABABABABABABABAB".to_vec();
-        let mut payload = compress_single_chunk_payload(&input, 1);
+        let mut payload = compress_single_chunk_payload_with_huffman(&input, 1, true);
         let (_table_index_offset, _table_data_offset, huff_lut_offset, _section_index_offset, _) =
             chunk_offsets(&payload);
         // huff lut header: [symbol_count:u16][root_bits:u8][max_code_bits:u8][root_len:u32]...

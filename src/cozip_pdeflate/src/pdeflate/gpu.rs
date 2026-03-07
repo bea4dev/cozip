@@ -132,6 +132,7 @@ pub(crate) struct GpuMatchInput<'a> {
     pub(crate) max_ref_len: usize,
     pub(crate) min_ref_len: usize,
     pub(crate) section_count: usize,
+    pub(crate) huffman_encode_enabled: bool,
     pub(crate) compression_mode: super::PDeflateCompressionMode,
 }
 
@@ -174,6 +175,7 @@ pub(crate) struct GpuBatchSparsePackOutput {
 
 struct IntegratedSparsePackPrepared {
     chunk_len: usize,
+    huffman_encode_enabled: bool,
     section_count: usize,
     table_data_stream_offset: usize,
     section_index_stream_offset: usize,
@@ -329,6 +331,7 @@ impl Drop for GpuBatchSectionKeepalive {
 pub(crate) struct GpuSparsePackInput<'a> {
     pub(crate) chunk_len: usize,
     pub(crate) section_count: usize,
+    pub(crate) huffman_encode_enabled: bool,
     pub(crate) table: &'a GpuPackedTableDevice,
     pub(crate) section: &'a GpuSectionCmdDeviceOutput,
 }
@@ -870,6 +873,7 @@ struct GpuDecodePayloadLayout {
     table_data_end: usize,
     huff_lut_start: usize,
     huff_lut_end: usize,
+    huffman_enabled: bool,
     cmd_start: usize,
 }
 
@@ -4689,7 +4693,10 @@ fn build_identity_huff_lut_block_for_pack() -> Vec<u8> {
     out
 }
 
-fn ensure_sparse_packed_chunk_huff_lut(payload: &mut Vec<u8>) -> Result<(), PDeflateError> {
+fn finalize_sparse_packed_chunk_huffman(
+    payload: &mut Vec<u8>,
+    huffman_enabled: bool,
+) -> Result<(), PDeflateError> {
     if payload.len() < PACK_CHUNK_HEADER_SIZE {
         return Err(PDeflateError::InvalidStream(
             "gpu sparse packed chunk header truncated",
@@ -4711,6 +4718,17 @@ fn ensure_sparse_packed_chunk_huff_lut(payload: &mut Vec<u8>) -> Result<(), PDef
         return Err(PDeflateError::InvalidStream(
             "gpu sparse packed chunk offsets invalid",
         ));
+    }
+
+    let flags = if huffman_enabled {
+        super::CHUNK_FLAG_HUFFMAN
+    } else {
+        0
+    };
+    write_u16_le_fixed(payload, 6, flags);
+
+    if !huffman_enabled {
+        return Ok(());
     }
 
     // Already has LUT payload.
@@ -5013,6 +5031,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse(
     let inputs = [GpuSparsePackInput {
         chunk_len,
         section_count,
+        huffman_encode_enabled: false,
         table,
         section,
     }];
@@ -5050,6 +5069,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
 
     struct SparsePackPrepared {
         chunk_len: usize,
+        huffman_encode_enabled: bool,
         section_count: usize,
         table_data_stream_offset: usize,
         section_index_stream_offset: usize,
@@ -5132,6 +5152,7 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
 
         prepared.push(SparsePackPrepared {
             chunk_len: input.chunk_len,
+            huffman_encode_enabled: input.huffman_encode_enabled,
             section_count: input.section_count,
             table_data_stream_offset,
             section_index_stream_offset,
@@ -6144,7 +6165,10 @@ pub(crate) fn pack_chunk_payload_from_device_sparse_batch(
             let payload_len = payload_lens[idx];
             let mut payload = vec![0u8; payload_len];
             payload.copy_from_slice(&mapped[..payload_len]);
-            ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
+            finalize_sparse_packed_chunk_huffman(
+                &mut payload,
+                prepared[idx].huffman_encode_enabled,
+            )?;
             if gpu_sparse_payload_validate_enabled() {
                 let mut validate_out = vec![0u8; prepared[idx].chunk_len];
                 super::decompress_chunk_into(&payload, &mut validate_out).map_err(|err| {
@@ -6796,6 +6820,13 @@ fn parse_gpu_decode_payload_layout(
             "gpu decode unsupported chunk version",
         ));
     }
+    let flags = read_le_u16_at(payload, 6)?;
+    if (flags & !super::CHUNK_FLAG_HUFFMAN) != 0 {
+        return Err(PDeflateError::InvalidStream(
+            "gpu decode unsupported chunk flags",
+        ));
+    }
+    let huffman_enabled = (flags & super::CHUNK_FLAG_HUFFMAN) != 0;
     let table_count = usize::from(read_le_u16_at(payload, 12)?);
     if table_count > GPU_DECODE_MAX_TABLE_ID {
         return Err(PDeflateError::InvalidStream(
@@ -6833,7 +6864,7 @@ fn parse_gpu_decode_payload_layout(
             "gpu decode table index length mismatch",
         ));
     }
-    if huff_lut_offset == section_index_offset {
+    if huffman_enabled && huff_lut_offset == section_index_offset {
         return Err(PDeflateError::InvalidStream(
             "gpu decode huffman lut block is empty",
         ));
@@ -6845,6 +6876,7 @@ fn parse_gpu_decode_payload_layout(
         table_data_end: huff_lut_offset,
         huff_lut_start: huff_lut_offset,
         huff_lut_end: section_index_offset,
+        huffman_enabled,
         cmd_start: section_bitstream_offset,
     })
 }
@@ -7247,16 +7279,21 @@ fn build_gpu_decode_table_buffer_bytes(
         .ok_or(PDeflateError::InvalidStream(
             "gpu decode table data slice out of bounds",
         ))?;
-    let huff_lut = payload
-        .get(layout.huff_lut_start..layout.huff_lut_end)
-        .ok_or(PDeflateError::InvalidStream(
-            "gpu decode huffman lut slice out of bounds",
-        ))?;
-    if huff_lut.is_empty() {
-        return Err(PDeflateError::InvalidStream(
-            "gpu decode huffman lut is empty",
-        ));
-    }
+    let huff_lut = if layout.huffman_enabled {
+        let huff_lut = payload
+            .get(layout.huff_lut_start..layout.huff_lut_end)
+            .ok_or(PDeflateError::InvalidStream(
+                "gpu decode huffman lut slice out of bounds",
+            ))?;
+        if huff_lut.is_empty() {
+            return Err(PDeflateError::InvalidStream(
+                "gpu decode huffman lut is empty",
+            ));
+        }
+        huff_lut
+    } else {
+        &[][..]
+    };
     let mut table_offsets = Vec::with_capacity(layout.table_count.saturating_add(1));
     table_offsets.push(0usize);
     for &entry_len_u8 in table_index {
@@ -7341,12 +7378,14 @@ fn upload_gpu_decode_job_to_slot(
         .map_err(|_| PDeflateError::NumericOverflow)?,
     );
     section_meta_words.push(
-        u32::try_from(
+        u32::try_from(if prepared.layout.huffman_enabled {
             prepared
                 .layout
                 .huff_lut_end
-                .saturating_sub(prepared.layout.huff_lut_start),
-        )
+                .saturating_sub(prepared.layout.huff_lut_start)
+        } else {
+            0
+        })
         .map_err(|_| PDeflateError::NumericOverflow)?,
     );
     section_meta_words.push(0u32);
@@ -8061,12 +8100,14 @@ fn decode_chunks_gpu_v2_true_batch(
                     break;
                 }
             };
-            let huff_lut_len_u32 = match u32::try_from(
+            let huff_lut_len_u32 = match u32::try_from(if prepared.layout.huffman_enabled {
                 prepared
                     .layout
                     .huff_lut_end
-                    .saturating_sub(prepared.layout.huff_lut_start),
-            ) {
+                    .saturating_sub(prepared.layout.huff_lut_start)
+            } else {
+                0
+            }) {
                 Ok(v) => v,
                 Err(_) => {
                     round_failed = true;
@@ -13111,6 +13152,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
 
         let prep = SparsePackPrepared {
             chunk_len,
+            huffman_encode_enabled: input.huffman_encode_enabled,
             section_count,
             table_data_stream_offset,
             section_index_stream_offset,
@@ -14840,7 +14882,10 @@ fn collect_pending_gpu_sparse_pack_batch(
                 }
                 let mut payload = vec![0u8; payload_len];
                 payload.copy_from_slice(&mapped[..payload_len]);
-                ensure_sparse_packed_chunk_huff_lut(&mut payload)?;
+                finalize_sparse_packed_chunk_huffman(
+                    &mut payload,
+                    state.prep.huffman_encode_enabled,
+                )?;
                 if gpu_sparse_payload_validate_enabled() {
                     let mut validate_out = vec![0u8; state.chunk_len];
                     super::decompress_chunk_into(&payload, &mut validate_out).map_err(|err| {

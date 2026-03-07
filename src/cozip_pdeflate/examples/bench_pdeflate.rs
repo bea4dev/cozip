@@ -17,6 +17,7 @@ struct BenchConfig {
     gpu_slot_count: usize,
     gpu_batch_chunks: usize,
     gpu_submit_chunks: usize,
+    huffman: bool,
     mode: CompressionMode,
     profile_outer: bool,
 }
@@ -37,6 +38,7 @@ impl Default for BenchConfig {
             gpu_slot_count: 6,
             gpu_batch_chunks: 32,
             gpu_submit_chunks: 32,
+            huffman: false,
             mode: CompressionMode::Speed,
             profile_outer: env_flag("COZIP_PDEFLATE_PROFILE_OUTER")
                 || env_flag("COZIP_PDEFLATE_PROFILE"),
@@ -172,6 +174,8 @@ fn parse_args() -> Result<BenchConfig, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --gpu-submit-chunks: {e}"))?;
             }
+            "--huffman" => cfg.huffman = true,
+            "--no-huffman" => cfg.huffman = false,
             "--mode" => {
                 i += 1;
                 let v = args.get(i).ok_or("--mode requires value")?;
@@ -227,6 +231,7 @@ options:\n\
   --gpu-slot-count/--gpu-slots <N>\n\
   --gpu-batch-chunks <N>\n\
   --gpu-submit-chunks <N>\n\
+  --huffman / --no-huffman\n\
   --mode <speed|balanced|ratio>\n\
   --skip-decompress / --no-skip-decompress\n\
   --verify / --no-verify\n\
@@ -342,6 +347,7 @@ fn main() -> Result<(), String> {
     cpu_opts.gpu_slot_count = cfg.gpu_slot_count;
     cpu_opts.gpu_submit_chunks = cfg.gpu_batch_chunks;
     cpu_opts.gpu_pipelined_submit_chunks = cfg.gpu_submit_chunks;
+    cpu_opts.huffman_encode_enabled = cfg.huffman;
     cpu_opts.compression_mode = cfg.mode;
     cpu_opts.gpu_compress_enabled = false;
     cpu_opts.gpu_decompress_enabled = false;
@@ -356,7 +362,7 @@ fn main() -> Result<(), String> {
     let hybrid = CoZipDeflate::init(hybrid_opts).map_err(|e| e.to_string())?;
 
     println!(
-        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} dataset=bench gpu_compress={} gpu_only={} gpu_slot_count={} gpu_batch_chunks={} gpu_submit_chunks={} mode={:?} compare_hybrid={} verify_bytes={}",
+        "cozip_pdeflate benchmark\nsize_mib={} runs={} warmups={} chunk_mib={} sections={} dataset=bench gpu_compress={} gpu_only={} gpu_slot_count={} gpu_batch_chunks={} gpu_submit_chunks={} huffman={} mode={:?} compare_hybrid={} verify_bytes={}",
         cfg.size_mib,
         cfg.runs,
         cfg.warmups,
@@ -367,6 +373,7 @@ fn main() -> Result<(), String> {
         cfg.gpu_slot_count,
         cfg.gpu_batch_chunks,
         cfg.gpu_submit_chunks,
+        cfg.huffman,
         cfg.mode,
         cfg.compare_hybrid,
         cfg.verify_bytes

@@ -162,6 +162,13 @@ fn decode_huffman_symbol(
     huff_lut_off: u32,
     huff_lut_len: u32,
 ) -> DecodedSymbol {
+    if (huff_lut_len == 0u) {
+        if ((bit_cursor & 7u) != 0u || bit_cursor + 8u > bit_end) {
+            return DecodedSymbol(0u, 0u, bit_cursor, 10u);
+        }
+        let symbol = load_cmd_u8(cmd_base, bit_cursor >> 3u);
+        return DecodedSymbol(1u, symbol, bit_cursor + 8u, 0u);
+    }
     if (huff_lut_len < HUFF_LUT_HEADER_SIZE) {
         return DecodedSymbol(0u, 0u, bit_cursor, 10u);
     }

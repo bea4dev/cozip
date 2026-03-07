@@ -202,6 +202,7 @@ name = "cozip"
 version = "0.1.0"
 dependencies = [
  "cozip_deflate",
+ "cozip_pdeflate",
  "crc32fast",
  "thiserror 2.0.17",
  "tokio",
