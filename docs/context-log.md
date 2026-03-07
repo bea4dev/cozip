@@ -1914,7 +1914,7 @@ mode別GPU品質パラメータ:
 
 実装:
 - `GpuMatchInput` に `compression_mode` を追加し、legacy 側の GPU圧縮経路へ伝搬。
-- `legacy_pdeflate_cpu::gpu` に sparse payload size class を追加。
+- `pdeflate::gpu` に sparse payload size class を追加。
   - `Tiny <= 256KiB`
   - `Small <= 1MiB`
   - `Medium <= 2MiB`

@@ -2,12 +2,12 @@
 
 Updated: 2026-03-07
 
-この文書は、`legacy_pdeflate_cpu::gpu::compute_matches_encode_and_pack_sparse_batch` の
+この文書は、`pdeflate::gpu::compute_matches_encode_and_pack_sparse_batch` の
 `sparse_lens_wait` を支配的ボトルネックから外すための大規模設計変更をまとめる。
 
 対象:
-- `src/cozip_pdeflate/src/legacy_pdeflate_cpu/gpu.rs`
-- `src/cozip_pdeflate/src/legacy_pdeflate_cpu/mod.rs`
+- `src/cozip_pdeflate/src/pdeflate/gpu.rs`
+- `src/cozip_pdeflate/src/pdeflate/mod.rs`
 - `src/cozip_pdeflate/src/lib.rs`
 
 前提:

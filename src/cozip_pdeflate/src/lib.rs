@@ -3,9 +3,9 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-mod legacy_pdeflate_cpu;
+mod pdeflate;
 
-pub use legacy_pdeflate_cpu::{
+pub use pdeflate::{
     pdeflate_compress, pdeflate_compress_with_stats, pdeflate_decompress,
     pdeflate_decompress_into, pdeflate_decompress_into_with_stats,
     pdeflate_decompress_into_with_stats_with_options, pdeflate_decompress_with_stats,
@@ -127,7 +127,7 @@ impl CoZipDeflate {
         stream: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
-        legacy_pdeflate_cpu::pdeflate_decompress_into_with_stats_with_options(
+        pdeflate::pdeflate_decompress_into_with_stats_with_options(
             stream,
             output,
             &self.options,
@@ -182,7 +182,7 @@ fn pdeflate_decompress_stream_with_options<R: Read, W: Write>(
     let mut stream = Vec::new();
     reader.read_to_end(&mut stream)?;
     let mut restored = Vec::new();
-    let stats = legacy_pdeflate_cpu::pdeflate_decompress_into_with_stats_with_options(
+    let stats = pdeflate::pdeflate_decompress_into_with_stats_with_options(
         &stream,
         &mut restored,
         options,
@@ -230,7 +230,7 @@ fn validate_options(options: &HybridOptions) -> Result<(), CozipDeflateError> {
     Ok(())
 }
 
-fn map_pdeflate_error(err: legacy_pdeflate_cpu::PDeflateError) -> CozipDeflateError {
+fn map_pdeflate_error(err: pdeflate::PDeflateError) -> CozipDeflateError {
     CozipDeflateError::PDeflate(err.to_string())
 }
 

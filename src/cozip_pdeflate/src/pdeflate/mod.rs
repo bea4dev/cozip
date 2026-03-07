@@ -11,6 +11,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod gpu;
+mod shaders;
 
 const STREAM_MAGIC: [u8; 4] = *b"PDS0";
 const CHUNK_MAGIC: [u8; 4] = *b"PDF0";
