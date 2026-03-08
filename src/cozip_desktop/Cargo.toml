@@ -1,0 +1,10 @@
+[package]
+name = "cozip_desktop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cozip = { path = "../cozip" }
+gpui = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
