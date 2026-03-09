@@ -9,8 +9,10 @@ use cozip_deflate::{
     CoZipDeflate, CompressionMode, CozipDeflateError, DeflateChunkIndex, HybridOptions,
     deflate_decompress_on_cpu, deflate_decompress_stream_on_cpu,
 };
-use cozip_pdeflate::{CoZipPDeflate, CoZipPDeflateError, PDeflateOptions};
+use cozip_pdeflate::{CoZipPDeflate, CoZipPDeflateError};
 use thiserror::Error;
+
+pub use cozip_pdeflate::PDeflateOptions;
 
 const LOCAL_FILE_HEADER_SIG: u32 = 0x0403_4b50;
 const CENTRAL_DIR_HEADER_SIG: u32 = 0x0201_4b50;
@@ -314,6 +316,24 @@ fn parse_czdi_extra_field(extra: &[u8]) -> Result<Option<CzdiParsedExtra>, CoZip
 pub enum CoZipOptions {
     Zip { options: ZipOptions },
     PDeflate { options: PDeflateOptions },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoZipArchiveFormat {
+    Zip,
+    PDeflate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoZipArchiveKind {
+    SingleFile { suggested_name: String },
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoZipArchiveInfo {
+    pub format: CoZipArchiveFormat,
+    pub kind: CoZipArchiveKind,
 }
 
 impl Default for CoZipOptions {
@@ -1918,6 +1938,51 @@ pub async fn decompress_directory_from_name_async<PIn: AsRef<Path>, POut: AsRef<
     cozip
         .decompress_directory_from_name_async(input_path, output_dir)
         .await
+}
+
+pub fn inspect_archive_from_name<P: AsRef<Path>>(
+    input_path: P,
+) -> Result<CoZipArchiveInfo, CoZipError> {
+    let input_path = input_path.as_ref();
+    let mut input = StdFile::open(input_path)?;
+    let mut magic = [0_u8; 4];
+    let read_len = input.read(&mut magic)?;
+    input.seek(SeekFrom::Start(0))?;
+
+    if read_len >= 2 && magic[..2] == *b"PK" {
+        let kind = match inspect_zip_archive_kind(&input)? {
+            ZipArchiveKind::SingleFile { entry_name } => {
+                CoZipArchiveKind::SingleFile {
+                    suggested_name: entry_name,
+                }
+            }
+            ZipArchiveKind::Directory => CoZipArchiveKind::Directory,
+        };
+        return Ok(CoZipArchiveInfo {
+            format: CoZipArchiveFormat::Zip,
+            kind,
+        });
+    }
+
+    if read_len == 4 && (magic == *b"PDS0" || magic == PDEFLATE_DIR_FILE_MAGIC) {
+        let kind = if inspect_pdeflate_directory_header(&input)?.is_some() {
+            CoZipArchiveKind::Directory
+        } else {
+            let suggested_name = input_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .unwrap_or(DEFAULT_ENTRY_NAME)
+                .to_string();
+            CoZipArchiveKind::SingleFile { suggested_name }
+        };
+        return Ok(CoZipArchiveInfo {
+            format: CoZipArchiveFormat::PDeflate,
+            kind,
+        });
+    }
+
+    Err(CoZipError::InvalidZip("unsupported archive signature"))
 }
 
 #[derive(Debug, Clone)]

@@ -2,6 +2,11 @@
 
 mod i18n;
 
+#[cfg(target_os = "windows")]
+use std::ffi::OsStr;
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
+use std::process::Command;
 use std::time::Duration;
 
 use gpui::{
@@ -12,7 +17,19 @@ use gpui::{
 
 use crate::i18n::I18n;
 
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+
 const INSTALL_DIR: &str = r"C:\Program Files\CoZip";
+const COZIP_EXE_PATH: &str = r"C:\Program Files\CoZip\cozip.exe";
+const COMP_ICON_PATH: &str = r"C:\Program Files\CoZip\icons\comp.ico";
+const DECOMP_ICON_PATH: &str = r"C:\Program Files\CoZip\icons\decomp.ico";
 const LICENSE_TEXT: &str = include_str!("../../../LICENSE");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +47,7 @@ struct InstallerApp {
     add_explorer_menu: bool,
     install_running: bool,
     install_progress: u8,
+    install_note: Option<String>,
 }
 
 impl InstallerApp {
@@ -41,6 +59,7 @@ impl InstallerApp {
             add_explorer_menu: true,
             install_running: false,
             install_progress: 0,
+            install_note: None,
         }
     }
 
@@ -103,20 +122,37 @@ impl InstallerApp {
         self.step = InstallerStep::Installing;
         self.install_running = true;
         self.install_progress = 0;
+        self.install_note = None;
 
         let entity = cx.entity().clone();
         window
             .spawn(cx, async move |cx| {
-                for percent in 0..=100_u8 {
+                for percent in 0..=96_u8 {
                     Timer::after(Duration::from_millis(28)).await;
                     let _ = entity.update(cx, |this, _| {
                         this.install_progress = percent;
-                        if percent == 100 {
-                            this.install_running = false;
-                            this.step = InstallerStep::Complete;
-                        }
                     });
                 }
+
+                let registration_result = entity
+                    .update(cx, |this, _| {
+                        if this.add_explorer_menu {
+                            install_explorer_menu_entries().err()
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+
+                let _ = entity.update(cx, |this, _| {
+                    this.install_progress = 100;
+                    this.install_running = false;
+                    this.step = InstallerStep::Complete;
+                    this.install_note = registration_result.map(|error| {
+                        format!("{} {error}", this.t("complete.menu_registration_failed"))
+                    });
+                });
             })
             .detach();
     }
@@ -306,6 +342,9 @@ impl InstallerApp {
                 },
             ))
             .child(value_row("Status".into(), self.t("complete.state")))
+            .when_some(self.install_note.as_ref(), |this, note| {
+                this.child(value_row(self.t("complete.note"), note.clone().into()))
+            })
     }
 
     fn checkbox(
@@ -533,7 +572,229 @@ fn simple_progress_bar(progress: u8) -> impl IntoElement {
         )
 }
 
+#[cfg(target_os = "windows")]
+fn install_explorer_menu_entries() -> Result<(), String> {
+    let compress_root = r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipCompress";
+    let extract_root = r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipExtract";
+
+    reg_add_value(compress_root, Some("MUIVerb"), "圧縮")?;
+    reg_add_value(compress_root, Some("Icon"), COMP_ICON_PATH)?;
+    reg_add_value(compress_root, Some("MultiSelectModel"), "Player")?;
+
+    reg_add_value(
+        &format!(r"{compress_root}\shell\zip_gpu"),
+        Some("MUIVerb"),
+        "zip (CPU + GPU)",
+    )?;
+    reg_add_value(
+        &format!(r"{compress_root}\shell\zip_gpu\command"),
+        None,
+        &format!(r#""{COZIP_EXE_PATH}" compress --format zip --hybrid %*"#),
+    )?;
+
+    reg_add_value(
+        &format!(r"{compress_root}\shell\cozip_gpu"),
+        Some("MUIVerb"),
+        "cozip (試験的) (CPU + GPU)",
+    )?;
+    reg_add_value(
+        &format!(r"{compress_root}\shell\cozip_gpu\command"),
+        None,
+        &format!(r#""{COZIP_EXE_PATH}" compress --format cozip --hybrid %*"#),
+    )?;
+
+    reg_add_value(
+        &format!(r"{compress_root}\shell\details"),
+        Some("MUIVerb"),
+        "詳細設定",
+    )?;
+    reg_add_value(
+        &format!(r"{compress_root}\shell\details\command"),
+        None,
+        &format!(r#""{COZIP_EXE_PATH}" ui compress-details %*"#),
+    )?;
+
+    reg_add_value(extract_root, Some("MUIVerb"), "解凍")?;
+    reg_add_value(extract_root, Some("Icon"), DECOMP_ICON_PATH)?;
+    reg_add_value(extract_root, Some("MultiSelectModel"), "Player")?;
+
+    reg_add_value(
+        &format!(r"{extract_root}\shell\extract_here"),
+        Some("MUIVerb"),
+        "ここに解凍",
+    )?;
+    reg_add_value(
+        &format!(r"{extract_root}\shell\extract_here\command"),
+        None,
+        &format!(r#""{COZIP_EXE_PATH}" extract --here %*"#),
+    )?;
+
+    reg_add_value(
+        &format!(r"{extract_root}\shell\details"),
+        Some("MUIVerb"),
+        "詳細設定",
+    )?;
+    reg_add_value(
+        &format!(r"{extract_root}\shell\details\command"),
+        None,
+        &format!(r#""{COZIP_EXE_PATH}" ui extract-details %*"#),
+    )?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_explorer_menu_entries() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn reg_add_value(key: &str, value_name: Option<&str>, data: &str) -> Result<(), String> {
+    let mut command = Command::new("reg");
+    command.args(["add", key, "/t", "REG_SZ", "/d", data, "/f"]);
+    match value_name {
+        Some(name) => {
+            command.args(["/v", name]);
+        }
+        None => {
+            command.arg("/ve");
+        }
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("reg add failed for {key}: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        Err(format!("registry write failed for {key}: {detail}"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_elevated() -> Result<(), String> {
+    if is_process_elevated()? {
+        return Ok(());
+    }
+
+    let exe_path = std::env::current_exe().map_err(|error| format!("current_exe failed: {error}"))?;
+    let current_dir = std::env::current_dir().map_err(|error| format!("current_dir failed: {error}"))?;
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|arg| quote_windows_arg(&arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let exe_wide = to_wide(exe_path.as_os_str());
+    let verb_wide = to_wide(OsStr::new("runas"));
+    let dir_wide = to_wide(current_dir.as_os_str());
+    let args_wide = if args.is_empty() {
+        Vec::new()
+    } else {
+        to_wide(OsStr::new(&args))
+    };
+
+    let result = unsafe {
+        ShellExecuteW(
+            0 as HWND,
+            verb_wide.as_ptr(),
+            exe_wide.as_ptr(),
+            if args_wide.is_empty() {
+                std::ptr::null()
+            } else {
+                args_wide.as_ptr()
+            },
+            dir_wide.as_ptr(),
+            1,
+        )
+    } as isize;
+
+    if result <= 32 {
+        return Err(format!("ShellExecuteW failed with code {result}"));
+    }
+
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "windows")]
+fn is_process_elevated() -> Result<bool, String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err("OpenProcessToken failed".to_string());
+    }
+
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned_len = 0_u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned_len,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+
+    if ok == 0 {
+        return Err("GetTokenInformation(TokenElevation) failed".to_string());
+    }
+
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn to_wide(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn quote_windows_arg(arg: &OsStr) -> String {
+    let value = arg.to_string_lossy();
+    if !value.contains([' ', '\t', '"']) {
+        return value.into_owned();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat((backslashes * 2) + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    if let Err(error) = ensure_elevated() {
+        eprintln!("failed to elevate installer: {error}");
+        std::process::exit(1);
+    }
+
     let i18n = I18n::load();
     let title = SharedString::from(i18n.text("window.title").to_string());
 

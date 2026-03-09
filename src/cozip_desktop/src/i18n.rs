@@ -61,6 +61,11 @@ fn flatten_toml_value(prefix: &str, value: &toml::Value, flat: &mut HashMap<Stri
 }
 
 fn current_locale() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    if let Some(locale) = current_windows_locale() {
+        return Some(locale);
+    }
+
     let raw = env::var("LC_ALL")
         .ok()
         .filter(|value| !value.is_empty())
@@ -69,6 +74,23 @@ fn current_locale() -> Option<String> {
     let normalized = raw.split('.').next().unwrap_or_default().replace('-', "_");
     match normalized.as_str() {
         "ja_JP" | "en_US" => Some(normalized),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_locale() -> Option<String> {
+    use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
+
+    let mut buffer = [0_u16; 85];
+    let len = unsafe { GetUserDefaultLocaleName(buffer.as_mut_ptr(), buffer.len() as i32) };
+    if len <= 1 {
+        return None;
+    }
+
+    let locale = String::from_utf16_lossy(&buffer[..(len as usize - 1)]).replace('-', "_");
+    match locale.as_str() {
+        "ja_JP" | "en_US" => Some(locale),
         _ => None,
     }
 }

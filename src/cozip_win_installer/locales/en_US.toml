@@ -33,9 +33,11 @@ status_completed = "Installation completed."
 [complete]
 title = "Completed"
 description = "CoZip has been installed."
-menu_enabled = "Explorer context menu will be added."
-menu_disabled = "Explorer context menu will not be added."
+menu_enabled = "Explorer context menu has been added."
+menu_disabled = "Explorer context menu was not added."
 state = "Wizard flow completed."
+note = "Note"
+menu_registration_failed = "Explorer menu registration failed."
 
 [footer]
 license = "Accept the license to continue."

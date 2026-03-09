@@ -1241,9 +1241,11 @@ name = "cozip_desktop"
 version = "0.1.0"
 dependencies = [
  "cozip",
+ "embed-resource",
  "gpui",
  "serde",
  "toml 0.8.23",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

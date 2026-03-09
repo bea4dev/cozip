@@ -2,9 +2,16 @@
 name = "cozip_desktop"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [dependencies]
 cozip = { path = "../cozip" }
 gpui = "0.2.2"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Globalization"] }
+
+[build-dependencies]
+embed-resource = "3.0.6"

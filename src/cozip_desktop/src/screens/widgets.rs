@@ -1,5 +1,5 @@
 use gpui::{
-    div, px, rgb, FontWeight, IntoElement, ParentElement, SharedString, Styled,
+    div, px, relative, rgb, FontWeight, IntoElement, ParentElement, SharedString, Styled,
 };
 
 pub fn panel(title: impl Into<SharedString>, body: impl IntoElement) -> impl IntoElement {
@@ -67,7 +67,6 @@ pub fn labeled_value(
 }
 
 pub fn progress_bar(progress: f32, accent: gpui::Rgba) -> impl IntoElement {
-    let width = progress.clamp(0.0, 1.0) * 480.0;
     div()
         .w_full()
         .h(px(12.0))
@@ -76,7 +75,7 @@ pub fn progress_bar(progress: f32, accent: gpui::Rgba) -> impl IntoElement {
         .child(
             div()
                 .h_full()
-                .w(px(width))
+                .w(relative(progress.clamp(0.0, 1.0)))
                 .rounded_full()
                 .bg(accent),
         )

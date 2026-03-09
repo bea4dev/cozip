@@ -1,12 +1,20 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, Context, FontWeight, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window,
+    AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Timer, Window, div, px, rgb,
 };
 
 use crate::i18n::I18n;
+use crate::jobs::{JobSnapshot, JobStatus, SharedJobSnapshot, spawn_job};
+use crate::launch::{
+    ArchiveFormat, CompressMode, CompressPlan, DesktopCommand, ExtractPlan, InitialScreen,
+    LaunchRequest,
+};
 use crate::screens::{
-    compress::CompressScreen, compress_settings::CompressSettingsScreen,
-    decompress::DecompressScreen, decompress_settings::DecompressSettingsScreen,
+    compress_settings::CompressSettingsScreen, decompress_settings::DecompressSettingsScreen,
+    widgets::{action_button, labeled_value, panel, progress_bar, separator},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,21 +27,36 @@ pub enum ScreenKind {
 
 pub struct CozipDesktopApp {
     i18n: I18n,
+    launch: LaunchRequest,
     active_screen: ScreenKind,
-    compress: CompressScreen,
-    decompress: DecompressScreen,
+    job: Option<SharedJobSnapshot>,
+    job_snapshot: JobSnapshot,
+    displayed_progress: f32,
+    displayed_throughput: f64,
+    poll_started: bool,
+    auto_start_consumed: bool,
     compress_settings: CompressSettingsScreen,
     decompress_settings: DecompressSettingsScreen,
 }
 
 impl CozipDesktopApp {
-    pub fn new() -> Self {
+    pub fn new(launch: LaunchRequest) -> Self {
         let i18n = I18n::load();
         Self {
             i18n,
-            active_screen: ScreenKind::Compress,
-            compress: CompressScreen::mock(),
-            decompress: DecompressScreen::mock(),
+            active_screen: match launch.initial_screen {
+                InitialScreen::Compress => ScreenKind::Compress,
+                InitialScreen::Decompress => ScreenKind::Decompress,
+                InitialScreen::CompressSettings => ScreenKind::CompressSettings,
+                InitialScreen::DecompressSettings => ScreenKind::DecompressSettings,
+            },
+            launch,
+            job: None,
+            job_snapshot: JobSnapshot::default(),
+            displayed_progress: 0.0,
+            displayed_throughput: 0.0,
+            poll_started: false,
+            auto_start_consumed: false,
             compress_settings: CompressSettingsScreen::mock(),
             decompress_settings: DecompressSettingsScreen::mock(),
         }
@@ -41,6 +64,92 @@ impl CozipDesktopApp {
 
     fn t(&self, key: &str) -> SharedString {
         self.i18n.text(key).to_owned().into()
+    }
+
+    fn start_polling_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.poll_started {
+            return;
+        }
+
+        self.poll_started = true;
+        let entity = cx.entity().clone();
+        window.spawn(cx, async move |cx| loop {
+            Timer::after(Duration::from_millis(33)).await;
+            if entity
+                .update(cx, |this, cx| {
+                    this.refresh_job_snapshot();
+                    this.step_displayed_progress();
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn maybe_start_from_launch(&mut self) {
+        if self.auto_start_consumed || !self.launch.auto_start {
+            return;
+        }
+        self.auto_start_consumed = true;
+        self.start_command();
+    }
+
+    fn refresh_job_snapshot(&mut self) {
+        let Some(shared) = &self.job else {
+            return;
+        };
+        self.job_snapshot = shared.lock().expect("job snapshot poisoned").clone();
+        self.update_displayed_throughput();
+    }
+
+    fn update_displayed_throughput(&mut self) {
+        let current = self
+            .job_snapshot
+            .progress
+            .as_ref()
+            .map(|progress| progress.snapshot().throughput_bytes_per_sec)
+            .unwrap_or(0.0);
+        let progress_complete = self.target_progress_fraction() >= 0.999;
+
+        if matches!(self.job_snapshot.status, JobStatus::Running) && !progress_complete {
+            self.displayed_throughput = current;
+        } else if self.displayed_throughput <= 0.0 {
+            self.displayed_throughput = current;
+        }
+    }
+
+    fn step_displayed_progress(&mut self) {
+        let target = self.target_progress_fraction();
+        if target >= 0.999 || matches!(self.job_snapshot.status, JobStatus::Succeeded) {
+            self.displayed_progress = 1.0;
+            return;
+        }
+
+        if target <= self.displayed_progress {
+            self.displayed_progress = target;
+            return;
+        }
+
+        let delta = target - self.displayed_progress;
+        let next = self.displayed_progress + delta * 0.22 + 0.002;
+        self.displayed_progress = next.min(target);
+    }
+
+    fn start_command(&mut self) {
+        if matches!(self.job_snapshot.status, JobStatus::Running) {
+            return;
+        }
+        let Some(command) = self.launch.command.clone() else {
+            return;
+        };
+        self.displayed_progress = 0.0;
+        self.displayed_throughput = 0.0;
+        self.job = Some(spawn_job(command));
+        self.refresh_job_snapshot();
+        self.step_displayed_progress();
     }
 
     fn nav_item(
@@ -57,22 +166,10 @@ impl CozipDesktopApp {
             .py_2()
             .rounded_md()
             .cursor_pointer()
-            .bg(if active {
-                rgb(0xdbeafe)
-            } else {
-                rgb(0xf8fafc)
-            })
+            .bg(if active { rgb(0xdbeafe) } else { rgb(0xf8fafc) })
             .border_1()
-            .border_color(if active {
-                rgb(0x93c5fd)
-            } else {
-                rgb(0xe2e8f0)
-            })
-            .text_color(if active {
-                rgb(0x0f172a)
-            } else {
-                rgb(0x475569)
-            })
+            .border_color(if active { rgb(0x93c5fd) } else { rgb(0xe2e8f0) })
+            .text_color(if active { rgb(0x0f172a) } else { rgb(0x475569) })
             .text_sm()
             .font_weight(FontWeight::MEDIUM)
             .on_click(cx.listener(move |this, _, _, _| {
@@ -82,6 +179,19 @@ impl CozipDesktopApp {
     }
 
     fn shell(&self, content: AnyElement, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.launch.command.is_some() {
+            return div()
+                .size_full()
+                .bg(rgb(0xf3f4f6))
+                .text_color(rgb(0x0f172a))
+                .child(
+                    div()
+                        .size_full()
+                        .p_6()
+                        .child(div().max_w(px(720.0)).mx_auto().child(content)),
+                );
+        }
+
         let active = self.active_screen;
         div()
             .size_full()
@@ -148,32 +258,567 @@ impl CozipDesktopApp {
                             .flex_grow()
                             .p_6()
                             .overflow_y_scroll()
-                            .child(
-                                div()
-                                    .max_w(px(980.0))
-                                    .mx_auto()
-                                    .child(content),
-                            ),
+                            .child(div().max_w(px(980.0)).mx_auto().child(content)),
                     ),
             )
+    }
+
+    fn command(&self) -> Option<&DesktopCommand> {
+        self.launch.command.as_ref()
+    }
+
+    fn compress_plan(&self) -> Option<&CompressPlan> {
+        match self.command() {
+            Some(DesktopCommand::Compress(plan)) => Some(plan),
+            _ => None,
+        }
+    }
+
+    fn extract_plan(&self) -> Option<&ExtractPlan> {
+        match self.command() {
+            Some(DesktopCommand::Extract(plan)) => Some(plan),
+            _ => None,
+        }
+    }
+
+    fn banner_panel(&self, text: SharedString, error: bool) -> impl IntoElement {
+        panel(
+            if error {
+                self.t("status.error")
+            } else {
+                self.t("status.notice")
+            },
+            div()
+                .text_sm()
+                .text_color(if error { rgb(0x991b1b) } else { rgb(0x475569) })
+                .child(text),
+        )
+    }
+
+    fn render_compress_screen(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.launch.command.is_some() {
+            let mut content = div().gap_4().flex().flex_col();
+            if let Some(error) = &self.launch.startup_error {
+                content = content.child(self.banner_panel(error.clone().into(), true));
+            }
+            if self.compress_plan().is_some() {
+                content = content.child(self.operation_panel(window, cx, true));
+            } else {
+                content = content.child(self.empty_state_panel("compress.empty"));
+            }
+            return content;
+        }
+
+        let mut content = div().gap_4().flex().flex_col();
+
+        if let Some(error) = &self.launch.startup_error {
+            content = content.child(self.banner_panel(error.clone().into(), true));
+        }
+
+        if let Some(plan) = self.compress_plan() {
+            content = content.child(self.compress_summary_panel(plan));
+            content = content.child(self.operation_panel(window, cx, true));
+        } else {
+            content = content.child(self.empty_state_panel("compress.empty"));
+        }
+
+        content
+    }
+
+    fn render_decompress_screen(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if self.launch.command.is_some() {
+            let mut content = div().gap_4().flex().flex_col();
+            if let Some(error) = &self.launch.startup_error {
+                content = content.child(self.banner_panel(error.clone().into(), true));
+            }
+            if self.extract_plan().is_some() {
+                content = content.child(self.operation_panel(window, cx, false));
+            } else {
+                content = content.child(self.empty_state_panel("decompress.empty"));
+            }
+            return content;
+        }
+
+        let mut content = div().gap_4().flex().flex_col();
+
+        if let Some(error) = &self.launch.startup_error {
+            content = content.child(self.banner_panel(error.clone().into(), true));
+        }
+
+        if let Some(plan) = self.extract_plan() {
+            if !plan.ignored_inputs.is_empty() {
+                let ignored = plan
+                    .ignored_inputs
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                content = content.child(self.banner_panel(ignored.into(), false));
+            }
+            content = content.child(self.extract_summary_panel(plan));
+            content = content.child(self.operation_panel(window, cx, false));
+        } else {
+            content = content.child(self.empty_state_panel("decompress.empty"));
+        }
+
+        content
+    }
+
+    fn render_compress_settings_screen(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if self.launch.command.is_some() {
+            let mut content = div().gap_4().flex().flex_col();
+            if let Some(error) = &self.launch.startup_error {
+                content = content.child(self.banner_panel(error.clone().into(), true));
+            }
+            if self.compress_plan().is_some() {
+                content = content.child(self.compress_settings.render(&self.i18n));
+                content = content.child(self.settings_action_row(true, cx));
+            } else {
+                content = content.child(self.empty_state_panel("compress.empty"));
+            }
+            return content;
+        }
+
+        let mut content = div().gap_4().flex().flex_col();
+
+        if let Some(error) = &self.launch.startup_error {
+            content = content.child(self.banner_panel(error.clone().into(), true));
+        }
+
+        if let Some(plan) = self.compress_plan() {
+            content = content.child(self.compress_summary_panel(plan));
+            content = content.child(self.compress_settings.render(&self.i18n));
+            content = content.child(self.settings_action_row(true, cx));
+        } else {
+            content = content.child(self.empty_state_panel("compress.empty"));
+        }
+
+        content
+    }
+
+    fn render_decompress_settings_screen(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if self.launch.command.is_some() {
+            let mut content = div().gap_4().flex().flex_col();
+            if let Some(error) = &self.launch.startup_error {
+                content = content.child(self.banner_panel(error.clone().into(), true));
+            }
+            if self.extract_plan().is_some() {
+                content = content.child(self.decompress_settings.render(&self.i18n));
+                content = content.child(self.settings_action_row(false, cx));
+            } else {
+                content = content.child(self.empty_state_panel("decompress.empty"));
+            }
+            return content;
+        }
+
+        let mut content = div().gap_4().flex().flex_col();
+
+        if let Some(error) = &self.launch.startup_error {
+            content = content.child(self.banner_panel(error.clone().into(), true));
+        }
+
+        if let Some(plan) = self.extract_plan() {
+            content = content.child(self.extract_summary_panel(plan));
+            content = content.child(self.decompress_settings.render(&self.i18n));
+            content = content.child(self.settings_action_row(false, cx));
+        } else {
+            content = content.child(self.empty_state_panel("decompress.empty"));
+        }
+
+        content
+    }
+
+    fn compress_summary_panel(&self, plan: &CompressPlan) -> impl IntoElement {
+        let mode_text = match plan.mode {
+            CompressMode::SingleFile => self.t("summary.single_file"),
+            CompressMode::SingleDirectory => self.t("summary.directory"),
+            CompressMode::MultiSelection => self.t("summary.multi_selection"),
+        };
+        let format_text: SharedString = match plan.format {
+            ArchiveFormat::Zip => "zip".into(),
+            ArchiveFormat::Cozip => "cozip".into(),
+        };
+        panel(
+            self.t("summary.compress"),
+            div()
+                .gap_3()
+                .flex()
+                .flex_col()
+                .child(labeled_value(self.t("summary.mode"), mode_text))
+                .child(labeled_value(self.t("summary.format"), format_text))
+                .child(labeled_value(
+                    self.t("summary.input_count"),
+                    plan.sources.len().to_string(),
+                ))
+                .child(labeled_value(
+                    self.t("summary.output"),
+                    plan.output_path.display().to_string(),
+                ))
+                .child(separator())
+                .child(self.path_list(plan.sources.iter().map(PathBuf::as_path))),
+        )
+    }
+
+    fn extract_summary_panel(&self, plan: &ExtractPlan) -> impl IntoElement {
+        let first_output = plan
+            .tasks
+            .first()
+            .map(|task| task.output_path.display().to_string())
+            .unwrap_or_default();
+        panel(
+            self.t("summary.extract"),
+            div()
+                .gap_3()
+                .flex()
+                .flex_col()
+                .child(labeled_value(
+                    self.t("summary.archive_count"),
+                    plan.tasks.len().to_string(),
+                ))
+                .child(labeled_value(self.t("summary.first_output"), first_output))
+                .child(labeled_value(
+                    self.t("summary.ignored"),
+                    plan.ignored_inputs.len().to_string(),
+                ))
+                .child(separator())
+                .child(self.path_list(plan.tasks.iter().map(|task| task.archive_path.as_path()))),
+        )
+    }
+
+    fn path_list<'a>(
+        &self,
+        paths: impl Iterator<Item = &'a Path>,
+    ) -> impl IntoElement {
+        let mut column = div().gap_2().flex().flex_col();
+        for path in paths.take(5) {
+            column = column.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(path.display().to_string()),
+            );
+        }
+        column
+    }
+
+    fn operation_panel(&self, _window: &mut Window, cx: &mut Context<Self>, compress: bool) -> impl IntoElement {
+        let snapshot = &self.job_snapshot;
+        let progress = self.progress_fraction();
+        let status_text = self.status_line(compress);
+        let current = self.current_item_line();
+        let throughput = self.throughput_line();
+        let runtime = self.runtime_line();
+        let mut body = div()
+            .gap_3()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x111827))
+                    .child(status_text),
+            )
+            .child(progress_bar(progress, if compress { rgb(0x4ea1ff) } else { rgb(0xf0a84b) }))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(current),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(throughput),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(runtime),
+            );
+
+        if let Some(note) = &snapshot.note {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(note.clone()),
+            );
+        }
+
+        if let Some(error) = &snapshot.error {
+            body = body.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x991b1b))
+                    .child(error.clone()),
+            );
+        }
+
+        if !matches!(snapshot.status, JobStatus::Running) {
+            body = body.child(separator()).child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.window_button("close-job", "common.close", true, move |_, window, _| {
+                        window.remove_window();
+                    }, cx)),
+            );
+        }
+
+        if self.launch.command.is_some() {
+            body.into_any_element()
+        } else {
+            panel(
+                if compress {
+                    self.t("compress.title")
+                } else {
+                    self.t("decompress.title")
+                },
+                body,
+            )
+            .into_any_element()
+        }
+    }
+
+    fn settings_action_row(&self, compress: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = div()
+            .gap_3()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x475569))
+                    .child(if compress {
+                        self.t("summary.ready_compress")
+                    } else {
+                        self.t("summary.ready_extract")
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(self.window_button(
+                        if compress { "start-compress" } else { "start-extract" },
+                        if compress {
+                            "summary.start_compress"
+                        } else {
+                            "summary.start_extract"
+                        },
+                        true,
+                        move |this, _, _| {
+                            this.active_screen = if compress {
+                                ScreenKind::Compress
+                            } else {
+                                ScreenKind::Decompress
+                            };
+                            this.start_command();
+                        },
+                        cx,
+                    )),
+            );
+
+        if self.launch.command.is_some() {
+            body.into_any_element()
+        } else {
+            panel(
+            self.t("summary.ready"),
+            body,
+        )
+            .into_any_element()
+        }
+    }
+
+    fn window_button(
+        &self,
+        id: &'static str,
+        label_key: &'static str,
+        primary: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on_click(this, window, cx);
+            }))
+            .child(action_button(self.t(label_key), primary))
+    }
+
+    fn empty_state_panel(&self, key: &'static str) -> impl IntoElement {
+        panel(
+            self.t("summary.no_selection"),
+            div()
+                .text_sm()
+                .text_color(rgb(0x475569))
+                .child(self.t(key)),
+        )
+    }
+
+    fn progress_fraction(&self) -> f32 {
+        self.displayed_progress
+    }
+
+    fn target_progress_fraction(&self) -> f32 {
+        let snapshot = &self.job_snapshot;
+        let progress_snapshot = self.progress_snapshot();
+        if snapshot.total_tasks == 0 {
+            return 0.0;
+        }
+
+        let current_fraction = progress_snapshot
+            .as_ref()
+            .and_then(|progress| {
+                progress.total_bytes.and_then(|total| {
+                    if total == 0 {
+                        None
+                    } else {
+                        Some((progress.processed_bytes as f32 / total as f32).clamp(0.0, 1.0))
+                    }
+                })
+            })
+            .unwrap_or(0.0);
+
+        if snapshot.total_tasks == 1 {
+            return current_fraction.max(match snapshot.status {
+                JobStatus::Succeeded => 1.0,
+                JobStatus::Failed => current_fraction,
+                JobStatus::Idle => 0.0,
+                JobStatus::Running => current_fraction,
+            });
+        }
+
+        ((snapshot.completed_tasks as f32 + current_fraction) / snapshot.total_tasks as f32)
+            .clamp(0.0, 1.0)
+    }
+
+    fn status_line(&self, compress: bool) -> String {
+        let snapshot = &self.job_snapshot;
+        let total = snapshot.total_tasks;
+        let done = snapshot.completed_tasks;
+        let progress_pct = (self.progress_fraction() * 100.0).round() as i32;
+
+        let action = match snapshot.status {
+            JobStatus::Idle => {
+                if compress {
+                    self.i18n.text("summary.waiting_compress")
+                } else {
+                    self.i18n.text("summary.waiting_extract")
+                }
+            }
+            JobStatus::Running => {
+                if compress {
+                    self.i18n.text("compress.inline_status")
+                } else {
+                    self.i18n.text("decompress.inline_status")
+                }
+            }
+            JobStatus::Succeeded => self.i18n.text("summary.completed"),
+            JobStatus::Failed => self.i18n.text("summary.failed"),
+        };
+
+        if total > 0 {
+            format!("{action} {progress_pct}% ({done} / {total})")
+        } else {
+            action.to_string()
+        }
+    }
+
+    fn current_item_line(&self) -> String {
+        let snapshot = &self.job_snapshot;
+        if let Some(progress) = self.progress_snapshot() {
+            if let Some(current) = &progress.current_entry {
+                return current.clone();
+            }
+        }
+        snapshot
+            .current_task_label
+            .clone()
+            .unwrap_or_else(|| self.i18n.text("summary.no_active_item").to_string())
+    }
+
+    fn throughput_line(&self) -> String {
+        format!(
+            "{} {} / s",
+            self.i18n.text("summary.throughput"),
+            human_bytes(self.displayed_throughput)
+        )
+    }
+
+    fn runtime_line(&self) -> String {
+        let cpu_enabled = self.t("common.enabled");
+        let gpu_enabled = if self.gpu_enabled() {
+            self.t("common.enabled")
+        } else {
+            self.t("common.disabled")
+        };
+        format!("CPU: {cpu_enabled} | GPU: {gpu_enabled}")
+    }
+
+    fn gpu_enabled(&self) -> bool {
+        match self.command() {
+            Some(DesktopCommand::Compress(plan)) => plan.hybrid,
+            Some(DesktopCommand::Extract(_)) => true,
+            None => false,
+        }
+    }
+
+    fn progress_snapshot(&self) -> Option<cozip::CoZipProgressSnapshot> {
+        self.job_snapshot
+            .progress
+            .as_ref()
+            .map(|progress| progress.snapshot())
     }
 }
 
 impl Render for CozipDesktopApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.start_polling_if_needed(window, cx);
+        self.maybe_start_from_launch();
+
         let content: AnyElement = match self.active_screen {
-            ScreenKind::Compress => self.compress.render(&self.i18n).into_any_element(),
-            ScreenKind::Decompress => self.decompress.render(&self.i18n).into_any_element(),
+            ScreenKind::Compress => self.render_compress_screen(window, cx).into_any_element(),
+            ScreenKind::Decompress => self.render_decompress_screen(window, cx).into_any_element(),
             ScreenKind::CompressSettings => self
-                .compress_settings
-                .render(&self.i18n)
+                .render_compress_settings_screen(cx)
                 .into_any_element(),
             ScreenKind::DecompressSettings => self
-                .decompress_settings
-                .render(&self.i18n)
+                .render_decompress_settings_screen(cx)
                 .into_any_element(),
         };
 
         self.shell(content, cx)
+    }
+}
+
+fn human_bytes(value: f64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut unit_index = 0;
+    let mut current = value.max(0.0);
+    while current >= 1024.0 && unit_index < units.len() - 1 {
+        current /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{current:.0} {}", units[unit_index])
+    } else {
+        format!("{current:.1} {}", units[unit_index])
     }
 }
