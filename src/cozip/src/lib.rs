@@ -3,6 +3,7 @@ use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 use cozip_deflate::{
@@ -31,6 +32,7 @@ const STORED_METHOD: u16 = 0;
 const ZIP_VERSION_ZIP64: u16 = 45;
 const DEFAULT_ENTRY_NAME: &str = "payload.bin";
 const STREAM_BUF_SIZE: usize = 256 * 1024;
+const PDEFLATE_DIR_PARALLEL_WRITE_BACKLOG_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 const ZIP64_EXTRA_FIELD_TAG: u16 = 0x0001;
 const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
@@ -626,11 +628,32 @@ enum PDeflateArchiveWriteState {
     RecordPath { tag: u8, path_len: usize },
     RecordFileLen { path: PathBuf },
     RecordFileData {
-        file: ParallelFileWriter,
+        file_id: usize,
         file_offset: u64,
         remaining: u64,
     },
     Finished,
+}
+
+struct PDeflateArchiveActiveFile {
+    writer: Arc<ParallelFileWriter>,
+    queued_fragments: usize,
+}
+
+struct PDeflateArchiveWriteFragment {
+    file_id: usize,
+    writer: Arc<ParallelFileWriter>,
+    offset: u64,
+    data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct PDeflateArchiveDispatchState {
+    queue: VecDeque<PDeflateArchiveWriteFragment>,
+    queued_bytes: usize,
+    active_files: Vec<Option<PDeflateArchiveActiveFile>>,
+    closed: bool,
+    stopped: bool,
 }
 
 struct PDeflateArchiveWriter {
@@ -641,6 +664,9 @@ struct PDeflateArchiveWriter {
     output_bytes: u64,
     progress: Option<CoZipProgress>,
     parallel_write_threads: usize,
+    dispatch: Arc<(Mutex<PDeflateArchiveDispatchState>, std::sync::Condvar)>,
+    dispatch_error: Arc<Mutex<Option<String>>>,
+    dispatch_threads: Vec<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3053,6 +3079,19 @@ impl PDeflateArchiveWriter {
         parallel_write_threads: usize,
     ) -> Result<Self, CoZipError> {
         std::fs::create_dir_all(output_dir)?;
+        let dispatch = Arc::new((
+            Mutex::new(PDeflateArchiveDispatchState::default()),
+            std::sync::Condvar::new(),
+        ));
+        let dispatch_error = Arc::new(Mutex::new(None));
+        let mut dispatch_threads = Vec::new();
+        for _ in 0..parallel_write_threads.max(1) {
+            let dispatch_ref = Arc::clone(&dispatch);
+            let dispatch_error_ref = Arc::clone(&dispatch_error);
+            dispatch_threads.push(thread::spawn(move || {
+                pdeflate_archive_dispatch_loop(dispatch_ref, dispatch_error_ref);
+            }));
+        }
         Ok(Self {
             output_dir: output_dir.to_path_buf(),
             buffer: Vec::new(),
@@ -3061,6 +3100,9 @@ impl PDeflateArchiveWriter {
             output_bytes: 0,
             progress,
             parallel_write_threads: parallel_write_threads.max(1),
+            dispatch,
+            dispatch_error,
+            dispatch_threads,
         })
     }
 
@@ -3072,16 +3114,133 @@ impl PDeflateArchiveWriter {
         self.output_bytes
     }
 
+    fn enqueue_file_fragment(
+        &mut self,
+        file_id: usize,
+        writer: &Arc<ParallelFileWriter>,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), CoZipError> {
+        let (lock, cv) = &*self.dispatch;
+        let mut state = lock
+            .lock()
+            .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+        while state.queued_bytes >= PDEFLATE_DIR_PARALLEL_WRITE_BACKLOG_BYTES && !state.stopped {
+            state = cv
+                .wait(state)
+                .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+            self.take_dispatch_error()?;
+        }
+        if state.stopped {
+            drop(state);
+            self.take_dispatch_error()?;
+            return Err(CoZipError::Io(io::Error::other("archive dispatch stopped")));
+        }
+        if let Some(active) = state.active_files.get_mut(file_id).and_then(Option::as_mut) {
+            active.queued_fragments = active.queued_fragments.saturating_add(1);
+        } else {
+            return Err(CoZipError::InvalidZip("archive file writer missing"));
+        }
+        state.queued_bytes = state.queued_bytes.saturating_add(data.len());
+        state.queue.push_back(PDeflateArchiveWriteFragment {
+            file_id,
+            writer: Arc::clone(writer),
+            offset,
+            data,
+        });
+        cv.notify_all();
+        Ok(())
+    }
+
+    fn mark_file_complete(&mut self, file_id: usize) -> Result<(), CoZipError> {
+        let (lock, _) = &*self.dispatch;
+        let state = lock
+            .lock()
+            .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+        if state.active_files.get(file_id).and_then(Option::as_ref).is_none() {
+            return Err(CoZipError::InvalidZip("archive file writer missing"));
+        }
+        Ok(())
+    }
+
+    fn finish_dispatch(&mut self) -> Result<(), CoZipError> {
+        let (lock, cv) = &*self.dispatch;
+        {
+            let mut state = lock
+                .lock()
+                .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+            state.closed = true;
+            cv.notify_all();
+            while (!state.queue.is_empty()
+                || state
+                    .active_files
+                    .iter()
+                    .flatten()
+                    .any(|file| file.queued_fragments > 0))
+                && !state.stopped
+            {
+                state = cv.wait(state).map_err(|_| {
+                    CoZipError::Io(io::Error::other("archive dispatch state poisoned"))
+                })?;
+                self.take_dispatch_error()?;
+            }
+        }
+        self.take_dispatch_error()?;
+
+        let writers: Vec<Arc<ParallelFileWriter>> = {
+            let (lock, _) = &*self.dispatch;
+            let mut state = lock
+                .lock()
+                .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+            state
+                .active_files
+                .iter_mut()
+                .filter_map(|entry| entry.take().map(|file| file.writer))
+                .collect()
+        };
+        for writer in writers {
+            writer
+                .drain()
+                .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
+        }
+        self.take_dispatch_error()?;
+
+        {
+            let (lock, cv) = &*self.dispatch;
+            let mut state = lock
+                .lock()
+                .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+            state.stopped = true;
+            cv.notify_all();
+        }
+        for handle in self.dispatch_threads.drain(..) {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+
+    fn take_dispatch_error(&self) -> Result<(), CoZipError> {
+        let mut slot = self
+            .dispatch_error
+            .lock()
+            .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch error slot poisoned")))?;
+        if let Some(message) = slot.take() {
+            return Err(CoZipError::Io(io::Error::other(message)));
+        }
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<(), CoZipError> {
         self.process_buffer()?;
         match &mut self.state {
-            PDeflateArchiveWriteState::Finished if self.buffer.is_empty() => Ok(()),
+            PDeflateArchiveWriteState::Finished if self.buffer.is_empty() => {
+                self.finish_dispatch()?;
+                Ok(())
+            }
             PDeflateArchiveWriteState::Finished => {
                 Err(CoZipError::InvalidZip("trailing bytes in pdeflate directory archive"))
             }
-            PDeflateArchiveWriteState::RecordFileData { remaining, file, .. } => {
-                file.drain()
-                    .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
+            PDeflateArchiveWriteState::RecordFileData { remaining, .. } => {
                 if *remaining == 0 {
                     Err(CoZipError::InvalidZip("missing final end marker in directory archive"))
                 } else {
@@ -3174,11 +3333,11 @@ impl PDeflateArchiveWriter {
                         std::fs::create_dir_all(parent)?;
                     }
                     let progress = self.progress.clone();
-                    let file = ParallelFileWriter::new(
+                    let file = Arc::new(ParallelFileWriter::new(
                         open_output_file_rw_truncate(&*path)?,
                         ParallelFileWriterOptions {
                             worker_threads: self.parallel_write_threads,
-                            max_backlog_bytes: 256 * 1024 * 1024,
+                            max_backlog_bytes: PDEFLATE_DIR_PARALLEL_WRITE_BACKLOG_BYTES,
                             backlog_reporter: None,
                             write_reporter: progress.clone().map(|progress| {
                                 std::sync::Arc::new(move |bytes| {
@@ -3187,7 +3346,7 @@ impl PDeflateArchiveWriter {
                             }),
                         },
                     )
-                    .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
+                    .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?);
                     self.file_entries = self.file_entries.saturating_add(1);
                     if let Some(progress) = &progress {
                         let entry_name = path
@@ -3201,20 +3360,29 @@ impl PDeflateArchiveWriter {
                             Some(file_len),
                         );
                     }
+                    let file_id = {
+                        let (lock, _) = &*self.dispatch;
+                        let mut state = lock.lock().map_err(|_| {
+                            CoZipError::Io(io::Error::other("archive dispatch state poisoned"))
+                        })?;
+                        state.active_files.push(Some(PDeflateArchiveActiveFile {
+                            writer: Arc::clone(&file),
+                            queued_fragments: 0,
+                        }));
+                        state.active_files.len() - 1
+                    };
                     self.state = PDeflateArchiveWriteState::RecordFileData {
-                        file,
+                        file_id,
                         file_offset: 0,
                         remaining: file_len,
                     };
                 }
                 PDeflateArchiveWriteState::RecordFileData {
-                    file,
+                    file_id,
                     file_offset,
                     remaining,
                 } => {
                     if *remaining == 0 {
-                        file.drain()
-                            .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                         if let Some(progress) = &self.progress {
                             progress.finish_entry();
                         }
@@ -3226,15 +3394,33 @@ impl PDeflateArchiveWriter {
                     }
                     let take = usize::try_from((*remaining).min(self.buffer.len() as u64))
                         .map_err(|_| CoZipError::InvalidZip("file chunk size out of range"))?;
-                    file.submit(*file_offset, self.buffer[..take].to_vec())
-                        .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
+                    let writer = {
+                        let (lock, _) = &*self.dispatch;
+                        let state = lock.lock().map_err(|_| {
+                            CoZipError::Io(io::Error::other("archive dispatch state poisoned"))
+                        })?;
+                        state
+                            .active_files
+                            .get(*file_id)
+                            .and_then(Option::as_ref)
+                            .map(|active| Arc::clone(&active.writer))
+                            .ok_or(CoZipError::InvalidZip("archive file writer missing"))?
+                    };
+                    let dispatch = Arc::clone(&self.dispatch);
+                    let dispatch_error = Arc::clone(&self.dispatch_error);
+                    enqueue_archive_file_fragment(
+                        &dispatch,
+                        &dispatch_error,
+                        *file_id,
+                        &writer,
+                        *file_offset,
+                        self.buffer[..take].to_vec(),
+                    )?;
                     self.buffer.drain(..take);
                     *file_offset = file_offset.saturating_add(take as u64);
                     *remaining = remaining.saturating_sub(take as u64);
                     self.output_bytes = self.output_bytes.saturating_add(take as u64);
                     if *remaining == 0 {
-                        file.drain()
-                            .map_err(|err| CoZipError::Io(io::Error::other(err.to_string())))?;
                         if let Some(progress) = &self.progress {
                             progress.finish_entry();
                         }
@@ -3257,12 +3443,117 @@ impl Write for PDeflateArchiveWriter {
     }
 
     fn flush(&mut self) -> Result<(), io::Error> {
-        if let PDeflateArchiveWriteState::RecordFileData { file, .. } = &mut self.state {
-            file.drain()
-                .map_err(|err| io::Error::other(err.to_string()))?;
-        }
+        self.take_dispatch_error()
+            .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(())
     }
+}
+
+fn pdeflate_archive_dispatch_loop(
+    dispatch: Arc<(Mutex<PDeflateArchiveDispatchState>, std::sync::Condvar)>,
+    error_slot: Arc<Mutex<Option<String>>>,
+) {
+    loop {
+        let fragment = {
+            let (lock, cv) = &*dispatch;
+            let mut state = match lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            loop {
+                if let Some(fragment) = state.queue.pop_front() {
+                    state.queued_bytes = state.queued_bytes.saturating_sub(fragment.data.len());
+                    cv.notify_all();
+                    break Some(fragment);
+                }
+                if state.closed || state.stopped {
+                    return;
+                }
+                state = match cv.wait(state) {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+            }
+        };
+        let Some(fragment) = fragment else {
+            return;
+        };
+
+        let submit_result = fragment.writer.submit(fragment.offset, fragment.data);
+
+        let (lock, cv) = &*dispatch;
+        let mut state = match lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Some(active) = state
+            .active_files
+            .get_mut(fragment.file_id)
+            .and_then(Option::as_mut)
+        {
+            active.queued_fragments = active.queued_fragments.saturating_sub(1);
+        }
+        if let Err(err) = submit_result {
+            state.stopped = true;
+            if let Ok(mut slot) = error_slot.lock() {
+                if slot.is_none() {
+                    *slot = Some(err.to_string());
+                }
+            }
+        }
+        cv.notify_all();
+    }
+}
+
+fn enqueue_archive_file_fragment(
+    dispatch: &Arc<(Mutex<PDeflateArchiveDispatchState>, std::sync::Condvar)>,
+    dispatch_error: &Arc<Mutex<Option<String>>>,
+    file_id: usize,
+    writer: &Arc<ParallelFileWriter>,
+    offset: u64,
+    data: Vec<u8>,
+) -> Result<(), CoZipError> {
+    let (lock, cv) = &**dispatch;
+    let mut state = lock
+        .lock()
+        .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+    while state.queued_bytes >= PDEFLATE_DIR_PARALLEL_WRITE_BACKLOG_BYTES && !state.stopped {
+        state = cv
+            .wait(state)
+            .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch state poisoned")))?;
+        take_archive_dispatch_error(dispatch_error)?;
+    }
+    if state.stopped {
+        drop(state);
+        take_archive_dispatch_error(dispatch_error)?;
+        return Err(CoZipError::Io(io::Error::other("archive dispatch stopped")));
+    }
+    if let Some(active) = state.active_files.get_mut(file_id).and_then(Option::as_mut) {
+        active.queued_fragments = active.queued_fragments.saturating_add(1);
+    } else {
+        return Err(CoZipError::InvalidZip("archive file writer missing"));
+    }
+    state.queued_bytes = state.queued_bytes.saturating_add(data.len());
+    state.queue.push_back(PDeflateArchiveWriteFragment {
+        file_id,
+        writer: Arc::clone(writer),
+        offset,
+        data,
+    });
+    cv.notify_all();
+    Ok(())
+}
+
+fn take_archive_dispatch_error(
+    dispatch_error: &Arc<Mutex<Option<String>>>,
+) -> Result<(), CoZipError> {
+    let mut slot = dispatch_error
+        .lock()
+        .map_err(|_| CoZipError::Io(io::Error::other("archive dispatch error slot poisoned")))?;
+    if let Some(message) = slot.take() {
+        return Err(CoZipError::Io(io::Error::other(message)));
+    }
+    Ok(())
 }
 
 fn collect_files_recursively(root: &Path) -> Result<Vec<PathBuf>, CoZipError> {
