@@ -1230,6 +1230,7 @@ name = "cozip_deflate"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cozip_util",
  "crc32fast",
  "flate2",
  "pollster 0.3.0",

@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cozip::{
-    CoZip, CoZipOptions, CoZipProgress, PDeflateOptions, ZipDeflateMode, ZipOptions,
-};
+use cozip::{CoZip, CoZipOptions, CoZipProgress, PDeflateOptions, ZipOptions};
 
 use crate::launch::{ArchiveFormat, CompressMode, CompressPlan, DesktopCommand, ExtractPlan};
 
@@ -154,7 +152,8 @@ fn run_extract(plan: ExtractPlan, shared: &SharedJobSnapshot) -> Result<String, 
                 .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
         }
 
-        let cozip = init_extract_cozip(task.archive_format, &plan.pdeflate_options)?;
+        let cozip =
+            init_extract_cozip(task.archive_format, &plan.zip_options, &plan.pdeflate_options)?;
         let result = cozip
             .decompress_auto_from_name_with_progress(
                 &task.archive_path,
@@ -194,14 +193,12 @@ fn init_compress_cozip(plan: &CompressPlan) -> Result<CoZip, String> {
 
 fn init_extract_cozip(
     format: ArchiveFormat,
+    zip_options: &ZipOptions,
     pdeflate_options: &PDeflateOptions,
 ) -> Result<CoZip, String> {
     let options = match format {
         ArchiveFormat::Zip => CoZipOptions::Zip {
-            options: ZipOptions {
-                deflate_mode: ZipDeflateMode::Hybrid,
-                ..ZipOptions::default()
-            },
+            options: zip_options.clone(),
         },
         ArchiveFormat::Cozip => CoZipOptions::PDeflate {
             options: pdeflate_options.clone(),

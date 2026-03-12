@@ -10,6 +10,7 @@ status.runtime_title = "実行プロファイル"
 status.runtime_body = "CoZip / CoZipPDeflate の実ジョブ進捗と統計を載せる前提のモックです。"
 
 common.enabled = "有効"
+common.enabled_single_thread = "有効（シングルスレッド）"
 common.disabled = "無効"
 common.cancel = "キャンセル"
 common.close = "閉じる"

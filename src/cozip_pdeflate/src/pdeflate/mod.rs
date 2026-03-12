@@ -215,8 +215,7 @@ impl Default for PDeflateOptions {
         let parallel_write_threads = thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1)
-            .max(1)
-            .div_ceil(2);
+            .max(1);
         Self {
             chunk_size: 4 * 1024 * 1024,
             section_count: 128,

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::env;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +57,7 @@ const PDEFLATE_DIR_FILE_VERSION_V2: u8 = 2;
 pub struct ZipOptions {
     pub compression_level: u32,
     pub deflate_mode: ZipDeflateMode,
+    pub parallel_write_threads: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,10 @@ impl Default for ZipOptions {
         Self {
             compression_level: 6,
             deflate_mode: ZipDeflateMode::Hybrid,
+            parallel_write_threads: thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+                .max(1),
         }
     }
 }
@@ -340,6 +346,12 @@ pub enum CoZipArchiveKind {
 pub struct CoZipArchiveInfo {
     pub format: CoZipArchiveFormat,
     pub kind: CoZipArchiveKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoZipArchiveDecodeHint {
+    SingleThread,
+    Parallel,
 }
 
 impl Default for CoZipOptions {
@@ -708,7 +720,10 @@ pub struct CoZip {
 
 #[derive(Debug, Clone)]
 enum CoZipBackend {
-    Zip { deflate: CoZipDeflate },
+    Zip {
+        deflate: CoZipDeflate,
+        parallel_write_threads: usize,
+    },
     PDeflate {
         pdeflate: CoZipPDeflate,
         parallel_write_threads: usize,
@@ -725,7 +740,10 @@ impl CoZip {
                 hybrid_opts.compression_mode = compression_mode_from_level(compression_level);
                 hybrid_opts.prefer_gpu = matches!(options.deflate_mode, ZipDeflateMode::Hybrid);
                 let deflate = CoZipDeflate::init(hybrid_opts)?;
-                CoZipBackend::Zip { deflate }
+                CoZipBackend::Zip {
+                    deflate,
+                    parallel_write_threads: options.parallel_write_threads.max(1),
+                }
             }
             CoZipOptions::PDeflate { options } => {
                 let parallel_write_threads = options.parallel_write_threads;
@@ -788,7 +806,7 @@ impl CoZip {
         progress: Option<CoZipProgress>,
     ) -> Result<CoZipStats, CoZipError> {
         match &self.backend {
-            CoZipBackend::Zip { deflate } => {
+            CoZipBackend::Zip { deflate, .. } => {
                 let entry_name = normalize_zip_entry_name(entry_name)?;
                 if let Some(progress) = &progress {
                     progress.start(
@@ -979,7 +997,7 @@ impl CoZip {
             progress.set_scanning(CoZipProgressOperation::Compress, CoZipProgressTarget::Directory);
         }
         match &self.backend {
-            CoZipBackend::Zip { deflate } => {
+            CoZipBackend::Zip { deflate, .. } => {
                 let files = collect_files_recursively(input_dir)?;
                 let total_bytes = files.iter().try_fold(0_u64, |acc, path| {
                     Ok::<u64, CoZipError>(acc.saturating_add(std::fs::metadata(path)?.len()))
@@ -1117,7 +1135,10 @@ impl CoZip {
     ) -> Result<CoZipStats, CoZipError> {
         let progress = progress.into();
         match &self.backend {
-            CoZipBackend::Zip { deflate } => {
+            CoZipBackend::Zip {
+                deflate,
+                parallel_write_threads,
+            } => {
                 let mut reader = BufReader::new(input_file);
                 let (entries, input_len) = read_central_directory_entries(&mut reader)?;
                 if entries.len() != 1 {
@@ -1134,14 +1155,43 @@ impl CoZip {
                     );
                     progress.begin_entry(entries[0].name.clone(), Some(entries[0].uncompressed_size));
                 }
-                let mut writer = BufWriter::new(ProgressWriter::new(
-                    output_file,
-                    progress.clone(),
-                ));
-
-                let output_bytes =
-                    extract_entry_to_writer(&mut reader, &entries[0], &mut writer, deflate)?;
-                writer.flush()?;
+                let output_bytes = if entries[0]._czdi_index.is_some() {
+                    let backlog_reporter = progress.clone().map(|progress| {
+                        Arc::new(move |bytes| {
+                            progress.set_pending_output_backlog_bytes(Some(bytes));
+                        }) as cozip_util::BacklogReporter
+                    });
+                    let write_reporter = progress.clone().map(|progress| {
+                        Arc::new(move |bytes| {
+                            progress.advance_bytes(bytes);
+                        }) as cozip_util::WriteReporter
+                    });
+                    let stats = extract_indexed_entry_to_parallel_writer(
+                        &mut reader,
+                        &entries[0],
+                        output_file,
+                        deflate,
+                        ParallelFileWriterOptions {
+                            worker_threads: (*parallel_write_threads).max(1),
+                            max_backlog_bytes: 2 * 1024 * 1024 * 1024,
+                            backlog_reporter,
+                            write_reporter,
+                        },
+                    )?;
+                    if let Some(progress) = &progress {
+                        progress.set_pending_output_backlog_bytes(None);
+                    }
+                    stats.output_bytes
+                } else {
+                    let mut writer = BufWriter::new(ProgressWriter::new(
+                        output_file,
+                        progress.clone(),
+                    ));
+                    let output_bytes =
+                        extract_entry_to_writer(&mut reader, &entries[0], &mut writer, deflate)?;
+                    writer.flush()?;
+                    output_bytes
+                };
                 if let Some(progress) = &progress {
                     progress.finish_entry();
                     progress.finish();
@@ -1522,8 +1572,8 @@ impl CoZip {
         std::fs::create_dir_all(output_dir)?;
 
         match &self.backend {
-            CoZipBackend::Zip { deflate } => {
-                let mut reader = BufReader::new(input_file);
+            CoZipBackend::Zip { deflate, .. } => {
+                let mut reader = BufReader::new(input_file.try_clone()?);
                 let (entries, input_len) = read_central_directory_entries(&mut reader)?;
                 let file_entries = entries.iter().filter(|entry| !entry.name.ends_with('/')).count();
                 let total_bytes = entries
@@ -1545,6 +1595,8 @@ impl CoZip {
                     output_bytes: 0,
                 };
 
+                let mut tasks = Vec::with_capacity(file_entries);
+                let mut indexed_file_count = 0usize;
                 for entry in entries {
                     let rel_path = entry_path_from_zip_name(&entry.name)?;
                     let out_path = output_dir.join(rel_path);
@@ -1557,23 +1609,212 @@ impl CoZip {
                         std::fs::create_dir_all(parent)?;
                     }
 
-                    let out_file = StdFile::create(&out_path)?;
-                    if let Some(progress) = &progress {
-                        progress.begin_entry(entry.name.clone(), Some(entry.uncompressed_size));
-                    }
-                    let mut out_writer = BufWriter::new(ProgressWriter::new(
-                        out_file,
-                        progress.clone(),
-                    ));
-                    let written =
-                        extract_entry_to_writer(&mut reader, &entry, &mut out_writer, deflate)?;
-                    out_writer.flush()?;
-                    if let Some(progress) = &progress {
-                        progress.finish_entry();
-                    }
+                    let backlog_slot = if entry._czdi_index.is_some() {
+                        let slot = indexed_file_count;
+                        indexed_file_count = indexed_file_count.saturating_add(1);
+                        Some(slot)
+                    } else {
+                        None
+                    };
 
-                    stats.entries = stats.entries.saturating_add(1);
-                    stats.output_bytes = stats.output_bytes.saturating_add(written);
+                    tasks.push(ZipExtractFileTask {
+                        entry,
+                        output_path: out_path,
+                        backlog_slot,
+                    });
+                }
+
+                if !tasks.is_empty() {
+                    let task_queue = Arc::new((
+                        Mutex::new(VecDeque::from(tasks)),
+                        std::sync::Condvar::new(),
+                    ));
+                    let result_totals = Arc::new(Mutex::new((0usize, 0_u64)));
+                    let error_slot = Arc::new(Mutex::new(None::<CoZipError>));
+                    let backlog_totals = Arc::new(Mutex::new(vec![0_u64; indexed_file_count]));
+                    let worker_count = match &self.backend {
+                        CoZipBackend::Zip {
+                            parallel_write_threads,
+                            ..
+                        } => (*parallel_write_threads).max(1),
+                        _ => 1,
+                    };
+
+                    thread::scope(|scope| {
+                        for _ in 0..worker_count {
+                            let queue_ref = Arc::clone(&task_queue);
+                            let result_ref = Arc::clone(&result_totals);
+                            let error_ref = Arc::clone(&error_slot);
+                            let progress_ref = progress.clone();
+                            let backlog_ref = Arc::clone(&backlog_totals);
+                            let mut input_ref = input_file
+                                .try_clone()
+                                .expect("zip directory input clone should succeed");
+                            let deflate_ref = deflate.clone();
+                            scope.spawn(move || loop {
+                                let task = {
+                                    let (lock, cv) = &*queue_ref;
+                                    let mut state = match lock.lock() {
+                                        Ok(guard) => guard,
+                                        Err(_) => {
+                                            if let Ok(mut slot) = error_ref.lock() {
+                                                if slot.is_none() {
+                                                    *slot = Some(CoZipError::InvalidZip(
+                                                        "zip task queue poisoned",
+                                                    ));
+                                                }
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    loop {
+                                        if let Some(task) = state.pop_front() {
+                                            break Some(task);
+                                        }
+                                        if error_ref
+                                            .lock()
+                                            .map(|slot| slot.is_some())
+                                            .unwrap_or(true)
+                                        {
+                                            break None;
+                                        }
+                                        if state.is_empty() {
+                                            break None;
+                                        }
+                                        state = match cv.wait(state) {
+                                            Ok(guard) => guard,
+                                            Err(_) => return,
+                                        };
+                                    }
+                                };
+
+                                let Some(task) = task else {
+                                    return;
+                                };
+
+                                if let Some(progress) = &progress_ref {
+                                    progress.begin_entry(
+                                        task.entry.name.clone(),
+                                        Some(task.entry.uncompressed_size),
+                                    );
+                                }
+
+                                let task_result: Result<u64, CoZipError> = (|| {
+                                    let output_file = if task.entry._czdi_index.is_some() {
+                                        open_output_file_rw_truncate(&task.output_path)?
+                                    } else {
+                                        StdFile::create(&task.output_path)?
+                                    };
+
+                                    if let Some(slot_index) = task.backlog_slot {
+                                        let backlog_ref_inner = Arc::clone(&backlog_ref);
+                                        let progress_inner = progress_ref.clone();
+                                        let backlog_reporter = Arc::new(move |bytes: u64| {
+                                            let total = {
+                                                let mut slots = match backlog_ref_inner.lock() {
+                                                    Ok(guard) => guard,
+                                                    Err(_) => return,
+                                                };
+                                                if let Some(slot) = slots.get_mut(slot_index) {
+                                                    *slot = bytes;
+                                                }
+                                                slots.iter().copied().sum::<u64>()
+                                            };
+                                            if let Some(progress) = &progress_inner {
+                                                progress.set_pending_output_backlog_bytes(Some(total));
+                                            }
+                                        }) as cozip_util::BacklogReporter;
+                                        let write_progress = progress_ref.clone();
+                                        let write_reporter = Arc::new(move |bytes: u64| {
+                                            if let Some(progress) = &write_progress {
+                                                progress.advance_bytes(bytes);
+                                            }
+                                        }) as cozip_util::WriteReporter;
+                                        let stats = extract_indexed_entry_to_parallel_writer(
+                                            &mut input_ref,
+                                            &task.entry,
+                                            output_file,
+                                            &deflate_ref,
+                                            ParallelFileWriterOptions {
+                                                worker_threads: worker_count,
+                                                max_backlog_bytes: 2 * 1024 * 1024 * 1024,
+                                                backlog_reporter: Some(backlog_reporter),
+                                                write_reporter: Some(write_reporter),
+                                            },
+                                        )?;
+                                        if let Ok(mut slots) = backlog_ref.lock() {
+                                            if let Some(slot) = slots.get_mut(slot_index) {
+                                                *slot = 0;
+                                            }
+                                            if let Some(progress) = &progress_ref {
+                                                progress.set_pending_output_backlog_bytes(Some(
+                                                    slots.iter().copied().sum::<u64>(),
+                                                ));
+                                            }
+                                        }
+                                        Ok(stats.output_bytes)
+                                    } else {
+                                        let mut local_reader = BufReader::new(input_ref.try_clone()?);
+                                        if let Some(progress) = &progress_ref {
+                                            let mut out_writer = BufWriter::new(ProgressWriter::new(
+                                                output_file,
+                                                Some(progress.clone()),
+                                            ));
+                                            let written = extract_entry_to_writer(
+                                                &mut local_reader,
+                                                &task.entry,
+                                                &mut out_writer,
+                                                &deflate_ref,
+                                            )?;
+                                            out_writer.flush()?;
+                                            Ok(written)
+                                        } else {
+                                            let mut out_writer = BufWriter::new(output_file);
+                                            let written = extract_entry_to_writer(
+                                                &mut local_reader,
+                                                &task.entry,
+                                                &mut out_writer,
+                                                &deflate_ref,
+                                            )?;
+                                            out_writer.flush()?;
+                                            Ok(written)
+                                        }
+                                    }
+                                })();
+
+                                match task_result {
+                                    Ok(written) => {
+                                        if let Ok(mut totals) = result_ref.lock() {
+                                            totals.0 = totals.0.saturating_add(1);
+                                            totals.1 = totals.1.saturating_add(written);
+                                        }
+                                        if let Some(progress) = &progress_ref {
+                                            progress.finish_entry();
+                                        }
+                                    }
+                                    Err(error) => {
+                                        if let Ok(mut slot) = error_ref.lock() {
+                                            if slot.is_none() {
+                                                *slot = Some(error);
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+                            });
+                        }
+                    });
+
+                    if let Some(error) = error_slot.lock().ok().and_then(|mut slot| slot.take()) {
+                        return Err(error);
+                    }
+                    if let Ok(totals) = result_totals.lock() {
+                        stats.entries = totals.0;
+                        stats.output_bytes = totals.1;
+                    }
+                    if let Some(progress) = &progress {
+                        progress.set_pending_output_backlog_bytes(None);
+                    }
                 }
 
                 if let Some(progress) = &progress {
@@ -2222,6 +2463,35 @@ pub fn inspect_archive_from_name<P: AsRef<Path>>(
     Err(CoZipError::InvalidZip("unsupported archive signature"))
 }
 
+pub fn inspect_archive_decode_hint_from_name<P: AsRef<Path>>(
+    input_path: P,
+) -> Result<CoZipArchiveDecodeHint, CoZipError> {
+    let input_path = input_path.as_ref();
+    let mut input = StdFile::open(input_path)?;
+    let mut magic = [0_u8; 4];
+    let read_len = input.read(&mut magic)?;
+    input.seek(SeekFrom::Start(0))?;
+
+    if read_len >= 2 && magic[..2] == *b"PK" {
+        let mut reader = BufReader::new(input);
+        let (entries, _) = read_central_directory_entries(&mut reader)?;
+        let all_entries_parallelizable = entries.iter().all(|entry| {
+            entry.method == STORED_METHOD || entry._czdi_index.is_some()
+        });
+        return Ok(if all_entries_parallelizable {
+            CoZipArchiveDecodeHint::Parallel
+        } else {
+            CoZipArchiveDecodeHint::SingleThread
+        });
+    }
+
+    if read_len == 4 && (magic == *b"PDS0" || magic == PDEFLATE_DIR_FILE_MAGIC) {
+        return Ok(CoZipArchiveDecodeHint::Parallel);
+    }
+
+    Err(CoZipError::InvalidZip("unsupported archive signature"))
+}
+
 #[derive(Debug, Clone)]
 struct ZipCentralWriteEntry {
     name: String,
@@ -2639,54 +2909,7 @@ fn read_central_directory_entries<R: Read + Seek>(
                 ))?;
         }
 
-        let czdi_parsed = parse_czdi_extra_field(&extra_data)?;
-        let czdi_blob = match czdi_parsed {
-            Some(CzdiParsedExtra {
-                kind:
-                    CzdiExtraKind::Inline {
-                        blob_len: _,
-                        blob_crc32: _,
-                    },
-                inline_blob,
-            }) => inline_blob,
-            Some(CzdiParsedExtra {
-                kind:
-                    CzdiExtraKind::Eocd64Ref {
-                        blob_offset,
-                        blob_len,
-                        blob_crc32,
-                    },
-                inline_blob: _,
-            }) => {
-                let area = czdi_eocd_blob
-                    .as_ref()
-                    .ok_or(CoZipError::InvalidZip("czdi eocd64 blob is missing"))?;
-                let start = usize::try_from(blob_offset)
-                    .map_err(|_| CoZipError::InvalidZip("czdi blob offset out of range"))?;
-                let len = usize::try_from(blob_len)
-                    .map_err(|_| CoZipError::InvalidZip("czdi blob length out of range"))?;
-                let end = start
-                    .checked_add(len)
-                    .ok_or(CoZipError::InvalidZip("czdi blob range overflow"))?;
-                let blob = area
-                    .get(start..end)
-                    .ok_or(CoZipError::InvalidZip("czdi blob range is invalid"))?;
-                if crc32fast::hash(blob) != blob_crc32 {
-                    return Err(CoZipError::InvalidZip("czdi eocd64 blob crc mismatch"));
-                }
-                Some(blob.to_vec())
-            }
-            Some(CzdiParsedExtra {
-                kind: CzdiExtraKind::None,
-                inline_blob: _,
-            })
-            | None => None,
-        };
-        let czdi_index = czdi_blob
-            .as_deref()
-            .map(DeflateChunkIndex::decode_czdi_v1)
-            .transpose()
-            .map_err(|_| CoZipError::InvalidZip("czdi index decode failed"))?;
+        let czdi_index = read_czdi_index_best_effort(&extra_data, czdi_eocd_blob.as_deref());
 
         // Skip comment
         if comment_len > 0 {
@@ -2715,51 +2938,7 @@ fn extract_entry_to_writer<R: Read + Seek + Send, W: Write>(
     writer: &mut W,
     deflate: &CoZipDeflate,
 ) -> Result<u64, CoZipError> {
-    reader.seek(SeekFrom::Start(entry.local_header_offset))?;
-
-    let mut local_fixed = [0_u8; 30];
-    reader.read_exact(&mut local_fixed)?;
-    let local_sig = u32::from_le_bytes(
-        local_fixed[0..4]
-            .try_into()
-            .map_err(|_| CoZipError::InvalidZip("local signature parse failed"))?,
-    );
-    if local_sig != LOCAL_FILE_HEADER_SIG {
-        return Err(CoZipError::InvalidZip(
-            "invalid local file header signature",
-        ));
-    }
-
-    let local_name_len = u16::from_le_bytes(
-        local_fixed[26..28]
-            .try_into()
-            .map_err(|_| CoZipError::InvalidZip("local name len parse failed"))?,
-    ) as usize;
-    let local_extra_len = u16::from_le_bytes(
-        local_fixed[28..30]
-            .try_into()
-            .map_err(|_| CoZipError::InvalidZip("local extra len parse failed"))?,
-    ) as usize;
-
-    // Skip name, read extra field
-    let name_skip = i64::try_from(local_name_len).map_err(|_| CoZipError::DataTooLarge)?;
-    reader.seek(SeekFrom::Current(name_skip))?;
-
-    let mut local_extra = vec![0_u8; local_extra_len];
-    reader.read_exact(&mut local_extra)?;
-
-    // Use compressed_size from central directory (already ZIP64-resolved)
-    let mut compressed_size = entry.compressed_size;
-
-    // If central directory had 0xFFFFFFFF, also check local extra field
-    if compressed_size == u64::from(u32::MAX) {
-        let z64 = parse_zip64_extra_field(&local_extra, false, true, false)?;
-        compressed_size =
-            z64.and_then(|field| field.compressed_size)
-                .ok_or(CoZipError::InvalidZip(
-                    "missing zip64 compressed size in local header",
-                ))?;
-    }
+    let compressed_size = position_reader_at_entry_data(reader, entry)?;
 
     let mut limited = reader.take(compressed_size);
     let mut written: u64;
@@ -2840,12 +3019,104 @@ fn extract_entry_to_writer<R: Read + Seek + Send, W: Write>(
     Ok(written)
 }
 
+fn extract_indexed_entry_to_parallel_writer<R: Read + Seek + Send>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+    output_file: StdFile,
+    deflate: &CoZipDeflate,
+    writer_options: ParallelFileWriterOptions,
+) -> Result<cozip_deflate::DeflateCpuStreamStats, CoZipError> {
+    let compressed_size = position_reader_at_entry_data(reader, entry)?;
+    let Some(index) = entry._czdi_index.as_ref() else {
+        return Err(CoZipError::InvalidZip("czdi index is missing"));
+    };
+    let mut limited = reader.take(compressed_size);
+    let stats = deflate
+        .deflate_decompress_stream_zip_compatible_with_index_parallel_write(
+            &mut limited,
+            output_file,
+            index,
+            writer_options,
+        )
+        .map_err(CoZipError::Deflate)?;
+    let mut sink = io::sink();
+    let leftover = io::copy(&mut limited, &mut sink)?;
+    if leftover != 0 {
+        return Err(CoZipError::InvalidZip(
+            "compressed stream did not consume declared size",
+        ));
+    }
+    if stats.output_bytes != entry.uncompressed_size {
+        return Err(CoZipError::InvalidZip("decompressed size mismatch"));
+    }
+    if stats.output_crc32 != entry.crc {
+        return Err(CoZipError::InvalidZip("crc32 mismatch"));
+    }
+    Ok(stats)
+}
+
+fn position_reader_at_entry_data<R: Read + Seek>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+) -> Result<u64, CoZipError> {
+    reader.seek(SeekFrom::Start(entry.local_header_offset))?;
+
+    let mut local_fixed = [0_u8; 30];
+    reader.read_exact(&mut local_fixed)?;
+    let local_sig = u32::from_le_bytes(
+        local_fixed[0..4]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("local signature parse failed"))?,
+    );
+    if local_sig != LOCAL_FILE_HEADER_SIG {
+        return Err(CoZipError::InvalidZip(
+            "invalid local file header signature",
+        ));
+    }
+
+    let local_name_len = u16::from_le_bytes(
+        local_fixed[26..28]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("local name len parse failed"))?,
+    ) as usize;
+    let local_extra_len = u16::from_le_bytes(
+        local_fixed[28..30]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("local extra len parse failed"))?,
+    ) as usize;
+
+    let name_skip = i64::try_from(local_name_len).map_err(|_| CoZipError::DataTooLarge)?;
+    reader.seek(SeekFrom::Current(name_skip))?;
+
+    let mut local_extra = vec![0_u8; local_extra_len];
+    reader.read_exact(&mut local_extra)?;
+
+    let mut compressed_size = entry.compressed_size;
+    if compressed_size == u64::from(u32::MAX) {
+        let z64 = parse_zip64_extra_field(&local_extra, false, true, false)?;
+        compressed_size = z64
+            .and_then(|field| field.compressed_size)
+            .ok_or(CoZipError::InvalidZip(
+                "missing zip64 compressed size in local header",
+            ))?;
+    }
+
+    Ok(compressed_size)
+}
+
 #[derive(Debug, Clone)]
 struct Eocd {
     entries: u64,
     central_size: u64,
     central_offset: u64,
     zip64_extensible_data: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct ZipExtractFileTask {
+    entry: ZipCentralReadEntry,
+    output_path: PathBuf,
+    backlog_slot: Option<usize>,
 }
 
 fn read_eocd<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<Eocd, CoZipError> {
@@ -2879,92 +3150,100 @@ fn read_eocd<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<Eocd, CoZi
     let needs_zip64 =
         entries_u16 == u16::MAX || central_size_u32 == u32::MAX || central_offset_u32 == u32::MAX;
 
-    if needs_zip64 {
-        // Look for ZIP64 EOCD Locator at eocd_offset - 20
-        if eocd_offset < 20 {
-            return Err(CoZipError::InvalidZip(
-                "ZIP64 EOCD locator not found (file too small)",
-            ));
-        }
-        let locator_offset = eocd_offset - 20;
-        reader.seek(SeekFrom::Start(locator_offset))?;
-        let mut locator_buf = [0_u8; 20];
-        reader.read_exact(&mut locator_buf)?;
-
-        let locator_sig = u32::from_le_bytes(
-            locator_buf[0..4]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("locator sig parse failed"))?,
-        );
-        if locator_sig != ZIP64_EOCD_LOCATOR_SIG {
-            return Err(CoZipError::InvalidZip("ZIP64 EOCD locator not found"));
-        }
-
-        let zip64_eocd_offset = u64::from_le_bytes(
-            locator_buf[8..16]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 eocd offset parse failed"))?,
-        );
-
-        // Read ZIP64 EOCD header prefix (sig + size)
-        reader.seek(SeekFrom::Start(zip64_eocd_offset))?;
-        let mut z64_prefix = [0_u8; 12];
-        reader.read_exact(&mut z64_prefix)?;
-        let z64_sig = u32::from_le_bytes(
-            z64_prefix[0..4]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 eocd sig parse failed"))?,
-        );
-        if z64_sig != ZIP64_EOCD_SIG {
-            return Err(CoZipError::InvalidZip("invalid ZIP64 EOCD signature"));
-        }
-        let z64_record_size = u64::from_le_bytes(
-            z64_prefix[4..12]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 eocd size parse failed"))?,
-        );
-        if z64_record_size < 44 {
-            return Err(CoZipError::InvalidZip("zip64 eocd record too short"));
-        }
-        let z64_tail_len = usize_from_u64(z64_record_size, "zip64 eocd size too large")?;
-        let mut z64_tail = vec![0_u8; z64_tail_len];
-        reader.read_exact(&mut z64_tail)?;
-
-        let entries = u64::from_le_bytes(
-            z64_tail[20..28]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 entries parse failed"))?,
-        );
-        let central_size = u64::from_le_bytes(
-            z64_tail[28..36]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 cd size parse failed"))?,
-        );
-        let central_offset = u64::from_le_bytes(
-            z64_tail[36..44]
-                .try_into()
-                .map_err(|_| CoZipError::InvalidZip("zip64 cd offset parse failed"))?,
-        );
-        let zip64_extensible_data = if z64_tail.len() > 44 {
-            Some(z64_tail[44..].to_vec())
-        } else {
-            None
-        };
-
-        Ok(Eocd {
-            entries,
-            central_size,
-            central_offset,
-            zip64_extensible_data,
-        })
-    } else {
-        Ok(Eocd {
-            entries: u64::from(entries_u16),
-            central_size: u64::from(central_size_u32),
-            central_offset: u64::from(central_offset_u32),
-            zip64_extensible_data: None,
-        })
+    if let Some(zip64) = try_read_zip64_eocd(reader, eocd_offset)? {
+        return Ok(zip64);
     }
+
+    if needs_zip64 {
+        return Err(CoZipError::InvalidZip("ZIP64 EOCD locator not found"));
+    }
+
+    Ok(Eocd {
+        entries: u64::from(entries_u16),
+        central_size: u64::from(central_size_u32),
+        central_offset: u64::from(central_offset_u32),
+        zip64_extensible_data: None,
+    })
+}
+
+fn try_read_zip64_eocd<R: Read + Seek>(
+    reader: &mut R,
+    eocd_offset: u64,
+) -> Result<Option<Eocd>, CoZipError> {
+    if eocd_offset < 20 {
+        return Ok(None);
+    }
+
+    let locator_offset = eocd_offset - 20;
+    reader.seek(SeekFrom::Start(locator_offset))?;
+    let mut locator_buf = [0_u8; 20];
+    reader.read_exact(&mut locator_buf)?;
+
+    let locator_sig = u32::from_le_bytes(
+        locator_buf[0..4]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("locator sig parse failed"))?,
+    );
+    if locator_sig != ZIP64_EOCD_LOCATOR_SIG {
+        return Ok(None);
+    }
+
+    let zip64_eocd_offset = u64::from_le_bytes(
+        locator_buf[8..16]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 eocd offset parse failed"))?,
+    );
+
+    reader.seek(SeekFrom::Start(zip64_eocd_offset))?;
+    let mut z64_prefix = [0_u8; 12];
+    reader.read_exact(&mut z64_prefix)?;
+    let z64_sig = u32::from_le_bytes(
+        z64_prefix[0..4]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 eocd sig parse failed"))?,
+    );
+    if z64_sig != ZIP64_EOCD_SIG {
+        return Err(CoZipError::InvalidZip("invalid ZIP64 EOCD signature"));
+    }
+    let z64_record_size = u64::from_le_bytes(
+        z64_prefix[4..12]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 eocd size parse failed"))?,
+    );
+    if z64_record_size < 44 {
+        return Err(CoZipError::InvalidZip("zip64 eocd record too short"));
+    }
+    let z64_tail_len = usize_from_u64(z64_record_size, "zip64 eocd size too large")?;
+    let mut z64_tail = vec![0_u8; z64_tail_len];
+    reader.read_exact(&mut z64_tail)?;
+
+    let entries = u64::from_le_bytes(
+        z64_tail[20..28]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 entries parse failed"))?,
+    );
+    let central_size = u64::from_le_bytes(
+        z64_tail[28..36]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 cd size parse failed"))?,
+    );
+    let central_offset = u64::from_le_bytes(
+        z64_tail[36..44]
+            .try_into()
+            .map_err(|_| CoZipError::InvalidZip("zip64 cd offset parse failed"))?,
+    );
+    let zip64_extensible_data = if z64_tail.len() > 44 {
+        Some(z64_tail[44..].to_vec())
+    } else {
+        None
+    };
+
+    Ok(Some(Eocd {
+        entries,
+        central_size,
+        central_offset,
+        zip64_extensible_data,
+    }))
 }
 
 impl PDeflateArchiveReader {
@@ -3447,6 +3726,127 @@ impl Write for PDeflateArchiveWriter {
             .map_err(|err| io::Error::other(err.to_string()))?;
         Ok(())
     }
+}
+
+fn read_czdi_index_best_effort(
+    extra_data: &[u8],
+    czdi_eocd_blob: Option<&[u8]>,
+) -> Option<DeflateChunkIndex> {
+    let czdi_parsed = match parse_czdi_extra_field(extra_data) {
+        Ok(value) => value,
+        Err(error) => {
+            trace_zip_czdi(format!("parse_czdi_extra_field error: {error}"));
+            return None;
+        }
+    };
+    let czdi_blob = match czdi_parsed {
+        Some(CzdiParsedExtra {
+            kind:
+                CzdiExtraKind::Inline {
+                    blob_len: _,
+                    blob_crc32: _,
+                },
+            inline_blob,
+        }) => inline_blob,
+        Some(CzdiParsedExtra {
+            kind:
+                CzdiExtraKind::Eocd64Ref {
+                    blob_offset,
+                    blob_len,
+                    blob_crc32,
+                },
+            inline_blob: _,
+        }) => {
+            trace_zip_czdi(format!(
+                "storage=eocd64 offset={blob_offset} len={blob_len} area_len={}",
+                czdi_eocd_blob.map(|blob| blob.len()).unwrap_or(0)
+            ));
+            let area = match czdi_eocd_blob {
+                Some(area) => area,
+                None => {
+                    trace_zip_czdi("missing eocd64 blob area");
+                    return None;
+                }
+            };
+            let start = match usize::try_from(blob_offset) {
+                Ok(value) => value,
+                Err(_) => {
+                    trace_zip_czdi("blob offset conversion failed");
+                    return None;
+                }
+            };
+            let len = match usize::try_from(blob_len) {
+                Ok(value) => value,
+                Err(_) => {
+                    trace_zip_czdi("blob length conversion failed");
+                    return None;
+                }
+            };
+            let end = match start.checked_add(len) {
+                Some(value) => value,
+                None => {
+                    trace_zip_czdi("blob range overflow");
+                    return None;
+                }
+            };
+            let blob = match area.get(start..end) {
+                Some(blob) => blob,
+                None => {
+                    trace_zip_czdi(format!(
+                        "blob slice out of range: start={start} end={end} area_len={}",
+                        area.len()
+                    ));
+                    return None;
+                }
+            };
+            if crc32fast::hash(blob) != blob_crc32 {
+                trace_zip_czdi(format!(
+                    "blob crc mismatch expected={blob_crc32:#010x} actual={:#010x}",
+                    crc32fast::hash(blob)
+                ));
+                return None;
+            }
+            Some(blob.to_vec())
+        }
+        Some(CzdiParsedExtra {
+            kind: CzdiExtraKind::None,
+            inline_blob: _,
+        })
+        | None => None,
+    };
+
+    match czdi_blob.as_deref() {
+        Some(blob) => match DeflateChunkIndex::decode_czdi_v1(blob) {
+            Ok(index) => {
+                trace_zip_czdi(format!(
+                    "decoded czdi index chunks={} chunk_size={} compressed_size={} uncompressed_size={}",
+                    index.chunk_count, index.chunk_size, index.compressed_size, index.uncompressed_size
+                ));
+                Some(index)
+            }
+            Err(error) => {
+                trace_zip_czdi(format!("decode_czdi_v1 error: {error}"));
+                None
+            }
+        },
+        None => {
+            trace_zip_czdi("czdi blob absent");
+            None
+        }
+    }
+}
+
+fn trace_zip_czdi(message: impl AsRef<str>) {
+    if env::var_os("COZIP_ZIP_CZDI_TRACE").is_none() {
+        return;
+    }
+    let path = env::temp_dir().join("cozip-zip-czdi-trace.log");
+    let line = format!("{}\n", message.as_ref());
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
 fn pdeflate_archive_dispatch_loop(
@@ -4343,5 +4743,32 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn read_central_directory_entries_ignores_invalid_large_czdi_blob() {
+        let large_blob = vec![0xAB_u8; usize::from(u16::MAX)];
+        let state = ZipWriteState {
+            central_entries: vec![ZipCentralWriteEntry {
+                name: "payload.bin".to_string(),
+                gp_flags: GP_FLAG_UTF8,
+                crc: 0,
+                compressed_size: 1,
+                uncompressed_size: 1,
+                local_header_offset: 0,
+                czdi_blob: Some(large_blob),
+            }],
+            offset: 0,
+            stats: CoZipStats::default(),
+        };
+
+        let mut bytes = Vec::new();
+        state.finish(&mut bytes).expect("write synthetic zip");
+
+        let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+        let (entries, _) = read_central_directory_entries(&mut reader).expect("read central dir");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]._czdi_index.is_none());
+        assert_eq!(entries[0].name, "payload.bin");
     }
 }

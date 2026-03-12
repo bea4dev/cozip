@@ -10,6 +10,7 @@ status.runtime_title = "Runtime profile"
 status.runtime_body = "Mock UI wired for CoZip / CoZipPDeflate orchestration and future live job telemetry."
 
 common.enabled = "Enabled"
+common.enabled_single_thread = "Enabled (Single-thread)"
 common.disabled = "Disabled"
 common.cancel = "Cancel"
 common.close = "Close"

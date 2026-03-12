@@ -11,8 +11,8 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 use crate::i18n::I18n;
 use crate::jobs::{JobSnapshot, JobStatus, SharedJobSnapshot, spawn_job};
 use crate::launch::{
-    ArchiveFormat, CompressMode, CompressPlan, DesktopCommand, ExtractPlan, InitialScreen,
-    LaunchRequest, cycle_archive_format,
+    ArchiveFormat, CompressMode, CompressPlan, DesktopCommand, ExtractDecodeHint, ExtractPlan,
+    InitialScreen, LaunchRequest, cycle_archive_format,
 };
 use crate::screens::widgets::{action_button, labeled_value, panel, progress_bar, separator};
 
@@ -735,13 +735,33 @@ impl CozipDesktopApp {
                 cx,
             ));
 
+        if plan.has_zip_tasks() {
+            let zip_opts = &plan.zip_options;
+            form = form.child(self.settings_row(
+                self.t("settings.parallel_write_threads"),
+                self.stepper_control(
+                    "dec-zip-parallel-write-threads",
+                    "inc-zip-parallel-write-threads",
+                    zip_opts.parallel_write_threads.to_string(),
+                    |this, _, _| {
+                        if let Some(plan) = this.extract_plan_mut() {
+                            plan.zip_options.parallel_write_threads =
+                                plan.zip_options.parallel_write_threads.saturating_sub(1).max(1);
+                        }
+                    },
+                    |this, _, _| {
+                        if let Some(plan) = this.extract_plan_mut() {
+                            plan.zip_options.parallel_write_threads =
+                                plan.zip_options.parallel_write_threads.saturating_add(1).min(128);
+                        }
+                    },
+                    cx,
+                ),
+            ));
+        }
+
         if !plan.has_pdeflate_tasks() {
-            return form.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x475569))
-                    .child(self.t("settings.no_pdeflate_options")),
-            );
+            return form;
         }
 
         let opts = &plan.pdeflate_options;
@@ -1281,13 +1301,39 @@ impl CozipDesktopApp {
     }
 
     fn runtime_line(&self) -> String {
-        let cpu_enabled = self.t("common.enabled");
+        let cpu_enabled = self.cpu_runtime_text();
         let gpu_enabled = if self.gpu_enabled() {
             self.t("common.enabled")
         } else {
             self.t("common.disabled")
         };
         format!("CPU: {cpu_enabled} | GPU: {gpu_enabled}")
+    }
+
+    fn cpu_runtime_text(&self) -> SharedString {
+        match self.command() {
+            Some(DesktopCommand::Extract(plan)) => match self.current_extract_task(plan) {
+                Some(task) if task.decode_hint == ExtractDecodeHint::SingleThread => {
+                    self.t("common.enabled_single_thread")
+                }
+                _ => self.t("common.enabled"),
+            },
+            _ => self.t("common.enabled"),
+        }
+    }
+
+    fn current_extract_task<'a>(
+        &self,
+        plan: &'a ExtractPlan,
+    ) -> Option<&'a crate::launch::ExtractTask> {
+        if plan.tasks.is_empty() {
+            return None;
+        }
+        let index = self
+            .job_snapshot
+            .completed_tasks
+            .min(plan.tasks.len().saturating_sub(1));
+        plan.tasks.get(index)
     }
 
     fn gpu_enabled(&self) -> bool {

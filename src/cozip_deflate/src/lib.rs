@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fs::File as StdFile;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -6,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use thiserror::Error;
+
+use cozip_util::{ParallelFileWriter, ParallelFileWriterOptions};
 
 const LITLEN_SYMBOL_COUNT: usize = 286;
 const DIST_SYMBOL_COUNT: usize = 30;
@@ -207,6 +210,17 @@ impl CoZipDeflate {
     ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
         let _ = self;
         deflate_decompress_stream_indexed_on_cpu(reader, writer, index)
+    }
+
+    pub fn deflate_decompress_stream_zip_compatible_with_index_parallel_write<R: Read + Send>(
+        &self,
+        reader: &mut R,
+        output_file: StdFile,
+        index: &DeflateChunkIndex,
+        writer_options: ParallelFileWriterOptions,
+    ) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+        let _ = self;
+        deflate_decompress_stream_indexed_parallel_write(reader, output_file, index, writer_options)
     }
 }
 
@@ -1219,6 +1233,390 @@ pub fn deflate_decompress_stream_indexed_on_cpu<R: Read + Send, W: Write>(
     let mut options = HybridOptions::default();
     options.prefer_gpu = false;
     deflate_decompress_stream_hybrid_indexed_with_context(reader, writer, index, &options, None)
+}
+
+fn deflate_decompress_stream_indexed_parallel_write<R: Read + Send>(
+    reader: &mut R,
+    output_file: StdFile,
+    index: &DeflateChunkIndex,
+    writer_options: ParallelFileWriterOptions,
+) -> Result<DeflateCpuStreamStats, CozipDeflateError> {
+    if usize::try_from(index.chunk_count).ok() != Some(index.entries.len()) {
+        return Err(CozipDeflateError::InvalidFrame(
+            "chunk_count and entries length mismatch",
+        ));
+    }
+
+    let task_count = index.entries.len();
+    let entries = Arc::<[DeflateChunkIndexEntry]>::from(index.entries.clone().into_boxed_slice());
+    let mut offsets = Vec::with_capacity(task_count);
+    let mut next_offset = 0_u64;
+    for entry in entries.iter() {
+        offsets.push(next_offset);
+        next_offset = next_offset
+            .checked_add(u64::from(entry.raw_len))
+            .ok_or(CozipDeflateError::DataTooLarge)?;
+    }
+    if next_offset != index.uncompressed_size {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed uncompressed size mismatch",
+        ));
+    }
+    output_file.set_len(index.uncompressed_size)?;
+
+    #[derive(Debug, Clone)]
+    struct StreamDecodeTask {
+        index: usize,
+        prepared: PreparedIndexedChunk,
+    }
+
+    #[derive(Debug, Default)]
+    struct StreamDecodeTaskQueueState {
+        queue: VecDeque<StreamDecodeTask>,
+        queued_bytes: usize,
+        closed: bool,
+    }
+
+    let queue_state = Arc::new((
+        Mutex::new(StreamDecodeTaskQueueState::default()),
+        Condvar::new(),
+    ));
+    let error = Arc::new(Mutex::new(None::<CozipDeflateError>));
+    let counters = Arc::new(WorkerCounters::default());
+    let producer_stats = Arc::new(Mutex::new((0_u64, 0_u32)));
+    let crc_slots = Arc::new(Mutex::new(vec![None::<(u32, u64)>; task_count]));
+    let output_offsets = Arc::<[u64]>::from(offsets.into_boxed_slice());
+    let writer = Arc::new(
+        ParallelFileWriter::new(output_file, writer_options)
+            .map_err(|error| CozipDeflateError::Io(std::io::Error::other(error.to_string())))?,
+    );
+
+    let cpu_workers = cpu_worker_count(false).min(task_count.max(1));
+    let chunk_size = usize::try_from(index.chunk_size)
+        .map_err(|_| CozipDeflateError::DataTooLarge)?
+        .max(1);
+    let decode_queue_byte_cap = chunk_size
+        .saturating_mul(cpu_workers.max(1))
+        .saturating_mul(4)
+        .max(chunk_size);
+    let decode_queue_low_watermark = (decode_queue_byte_cap / 2).max(chunk_size);
+    let mut handles = Vec::with_capacity(cpu_workers);
+
+    for _ in 0..cpu_workers {
+        let queue_ref = Arc::clone(&queue_state);
+        let err_ref = Arc::clone(&error);
+        let counters_ref = Arc::clone(&counters);
+        let entries_ref = Arc::clone(&entries);
+        let offsets_ref = Arc::clone(&output_offsets);
+        let writer_ref = Arc::clone(&writer);
+        let crc_slots_ref = Arc::clone(&crc_slots);
+        handles.push(std::thread::spawn(move || loop {
+            if has_error(&err_ref) {
+                break;
+            }
+            let task = {
+                let (queue_lock, queue_cv) = &*queue_ref;
+                let mut state = match lock(queue_lock) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        break;
+                    }
+                };
+                loop {
+                    if let Some(task) = state.queue.pop_front() {
+                        state.queued_bytes =
+                            state.queued_bytes.saturating_sub(task.prepared.chunk.len());
+                        if state.queued_bytes < decode_queue_low_watermark {
+                            queue_cv.notify_all();
+                        }
+                        break Some(task);
+                    }
+                    if state.closed {
+                        break None;
+                    }
+                    counters_ref.cpu_yield_events.fetch_add(1, Ordering::Relaxed);
+                    let wait_start = Instant::now();
+                    state = match wait_on_condvar(queue_cv, state) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            set_error(&err_ref, err);
+                            return;
+                        }
+                    };
+                    counters_ref.cpu_wait_for_task_ns.fetch_add(
+                        wait_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            };
+
+            let Some(task) = task else {
+                counters_ref.cpu_no_task_events.fetch_add(1, Ordering::Relaxed);
+                break;
+            };
+
+            let decode_start = Instant::now();
+            let raw = match decode_prepared_chunk_on_cpu(&task.prepared) {
+                Ok(value) => value,
+                Err(err) => {
+                    set_error(&err_ref, err);
+                    break;
+                }
+            };
+            counters_ref
+                .cpu_busy_ns
+                .fetch_add(decode_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            counters_ref.cpu_chunks.fetch_add(1, Ordering::Relaxed);
+
+            let crc = crc32fast::hash(&raw);
+            let output_offset = match offsets_ref.get(task.index).copied() {
+                Some(value) => value,
+                None => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::Internal("decoded chunk index out of range"),
+                    );
+                    break;
+                }
+            };
+            if let Err(err) = writer_ref
+                .submit(output_offset, raw)
+                .map_err(|error| CozipDeflateError::Io(std::io::Error::other(error.to_string())))
+            {
+                set_error(&err_ref, err);
+                break;
+            }
+
+            let raw_len = match entries_ref.get(task.index) {
+                Some(entry) => u64::from(entry.raw_len),
+                None => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::Internal("decoded chunk index out of range"),
+                    );
+                    break;
+                }
+            };
+            let mut slots = match lock(&crc_slots_ref) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    set_error(&err_ref, err);
+                    break;
+                }
+            };
+            let slot = match slots.get_mut(task.index) {
+                Some(value) => value,
+                None => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::Internal("decoded chunk crc slot out of range"),
+                    );
+                    break;
+                }
+            };
+            if slot.is_some() {
+                set_error(
+                    &err_ref,
+                    CozipDeflateError::Internal("duplicate decoded chunk index"),
+                );
+                break;
+            }
+            *slot = Some((crc, raw_len));
+        }));
+    }
+
+    let mut stats = DeflateCpuStreamStats::default();
+    stats.chunk_count = task_count;
+    stats.gpu_available = false;
+
+    std::thread::scope(|scope| -> Result<(), CozipDeflateError> {
+        let queue_ref = Arc::clone(&queue_state);
+        let err_ref = Arc::clone(&error);
+        let entries_ref = Arc::clone(&entries);
+        let producer_stats_ref = Arc::clone(&producer_stats);
+        scope.spawn(move || {
+            let mut compressed = Vec::new();
+            let mut hasher = crc32fast::Hasher::new();
+            let mut bytes_read = 0usize;
+            let mut dropped_prefix_bytes = 0usize;
+            for (idx, entry) in entries_ref.iter().copied().enumerate() {
+                let absolute_start_bit = usize::try_from(entry.comp_bit_off).unwrap_or(usize::MAX);
+                let relative_start_bit =
+                    absolute_start_bit.saturating_sub(dropped_prefix_bytes.saturating_mul(8));
+                let relative_end_bit = relative_start_bit
+                    .saturating_add(usize::try_from(entry.comp_bit_len).unwrap_or(usize::MAX));
+                let required_bytes = relative_end_bit.div_ceil(8);
+                while compressed.len() < required_bytes {
+                    let remaining = required_bytes.saturating_sub(compressed.len());
+                    let mut chunk = vec![0u8; remaining.min(256 * 1024)];
+                    let read = match reader.read(&mut chunk) {
+                        Ok(read) => read,
+                        Err(err) => {
+                            set_error(&err_ref, err.into());
+                            return;
+                        }
+                    };
+                    if read == 0 {
+                        set_error(
+                            &err_ref,
+                            CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                        );
+                        return;
+                    }
+                    hasher.update(&chunk[..read]);
+                    compressed.extend_from_slice(&chunk[..read]);
+                    bytes_read = bytes_read.saturating_add(read);
+                }
+
+                let mut relative_entry = entry;
+                relative_entry.comp_bit_off = u64::try_from(relative_start_bit)
+                    .map_err(|_| CozipDeflateError::DataTooLarge)
+                    .unwrap_or(u64::MAX);
+                let prepared = match prepare_indexed_chunk_for_decode(&compressed, relative_entry) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                };
+
+                let (queue_lock, queue_cv) = &*queue_ref;
+                let mut state = match lock(queue_lock) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        set_error(&err_ref, err);
+                        return;
+                    }
+                };
+                while state.queued_bytes >= decode_queue_byte_cap && !state.closed {
+                    state = match wait_on_condvar(queue_cv, state) {
+                        Ok(guard) => guard,
+                        Err(err) => {
+                            set_error(&err_ref, err);
+                            return;
+                        }
+                    };
+                }
+                state.queue.push_back(StreamDecodeTask {
+                    index: idx,
+                    prepared: prepared.clone(),
+                });
+                state.queued_bytes = state.queued_bytes.saturating_add(prepared.chunk.len());
+                queue_cv.notify_all();
+
+                if let Some(next_entry) = entries_ref.get(idx + 1).copied() {
+                    let next_keep_byte =
+                        usize::try_from(next_entry.comp_bit_off / 8).unwrap_or(usize::MAX);
+                    if next_keep_byte > dropped_prefix_bytes {
+                        let drop_bytes =
+                            (next_keep_byte - dropped_prefix_bytes).min(compressed.len());
+                        compressed.drain(0..drop_bytes);
+                        dropped_prefix_bytes = dropped_prefix_bytes.saturating_add(drop_bytes);
+                    }
+                }
+            }
+
+            while bytes_read < index.compressed_size as usize {
+                let remaining = (index.compressed_size as usize).saturating_sub(bytes_read);
+                let mut chunk = vec![0u8; remaining.min(256 * 1024)];
+                let read = match reader.read(&mut chunk) {
+                    Ok(read) => read,
+                    Err(err) => {
+                        set_error(&err_ref, err.into());
+                        return;
+                    }
+                };
+                if read == 0 {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                    );
+                    return;
+                }
+                hasher.update(&chunk[..read]);
+                bytes_read = bytes_read.saturating_add(read);
+            }
+
+            let mut trailing = [0u8; 1];
+            match reader.read(&mut trailing) {
+                Ok(0) => {}
+                Ok(_) => {
+                    set_error(
+                        &err_ref,
+                        CozipDeflateError::InvalidFrame("indexed compressed size mismatch"),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    set_error(&err_ref, err.into());
+                    return;
+                }
+            }
+
+            if let Ok(mut producer_stats) = lock(&producer_stats_ref) {
+                *producer_stats = (bytes_read as u64, hasher.finalize());
+            }
+            let (queue_lock, queue_cv) = &*queue_ref;
+            if let Ok(mut state) = lock(queue_lock) {
+                state.closed = true;
+                queue_cv.notify_all();
+            }
+        });
+
+        Ok(())
+    })?;
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    if let Some(err) = lock(&error)?.take() {
+        return Err(err);
+    }
+
+    writer
+        .drain()
+        .map_err(|error| CozipDeflateError::Io(std::io::Error::other(error.to_string())))?;
+
+    let (input_bytes, input_crc32) = *lock(&producer_stats)?;
+    stats.input_bytes = input_bytes;
+    stats.input_crc32 = input_crc32;
+    stats.output_bytes = index.uncompressed_size;
+
+    let slots = lock(&crc_slots)?;
+    let mut combined_crc = 0_u32;
+    let mut combined_len = 0_u64;
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some((chunk_crc, chunk_len)) = slot else {
+            return Err(CozipDeflateError::Internal(
+                "parallel decoded chunk crc missing",
+            ));
+        };
+        if idx == 0 {
+            combined_crc = *chunk_crc;
+            combined_len = *chunk_len;
+            continue;
+        }
+        combined_crc = crc32_combine(combined_crc, *chunk_crc, *chunk_len);
+        combined_len = combined_len.saturating_add(*chunk_len);
+    }
+    if combined_len != index.uncompressed_size {
+        return Err(CozipDeflateError::InvalidFrame(
+            "indexed uncompressed size mismatch",
+        ));
+    }
+    stats.output_crc32 = combined_crc;
+
+    let counter_snapshot = counters.snapshot();
+    stats.cpu_worker_busy_ms = counter_snapshot.cpu_busy_ms;
+    stats.cpu_queue_lock_wait_ms = counter_snapshot.cpu_queue_lock_wait_ms;
+    stats.cpu_wait_for_task_ms = counter_snapshot.cpu_wait_for_task_ms;
+    stats.cpu_worker_chunks = counter_snapshot.cpu_chunks_done;
+    stats.cpu_no_task_events = counter_snapshot.cpu_no_task_events;
+    stats.cpu_yield_events = counter_snapshot.cpu_yield_events;
+    stats.decode_prepare_ms = counter_snapshot.decode_prepare_ms;
+    Ok(stats)
 }
 
 fn decode_cpu_indexed_worker(
@@ -3334,6 +3732,66 @@ impl<W: Write> Write for HashingCountWriter<'_, W> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
+    }
+}
+
+fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+
+    let mut even = [0_u32; 32];
+    let mut odd = [0_u32; 32];
+    odd[0] = 0xedb8_8320;
+    let mut row = 1_u32;
+    for item in odd.iter_mut().skip(1) {
+        *item = row;
+        row <<= 1;
+    }
+
+    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square(&mut odd, &even);
+
+    let mut crc1_acc = crc1;
+    let mut remaining = len2;
+    loop {
+        gf2_matrix_square(&mut even, &odd);
+        if (remaining & 1) != 0 {
+            crc1_acc = gf2_matrix_times(&even, crc1_acc);
+        }
+        remaining >>= 1;
+        if remaining == 0 {
+            break;
+        }
+        gf2_matrix_square(&mut odd, &even);
+        if (remaining & 1) != 0 {
+            crc1_acc = gf2_matrix_times(&odd, crc1_acc);
+        }
+        remaining >>= 1;
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    crc1_acc ^ crc2
+}
+
+fn gf2_matrix_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0_u32;
+    let mut idx = 0_usize;
+    while vec != 0 {
+        if (vec & 1) != 0 {
+            sum ^= mat[idx];
+        }
+        vec >>= 1;
+        idx += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
+    for index in 0..32 {
+        square[index] = gf2_matrix_times(mat, mat[index]);
     }
 }
 

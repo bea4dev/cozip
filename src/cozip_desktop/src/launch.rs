@@ -4,8 +4,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use cozip::{
-    CoZipArchiveFormat, CoZipArchiveInfo, CoZipArchiveKind, ZipDeflateMode, ZipOptions,
-    inspect_archive_from_name,
+    CoZipArchiveDecodeHint, CoZipArchiveFormat, CoZipArchiveInfo, CoZipArchiveKind,
+    ZipDeflateMode, ZipOptions, inspect_archive_decode_hint_from_name, inspect_archive_from_name,
 };
 use cozip_pdeflate::{PDeflateOptions, pdeflate_stream_suggested_name};
 
@@ -59,6 +59,7 @@ pub struct ExtractPlan {
     pub tasks: Vec<ExtractTask>,
     pub ignored_inputs: Vec<PathBuf>,
     pub output_dir: PathBuf,
+    pub zip_options: ZipOptions,
     pub pdeflate_options: PDeflateOptions,
 }
 
@@ -69,12 +70,19 @@ pub struct ExtractTask {
     pub archive_kind: ExtractArchiveKind,
     pub container_dir_name: PathBuf,
     pub single_file_name: Option<PathBuf>,
+    pub decode_hint: ExtractDecodeHint,
 }
 
 #[derive(Clone, Debug)]
 pub enum ExtractArchiveKind {
     SingleFile,
     Directory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtractDecodeHint {
+    SingleThread,
+    Parallel,
 }
 
 impl LaunchRequest {
@@ -112,6 +120,12 @@ impl ExtractPlan {
         self.tasks
             .iter()
             .any(|task| task.archive_format == ArchiveFormat::Cozip)
+    }
+
+    pub fn has_zip_tasks(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.archive_format == ArchiveFormat::Zip)
     }
 }
 
@@ -330,7 +344,11 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
             match inspect_archive_from_name(&input) {
                 Ok(info) => {
                     if seen.insert(input.clone()) {
-                        tasks.push(build_extract_task(input, info));
+                        tasks.push(build_extract_task(
+                            input.clone(),
+                            info,
+                            extract_decode_hint_for_path(&input),
+                        ));
                     }
                 }
                 Err(_) => {
@@ -343,6 +361,7 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                                     suggested_name: suggested_name_from_pdeflate_path(&input),
                                 },
                             },
+                            ExtractDecodeHint::Parallel,
                         ));
                     } else {
                         ignored.push(input);
@@ -365,7 +384,11 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                 }
                 if let Ok(info) = inspect_archive_from_name(&path) {
                     if seen.insert(path.clone()) {
-                        tasks.push(build_extract_task(path, info));
+                        tasks.push(build_extract_task(
+                            path.clone(),
+                            info,
+                            extract_decode_hint_for_path(&path),
+                        ));
                     }
                 } else if is_probable_pdeflate_archive_path(&path) && seen.insert(path.clone()) {
                     tasks.push(build_extract_task(
@@ -376,6 +399,7 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
                                 suggested_name: suggested_name_from_pdeflate_path(&path),
                             },
                         },
+                        ExtractDecodeHint::Parallel,
                     ));
                 }
             }
@@ -398,11 +422,16 @@ fn build_extract_plan(inputs: Vec<PathBuf>) -> Result<ExtractPlan, String> {
         tasks,
         ignored_inputs: ignored,
         output_dir,
+        zip_options: ZipOptions::default(),
         pdeflate_options: PDeflateOptions::default(),
     })
 }
 
-fn build_extract_task(path: PathBuf, info: CoZipArchiveInfo) -> ExtractTask {
+fn build_extract_task(
+    path: PathBuf,
+    info: CoZipArchiveInfo,
+    decode_hint: ExtractDecodeHint,
+) -> ExtractTask {
     let archive_format = match info.format {
         CoZipArchiveFormat::Zip => ArchiveFormat::Zip,
         CoZipArchiveFormat::PDeflate => ArchiveFormat::Cozip,
@@ -431,6 +460,14 @@ fn build_extract_task(path: PathBuf, info: CoZipArchiveInfo) -> ExtractTask {
         archive_kind,
         container_dir_name,
         single_file_name,
+        decode_hint,
+    }
+}
+
+fn extract_decode_hint_for_path(path: &Path) -> ExtractDecodeHint {
+    match inspect_archive_decode_hint_from_name(path) {
+        Ok(CoZipArchiveDecodeHint::Parallel) => ExtractDecodeHint::Parallel,
+        Ok(CoZipArchiveDecodeHint::SingleThread) | Err(_) => ExtractDecodeHint::SingleThread,
     }
 }
 
