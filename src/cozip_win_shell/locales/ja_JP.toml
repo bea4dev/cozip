@@ -3,8 +3,8 @@ compress_root = "圧縮"
 compress_zip = "zip (CPU + GPU)"
 compress_cozip = "cozip (試験的) (CPU + GPU)"
 compress_details = "詳細設定"
-extract_root = "解凍"
-extract_here = "ここに解凍"
+extract_root = "展開"
+extract_here = "ここに展開"
 extract_details = "詳細設定"
 
 [registration]
