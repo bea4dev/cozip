@@ -1,5 +1,5 @@
 [window]
-title = "CoZip セットアップ"
+title = "CoZip のセットアップ"
 
 [header]
 title = "CoZip セットアップウィザード"
@@ -15,34 +15,34 @@ accept = "ライセンス契約の条項に同意します"
 
 [options]
 title = "インストールオプション"
-description = "適用するセットアップオプションを選択してください。"
-explorer_menu = "エクスプローラのコンテキストメニューに追加"
+description = "適用するインストールオプションを選択してください。"
+explorer_menu = "エクスプローラーのコンテキストメニューに追加する"
 
 [install]
 title = "インストール中"
-description = "セットアップはファイルのコピーとシステム設定を行っています。"
-status_preparing = "インストールを準備しています..."
-status_downloading = "最新リリースをダウンロードしています..."
-status_extracting = "アプリケーション ファイルをコピーしています..."
-status_registering = "レジストリとエクスプローラ設定を更新しています..."
+description = "インストールするファイルのコピーとシステム設定を実行中です。"
+status_preparing = "インストールを準備中です..."
+status_downloading = "最新リリースをダウンロード中です..."
+status_extracting = "アプリケーションファイルをコピー中です..."
+status_registering = "レジストリとエクスプローラーの設定を更新中です..."
 status_completed = "インストールが完了しました。"
 
 [complete]
 title = "完了"
 description = "CoZip のインストールが完了しました。"
-menu_enabled = "エクスプローラのコンテキストメニューを追加しました。"
-menu_disabled = "エクスプローラのコンテキストメニューは追加していません。"
+menu_enabled = "エクスプローラーのコンテキストメニューを追加しました。"
+menu_disabled = "エクスプローラーのコンテキストメニューを追加していません。"
 status_label = "状態"
 state = "インストールが完了しました。"
 note = "メモ"
-menu_registration_failed = "エクスプローラメニューの登録に失敗しました。"
-restart_required_note = "右クリックメニューは再起動後に反映されます。"
+menu_registration_failed = "コンテキストメニューの登録に失敗しました。"
+restart_required_note = "コンテキストメニューは再起動後に適用されます。"
 
 [footer]
 license = "続行するにはライセンスに同意してください。"
 options = "オプションを確認してからインストールを開始してください。"
 installing = "セットアップが完了するまでお待ちください。"
-complete = "完了を押すとセットアップを終了します。"
+complete = "「完了」をクリックでセットアップを終了します。"
 
 [buttons]
 back = "戻る"
