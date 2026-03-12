@@ -157,7 +157,7 @@ fn parse_ui_args(args: &[OsString]) -> Result<LaunchRequest, String> {
     let subcommand = os_to_string(subcommand)?;
     match subcommand.as_str() {
         "compress-details" => parse_compress_args(&args[1..], false),
-        "extract-details" => parse_extract_args(&args[1..], false),
+        "extract-details" => parse_extract_args(args_after_here(args.get(1..).unwrap_or(&[])), false),
         other => Err(format!("unsupported ui subcommand: {other}")),
     }
 }
@@ -235,6 +235,17 @@ fn parse_extract_args(args: &[OsString], auto_start: bool) -> Result<LaunchReque
         auto_start,
         startup_error: None,
     })
+}
+
+fn args_after_here(args: &[OsString]) -> &[OsString] {
+    if let Some(index) = args
+        .iter()
+        .position(|arg| arg.to_str().is_some_and(|value| value == "--here"))
+    {
+        &args[index + 1..]
+    } else {
+        args
+    }
 }
 
 fn build_compress_plan(

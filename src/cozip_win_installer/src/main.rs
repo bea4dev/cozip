@@ -9,15 +9,14 @@ use std::io::{Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use gpui::{
     App, AppContext, Application, Bounds, Context, FontWeight, IntoElement, ParentElement,
-    Render, SharedString, Styled, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, rgb, size,
+    Render, SharedString, Styled, Timer, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -26,9 +25,20 @@ use zip::ZipArchive;
 use crate::i18n::I18n;
 
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE, HWND};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MoveFileExW,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 #[cfg(target_os = "windows")]
@@ -36,7 +46,8 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 const INSTALL_DIR: &str = r"C:\Program Files\CoZip";
 const COZIP_DESKTOP_EXE_PATH: &str = r"C:\Program Files\CoZip\cozip_desktop.exe";
-const COMP_ICON_PATH: &str = r"C:\Program Files\CoZip\icons\comp.ico";
+const COZIP_WIN_SHELL_DLL_PATH: &str = r"C:\Program Files\CoZip\cozip_win_shell.dll";
+const COZIP_WIN_SHELL_TMP_DLL_PATH: &str = r"C:\Program Files\CoZip\cozip_win_shell_tmp.dll";
 const DECOMP_ICON_PATH: &str = r"C:\Program Files\CoZip\icons\decomp.ico";
 const COZIP_FILE_PROG_ID: &str = "CoZip.Archive";
 const RELEASES_API_URL: &str = "https://api.github.com/repos/bea4dev/cozip/releases";
@@ -56,7 +67,7 @@ enum InstallerStep {
 
 enum InstallWorkerMessage {
     Progress(u8),
-    Finished(Result<(), String>),
+    Finished(Result<Option<String>, String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +79,6 @@ struct GithubRelease {
 
 #[derive(Clone, Debug, Deserialize)]
 struct GithubReleaseAsset {
-    name: String,
     browser_download_url: String,
     size: u64,
 }
@@ -185,17 +195,22 @@ impl InstallerApp {
                     }
 
                     if let Some(progress) = latest_progress {
-                        let _ = entity.update(cx, |this, _| {
+                        let _ = entity.update(cx, |this, cx| {
                             this.install_progress = progress;
+                            cx.notify();
                         });
                     }
 
                     if let Some(result) = finished {
-                        let _ = entity.update(cx, |this, _| {
+                        let _ = entity.update(cx, |this, cx| {
                             this.install_progress = 100;
                             this.install_running = false;
                             this.step = InstallerStep::Complete;
-                            this.install_note = result.err();
+                            this.install_note = match result {
+                                Ok(note) => note,
+                                Err(error) => Some(error),
+                            };
+                            cx.notify();
                         });
                         break;
                     }
@@ -313,10 +328,6 @@ impl InstallerApp {
             .flex_col()
             .child(self.content_header(self.t("options.title"), self.t("options.description")))
             .child(value_row(self.t("common.install_dir"), INSTALL_DIR.into()))
-            .child(value_row(
-                self.t("common.start_menu"),
-                self.t("common.start_menu_value"),
-            ))
             .child(self.checkbox(
                 "explorer-menu",
                 self.add_explorer_menu,
@@ -389,7 +400,10 @@ impl InstallerApp {
                     self.t("complete.menu_disabled")
                 },
             ))
-            .child(value_row("Status".into(), self.t("complete.state")))
+            .child(value_row(
+                self.t("complete.status_label"),
+                self.t("complete.state"),
+            ))
             .when_some(self.install_note.as_ref(), |this, note| {
                 this.child(value_row(self.t("complete.note"), note.clone().into()))
             })
@@ -507,15 +521,11 @@ impl Render for InstallerApp {
 
         div()
             .size_full()
-            .bg(rgb(0xe5e7eb))
-            .p_6()
+            .bg(rgb(0xffffff))
             .child(
                 div()
                     .size_full()
                     .bg(rgb(0xffffff))
-                    .border_1()
-                    .rounded_xl()
-                    .border_color(rgb(0xa1a1aa))
                     .flex()
                     .flex_col()
                     .child(self.header())
@@ -533,7 +543,6 @@ impl Render for InstallerApp {
                         div()
                             .px_6()
                             .py_5()
-                            .rounded_b_xl()
                             .border_t_1()
                             .border_color(rgb(0xd4d4d8))
                             .bg(rgb(0xf9fafb))
@@ -623,7 +632,7 @@ fn simple_progress_bar(progress: u8) -> impl IntoElement {
 fn perform_install(
     add_explorer_menu: bool,
     mut on_progress: impl FnMut(u8),
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let mut last_progress = 0_u8;
     let mut report_progress = |progress: u8| {
         if progress > last_progress {
@@ -660,13 +669,15 @@ fn perform_install(
     let _ = fs::remove_file(&temp_zip_path);
     extract_result?;
 
+    let shell_extension_note = install_shell_extension_binaries()?;
+
     install_archive_file_associations()?;
     report_progress(94);
     if add_explorer_menu {
         install_explorer_menu_entries()?;
     }
     report_progress(REGISTRY_PROGRESS_END);
-    Ok(())
+    Ok(shell_extension_note)
 }
 
 fn fetch_latest_release_asset(client: &Client) -> Result<GithubReleaseAsset, String> {
@@ -688,7 +699,13 @@ fn fetch_latest_release_asset(client: &Client) -> Result<GithubReleaseAsset, Str
             release
                 .assets
                 .into_iter()
-                .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
+                .find(|asset| {
+                    asset
+                        .browser_download_url
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
+                })
         })
         .ok_or_else(|| "latest stable release does not contain pack.zip".to_string())
 }
@@ -744,10 +761,6 @@ fn extract_pack_archive(
     install_dir: &Path,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), String> {
-    if install_dir.exists() {
-        fs::remove_dir_all(install_dir)
-            .map_err(|error| format!("failed to clear {}: {error}", install_dir.display()))?;
-    }
     fs::create_dir_all(install_dir)
         .map_err(|error| format!("failed to create {}: {error}", install_dir.display()))?;
 
@@ -826,105 +839,77 @@ fn installer_temp_zip_path() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
+fn install_shell_extension_binaries() -> Result<Option<String>, String> {
+    let tmp_path = Path::new(COZIP_WIN_SHELL_TMP_DLL_PATH);
+    if !tmp_path.exists() {
+        return Ok(None);
+    }
+
+    let target_path = Path::new(COZIP_WIN_SHELL_DLL_PATH);
+    match fs::copy(tmp_path, target_path) {
+        Ok(_) => {
+            let _ = fs::remove_file(tmp_path);
+            Ok(None)
+        }
+        Err(copy_error) => {
+            schedule_replace_on_reboot(tmp_path, target_path)?;
+            Ok(Some(format!(
+                "{} ({copy_error})",
+                I18n::load().text("complete.restart_required_note")
+            )))
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_shell_extension_binaries() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_replace_on_reboot(source: &Path, target: &Path) -> Result<(), String> {
+    let source_wide = to_wide(source.as_os_str());
+    let target_wide = to_wide(target.as_os_str());
+    let ok = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if ok == 0 {
+        Err(format!(
+            "failed to schedule shell extension replacement on reboot: {} -> {}",
+            source.display(),
+            target.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn install_explorer_menu_entries() -> Result<(), String> {
-    let compress_root = r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipCompress";
-    let extract_root = r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipExtract";
-    let compress_subcommands = r"HKCU\Software\Classes\CoZip.ContextMenus\Compress";
-    let extract_subcommands = r"HKCU\Software\Classes\CoZip.ContextMenus\Extract";
-
-    let _ = reg_delete_tree(compress_subcommands);
-    let _ = reg_delete_tree(extract_subcommands);
-
-    reg_add_value(compress_root, Some("MUIVerb"), "圧縮")?;
-    reg_add_value(compress_root, Some("Icon"), COMP_ICON_PATH)?;
-    reg_add_value(compress_root, Some("MultiSelectModel"), "Player")?;
-    reg_add_value(
-        compress_root,
-        Some("ExtendedSubCommandsKey"),
-        r"CoZip.ContextMenus\Compress",
-    )?;
-
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\01_zip_gpu"),
-        Some("MUIVerb"),
-        "zip (CPU + GPU)",
-    )?;
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\01_zip_gpu\command"),
-        None,
-        &format!(r#""{COZIP_DESKTOP_EXE_PATH}" compress --format zip --hybrid %*"#),
-    )?;
-
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\02_cozip_gpu"),
-        Some("MUIVerb"),
-        "cozip (試験的) (CPU + GPU)",
-    )?;
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\02_cozip_gpu\command"),
-        None,
-        &format!(r#""{COZIP_DESKTOP_EXE_PATH}" compress --format cozip --hybrid %*"#),
-    )?;
-
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\03_details"),
-        Some("MUIVerb"),
-        "詳細設定",
-    )?;
-    reg_add_value(
-        &format!(r"{compress_subcommands}\shell\03_details\command"),
-        None,
-        &format!(r#""{COZIP_DESKTOP_EXE_PATH}" ui compress-details %*"#),
-    )?;
-
-    reg_add_value(extract_root, Some("MUIVerb"), "解凍")?;
-    reg_add_value(extract_root, Some("Icon"), DECOMP_ICON_PATH)?;
-    reg_add_value(extract_root, Some("MultiSelectModel"), "Player")?;
-    reg_add_value(
-        extract_root,
-        Some("ExtendedSubCommandsKey"),
-        r"CoZip.ContextMenus\Extract",
-    )?;
-
-    reg_add_value(
-        &format!(r"{extract_subcommands}\shell\01_extract_here"),
-        Some("MUIVerb"),
-        "ここに解凍",
-    )?;
-    reg_add_value(
-        &format!(r"{extract_subcommands}\shell\01_extract_here\command"),
-        None,
-        &format!(r#""{COZIP_DESKTOP_EXE_PATH}" extract --here "%1" %*"#),
-    )?;
-
-    reg_add_value(
-        &format!(r"{extract_subcommands}\shell\02_details"),
-        Some("MUIVerb"),
-        "詳細設定",
-    )?;
-    reg_add_value(
-        &format!(r"{extract_subcommands}\shell\02_details\command"),
-        None,
-        &format!(r#""{COZIP_DESKTOP_EXE_PATH}" ui extract-details "%1" %*"#),
-    )?;
-
-    Ok(())
+    uninstall_legacy_static_explorer_menu_entries()?;
+    if !Path::new(COZIP_WIN_SHELL_DLL_PATH).exists() {
+        return Err(format!(
+            "shell extension dll is missing: {COZIP_WIN_SHELL_DLL_PATH}"
+        ));
+    }
+    call_shell_extension_registration(COZIP_WIN_SHELL_DLL_PATH, b"DllRegisterServer\0")
 }
 
 #[cfg(target_os = "windows")]
 fn install_archive_file_associations() -> Result<(), String> {
-    let extension_key = r"HKCU\Software\Classes\.cozip";
-    let prog_id_key = r"HKCU\Software\Classes\CoZip.Archive";
-
-    reg_add_value(extension_key, None, COZIP_FILE_PROG_ID)?;
-    reg_add_value(prog_id_key, None, "CoZip Archive")?;
-    reg_add_value(
-        &format!(r"{prog_id_key}\DefaultIcon"),
+    reg_set_sz_value(r"Software\Classes\.cozip", None, COZIP_FILE_PROG_ID)?;
+    reg_set_sz_value(r"Software\Classes\CoZip.Archive", None, "CoZip Archive")?;
+    reg_set_sz_value(
+        r"Software\Classes\CoZip.Archive\DefaultIcon",
         None,
         DECOMP_ICON_PATH,
     )?;
-    reg_add_value(
-        &format!(r"{prog_id_key}\shell\open\command"),
+    reg_set_sz_value(
+        r"Software\Classes\CoZip.Archive\shell\open\command",
         None,
         &format!(r#""{COZIP_DESKTOP_EXE_PATH}" extract --here "%1""#),
     )?;
@@ -943,51 +928,28 @@ fn install_explorer_menu_entries() -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn reg_add_value(key: &str, value_name: Option<&str>, data: &str) -> Result<(), String> {
-    let mut command = Command::new("reg");
-    command.args(["add", key, "/t", "REG_SZ", "/d", data, "/f"]);
-    match value_name {
-        Some(name) => {
-            command.args(["/v", name]);
-        }
-        None => {
-            command.arg("/ve");
-        }
-    }
-
-    let output = command
-        .output()
-        .map_err(|error| format!("reg add failed for {key}: {error}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        Err(format!("registry write failed for {key}: {detail}"))
+fn reg_delete_tree(key: &str) -> Result<(), String> {
+    let subkey = strip_hkcu_prefix(key)?;
+    let subkey_wide = to_wide(OsStr::new(subkey));
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, subkey_wide.as_ptr()) };
+    match status {
+        0 | 2 | 3 => Ok(()),
+        code => Err(format!("registry delete failed for {key}: win32 error {code}")),
     }
 }
 
 #[cfg(target_os = "windows")]
-fn reg_delete_tree(key: &str) -> Result<(), String> {
-    let output = Command::new("reg")
-        .args(["delete", key, "/f"])
-        .output()
-        .map_err(|error| format!("reg delete failed for {key}: {error}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        if detail.contains("unable to find") || detail.contains("指定されたレジストリ") {
-            Ok(())
-        } else {
-            Err(format!("registry delete failed for {key}: {detail}"))
-        }
+fn uninstall_legacy_static_explorer_menu_entries() -> Result<(), String> {
+    let keys = [
+        r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipCompress",
+        r"HKCU\Software\Classes\AllFilesystemObjects\shell\CozipExtract",
+        r"HKCU\Software\Classes\CoZip.ContextMenus\Compress",
+        r"HKCU\Software\Classes\CoZip.ContextMenus\Extract",
+    ];
+    for key in keys {
+        reg_delete_tree(key)?;
     }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1071,6 +1033,97 @@ fn to_wide(value: &OsStr) -> Vec<u16> {
 }
 
 #[cfg(target_os = "windows")]
+fn reg_set_sz_value(key: &str, value_name: Option<&str>, data: &str) -> Result<(), String> {
+    let key_wide = to_wide(OsStr::new(key));
+    let mut handle: HKEY = std::ptr::null_mut();
+    let create_status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_wide.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut handle,
+            std::ptr::null_mut(),
+        )
+    };
+    if create_status != 0 {
+        return Err(format!(
+            "registry write failed for HKCU\\{key}: win32 error {create_status}"
+        ));
+    }
+
+    let result = (|| {
+        let value_name_wide = value_name.map(|name| to_wide(OsStr::new(name)));
+        let data_wide = to_wide(OsStr::new(data));
+        let value_name_ptr = value_name_wide
+            .as_ref()
+            .map(|wide| wide.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let bytes = u32::try_from(data_wide.len().saturating_mul(2))
+            .map_err(|_| "registry string is too large".to_string())?;
+        let status = unsafe {
+            RegSetValueExW(
+                handle,
+                value_name_ptr,
+                0,
+                REG_SZ,
+                data_wide.as_ptr() as *const u8,
+                bytes,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "registry write failed for HKCU\\{key}: win32 error {status}"
+            ))
+        }
+    })();
+
+    unsafe {
+        RegCloseKey(handle);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn call_shell_extension_registration(dll_path: &str, proc_name: &[u8]) -> Result<(), String> {
+    let dll_wide = to_wide(OsStr::new(dll_path));
+    let module = unsafe { LoadLibraryW(dll_wide.as_ptr()) };
+    if module.is_null() {
+        return Err(format!("failed to load shell extension dll: {dll_path}"));
+    }
+
+    let result = (|| {
+        let proc = unsafe { GetProcAddress(module, proc_name.as_ptr()) };
+        if proc.is_none() {
+            return Err("shell extension registration entry point was not found".to_string());
+        }
+        let callback: unsafe extern "system" fn() -> i32 = unsafe { std::mem::transmute(proc) };
+        let hr = unsafe { callback() };
+        if hr >= 0 {
+            Ok(())
+        } else {
+            Err(format!("shell extension registration failed: HRESULT 0x{hr:08X}"))
+        }
+    })();
+
+    unsafe {
+        FreeLibrary(module);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn strip_hkcu_prefix(key: &str) -> Result<&str, String> {
+    key.strip_prefix(r"HKCU\")
+        .ok_or_else(|| format!("unsupported registry hive path: {key}"))
+}
+
+#[cfg(target_os = "windows")]
 fn quote_windows_arg(arg: &OsStr) -> String {
     let value = arg.to_string_lossy();
     if !value.contains([' ', '\t', '"']) {
@@ -1111,21 +1164,17 @@ fn main() {
     }
 
     let i18n = I18n::load();
-    let title = SharedString::from(i18n.text("window.title").to_string());
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(720.0), px(560.0)), cx);
         let i18n = i18n.clone();
-        let title = title.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title),
-                    ..Default::default()
-                }),
-                app_id: Some("cozip-installer".to_string()),
+                titlebar: Some(Default::default()),
+                window_background: WindowBackgroundAppearance::Opaque,
                 window_min_size: Some(size(px(680.0), px(520.0))),
+                app_id: Some("cozip-installer".to_string()),
                 ..Default::default()
             },
             move |_, cx| cx.new(|_| InstallerApp::new(i18n.clone())),

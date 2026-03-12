@@ -7,8 +7,6 @@ subtitle = "This wizard installs CoZip on your computer."
 
 [common]
 install_dir = "Install location"
-start_menu = "Start Menu shortcut"
-start_menu_value = "Create shortcut"
 
 [license]
 title = "License Agreement"
@@ -34,9 +32,11 @@ title = "Completed"
 description = "CoZip has been installed."
 menu_enabled = "Explorer context menu has been added."
 menu_disabled = "Explorer context menu was not added."
-state = "Wizard flow completed."
+status_label = "Status"
+state = "Installation completed."
 note = "Note"
 menu_registration_failed = "Explorer menu registration failed."
+restart_required_note = "The context menu will appear after restarting Windows."
 
 [footer]
 license = "Accept the license to continue."

@@ -15,7 +15,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         let window_size = match launch.command.as_ref().map(|_| launch.initial_screen) {
             Some(InitialScreen::Compress) | Some(InitialScreen::Decompress) => {
-                size(px(620.0), px(300.0))
+                size(px(620.0), px(350.0))
             }
             Some(InitialScreen::DecompressSettings) => {
                 size(px(760.0), px(520.0))

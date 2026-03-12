@@ -5,7 +5,8 @@ members = [
     "src/cozip_pdeflate",
     "src/cozip_util",
     "src/cozip_desktop",
-    "src/cozip_win_installer"
+    "src/cozip_win_installer",
+    "src/cozip_win_shell"
 ]
 resolver = "2"
 

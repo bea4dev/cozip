@@ -1774,6 +1774,7 @@ impl CoZip {
                     let result_totals = Arc::new(Mutex::new((0usize, 0_u64)));
                     let error_slot = Arc::new(Mutex::new(None::<CoZipError>));
                     let backlog_totals = Arc::new(Mutex::new(vec![0_u64; indexed_file_count]));
+                    let input_ref = Arc::new(Mutex::new(input_file));
                     let worker_count = match &self.backend {
                         CoZipBackend::Zip {
                             parallel_write_threads,
@@ -1789,9 +1790,7 @@ impl CoZip {
                             let error_ref = Arc::clone(&error_slot);
                             let progress_ref = progress.clone();
                             let backlog_ref = Arc::clone(&backlog_totals);
-                            let mut input_ref = input_file
-                                .try_clone()
-                                .expect("zip directory input clone should succeed");
+                            let input_handle = Arc::clone(&input_ref);
                             let deflate_ref = deflate.clone();
                             scope.spawn(move || loop {
                                 let task = {
@@ -1842,6 +1841,18 @@ impl CoZip {
                                 }
 
                                 let task_result: Result<u64, CoZipError> = (|| {
+                                    let compressed = {
+                                        let mut shared_input = match input_handle.lock() {
+                                            Ok(guard) => guard,
+                                            Err(_) => {
+                                                return Err(CoZipError::InvalidZip(
+                                                    "zip directory input handle poisoned",
+                                                ));
+                                            }
+                                        };
+                                        read_entry_compressed_payload(&mut *shared_input, &task.entry)?
+                                    };
+
                                     let output_file = if task.entry._czdi_index.is_some() {
                                         open_output_file_rw_truncate(&task.output_path)?
                                     } else {
@@ -1872,8 +1883,10 @@ impl CoZip {
                                                 progress.advance_bytes(bytes);
                                             }
                                         }) as cozip_util::WriteReporter;
-                                        let stats = extract_indexed_entry_to_parallel_writer(
-                                            &mut input_ref,
+                                        let compressed_size = compressed.len() as u64;
+                                        let mut payload_reader = Cursor::new(compressed);
+                                        let stats = extract_indexed_payload_to_parallel_writer(
+                                            &mut payload_reader,
                                             &task.entry,
                                             output_file,
                                             &deflate_ref,
@@ -1883,6 +1896,7 @@ impl CoZip {
                                                 backlog_reporter: Some(backlog_reporter),
                                                 write_reporter: Some(write_reporter),
                                             },
+                                            compressed_size,
                                         )?;
                                         if let Ok(mut slots) = backlog_ref.lock() {
                                             if let Some(slot) = slots.get_mut(slot_index) {
@@ -1896,14 +1910,14 @@ impl CoZip {
                                         }
                                         Ok(stats.output_bytes)
                                     } else {
-                                        let mut local_reader = BufReader::new(input_ref.try_clone()?);
+                                        let mut payload_reader = Cursor::new(compressed);
                                         if let Some(progress) = &progress_ref {
                                             let mut out_writer = BufWriter::new(ProgressWriter::new(
                                                 output_file,
                                                 Some(progress.clone()),
                                             ));
-                                            let written = extract_entry_to_writer(
-                                                &mut local_reader,
+                                            let written = extract_entry_payload_to_writer(
+                                                &mut payload_reader,
                                                 &task.entry,
                                                 &mut out_writer,
                                                 &deflate_ref,
@@ -1912,8 +1926,8 @@ impl CoZip {
                                             Ok(written)
                                         } else {
                                             let mut out_writer = BufWriter::new(output_file);
-                                            let written = extract_entry_to_writer(
-                                                &mut local_reader,
+                                            let written = extract_entry_payload_to_writer(
+                                                &mut payload_reader,
                                                 &task.entry,
                                                 &mut out_writer,
                                                 &deflate_ref,
@@ -3251,7 +3265,25 @@ fn extract_entry_to_writer<R: Read + Seek + Send, W: Write>(
     deflate: &CoZipDeflate,
 ) -> Result<u64, CoZipError> {
     let compressed_size = position_reader_at_entry_data(reader, entry)?;
+    extract_entry_payload_to_writer_with_size(reader, entry, writer, deflate, compressed_size)
+}
 
+fn extract_entry_payload_to_writer<R: Read + Send, W: Write>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+    writer: &mut W,
+    deflate: &CoZipDeflate,
+) -> Result<u64, CoZipError> {
+    extract_entry_payload_to_writer_with_size(reader, entry, writer, deflate, entry.compressed_size)
+}
+
+fn extract_entry_payload_to_writer_with_size<R: Read + Send, W: Write>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+    writer: &mut W,
+    deflate: &CoZipDeflate,
+    compressed_size: u64,
+) -> Result<u64, CoZipError> {
     let mut limited = reader.take(compressed_size);
     let mut written: u64;
     let mut buf = vec![0_u8; STREAM_BUF_SIZE];
@@ -3339,6 +3371,24 @@ fn extract_indexed_entry_to_parallel_writer<R: Read + Seek + Send>(
     writer_options: ParallelFileWriterOptions,
 ) -> Result<cozip_deflate::DeflateCpuStreamStats, CoZipError> {
     let compressed_size = position_reader_at_entry_data(reader, entry)?;
+    extract_indexed_payload_to_parallel_writer(
+        reader,
+        entry,
+        output_file,
+        deflate,
+        writer_options,
+        compressed_size,
+    )
+}
+
+fn extract_indexed_payload_to_parallel_writer<R: Read + Send>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+    output_file: StdFile,
+    deflate: &CoZipDeflate,
+    writer_options: ParallelFileWriterOptions,
+    compressed_size: u64,
+) -> Result<cozip_deflate::DeflateCpuStreamStats, CoZipError> {
     let Some(index) = entry._czdi_index.as_ref() else {
         return Err(CoZipError::InvalidZip("czdi index is missing"));
     };
@@ -3365,6 +3415,17 @@ fn extract_indexed_entry_to_parallel_writer<R: Read + Seek + Send>(
         return Err(CoZipError::InvalidZip("crc32 mismatch"));
     }
     Ok(stats)
+}
+
+fn read_entry_compressed_payload<R: Read + Seek>(
+    reader: &mut R,
+    entry: &ZipCentralReadEntry,
+) -> Result<Vec<u8>, CoZipError> {
+    let compressed_size = position_reader_at_entry_data(reader, entry)?;
+    let payload_len = usize::try_from(compressed_size).map_err(|_| CoZipError::DataTooLarge)?;
+    let mut payload = vec![0_u8; payload_len];
+    reader.read_exact(&mut payload)?;
+    Ok(payload)
 }
 
 fn position_reader_at_entry_data<R: Read + Seek>(

@@ -1,0 +1,11 @@
+[menu]
+compress_root = "Compress"
+compress_zip = "zip (CPU + GPU)"
+compress_cozip = "cozip (CPU + GPU)"
+compress_details = "Advanced"
+extract_root = "Extract"
+extract_here = "Extract Here"
+extract_details = "Advanced"
+
+[registration]
+command_name = "CoZip Explorer Command"
