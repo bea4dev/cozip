@@ -1,9 +1,16 @@
-# CoZip（日本語）
+<div align="center">
+<h2>CoZip</h2>
+<p>GPUを使用する圧縮解凍ソフトウェア・ライブラリ</p>
+</div>
 
-Rustライブラリ & 圧縮解凍ソフトウェア群です。
+<a href="https://discord.gg/F9DfEw6fqX" data-size="large">
+  <img alt="Discord" src="https://img.shields.io/discord/1481785335519117316.svg?label=Discord&logo=Discord&colorB=7289da&style=for-the-badge">
+</a>
 
 - `cozip_deflate`: 独自フレーム形式（`CZDF`）。圧縮は CPU/GPU 補助、解凍は CPU 実装。
+- `cozip_pdeflate`: PDeflate 本体。単一ファイル・ストリーム・並列 read/write API を持つ低レベル実装。
 - `cozip`: `cozip_deflate` の CPU deflate/inflate を使う、ファイル/ディレクトリ圧縮向け ZIP ラッパー（オーケストレーター）。
+- `cozip_desktop`: GPUI ベースのデスクトップアプリ。
 
 英語版: [README.md](./README.md)
 
@@ -13,7 +20,9 @@ Rustライブラリ & 圧縮解凍ソフトウェア群です。
 cozip/
   src/
     cozip_deflate/
+    cozip_pdeflate/
     cozip/
+    cozip_desktop/
   bench.sh
   docs/
 ```
@@ -93,6 +102,53 @@ let _ = cozip
 # }
 # Ok::<(), cozip::CoZipError>(())
 ```
+
+PDeflate backend も選べます。
+
+```rust
+use cozip::{CoZip, CoZipOptions, PDeflateOptions};
+
+let cozip = CoZip::init(CoZipOptions::PDeflate {
+    options: PDeflateOptions::default(),
+});
+
+let _ = cozip.compress_file_from_name("input.bin", "input.cozip")?;
+# Ok::<(), cozip::CoZipError>(())
+```
+
+### `cozip` で追加・更新された重要 API
+
+- `decompress_auto(...)`
+- `decompress_auto_from_name(...)`
+- `decompress_file_with_progress(...)`
+- `decompress_directory_with_progress(...)`
+- `decompress_file_with_progress_and_expected_output_bytes(...)`
+- `decompress_file_from_name_with_progress_and_expected_output_bytes(...)`
+- `inspect_archive_from_name(...)`
+- `inspect_archive_decode_hint_from_name(...)`
+- `CoZipProgress`
+- `CoZipArchiveInfo`
+- `ZipOptions { parallel_read_threads, parallel_write_threads, deflate_mode, ... }`
+- `PDeflateOptions { parallel_read_threads, parallel_write_threads, gpu_* , ... }`
+
+特に次の 3 つは実用上重要です。
+
+- `decompress_auto*`
+  - ZIP / PDeflate と単一ファイル / ディレクトリを自動判別します。
+- `CoZipProgress`
+  - GUI や CLI から進捗率・現在ファイル・スループットを取得できます。
+- `inspect_archive_*`
+  - アーカイブ形式・種別・並列解凍可否のヒントを事前に調べられます。
+
+### `cozip_pdeflate` の主な API
+
+- `compress_stream_with_options(...)`
+- `decompress_stream_with_options(...)`
+- `compress_file_with_options(...)`
+- `compress_file_parallel_read_with_options(...)`
+- `decompress_file_parallel_write_with_options(...)`
+- `pdeflate_stream_suggested_name(...)`
+- `pdeflate_stream_uncompressed_size(...)`
 
 ## ベンチマーク
 
