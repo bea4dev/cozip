@@ -38,20 +38,6 @@ static PROFILE_DETAIL_GPU_PACK_SEQ: AtomicU64 = AtomicU64::new(0);
 static PROFILE_DETAIL_GPU_BATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 static GPU_INTEGRATED_ERROR_SAMPLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn append_gpu_compress_trace(message: &str) {
-    if std::env::var_os("COZIP_PDEFLATE_GPU_COMPRESS_TRACE").is_none() {
-        return;
-    }
-    let path = std::env::temp_dir().join("cozip-pdeflate-gpu-compress-trace.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{message}");
-    }
-}
-
 #[derive(Debug, Default)]
 struct EncodeScratch {
     repeat_table: Vec<Vec<u8>>,
@@ -2407,15 +2393,6 @@ fn compress_chunk_gpu_batch(
         return Ok((Vec::new(), GpuBatchCompressProfile::default()));
     }
 
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] enter chunks={} first_index={} last_index={} chunk_size={} input_len={}",
-        indices.len(),
-        indices.first().copied().unwrap_or(0),
-        indices.last().copied().unwrap_or(0),
-        chunk_size,
-        input.len()
-    ));
-
     let t_total = Instant::now();
     let profile_detail = profile_detail_enabled();
     let t_prepare = Instant::now();
@@ -2428,10 +2405,6 @@ fn compress_chunk_gpu_batch(
     let mut gpu_table_batch_positions = Vec::<usize>::new();
     let mut gpu_table_batch_chunks = Vec::<&[u8]>::new();
     let mut gpu_table_build_requested_chunks = 0usize;
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] prepare_begin chunks={}",
-        indices.len()
-    ));
     for (pos, &chunk_idx) in indices.iter().enumerate() {
         let start = chunk_idx
             .checked_mul(chunk_size)
@@ -2440,12 +2413,6 @@ fn compress_chunk_gpu_batch(
         let chunk = &input[start..end];
         let max_ref_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
         if should_use_gpu_table_build(options, chunk.len()) {
-            append_gpu_compress_trace(&format!(
-                "[gpu_batch] prepare_queue_gpu_table pos={} chunk_index={} len={}",
-                pos,
-                chunk_idx,
-                chunk.len()
-            ));
             gpu_table_build_requested_chunks = gpu_table_build_requested_chunks.saturating_add(1);
             gpu_table_batch_positions.push(pos);
             gpu_table_batch_chunks.push(chunk);
@@ -2464,21 +2431,7 @@ fn compress_chunk_gpu_batch(
             });
             continue;
         }
-        append_gpu_compress_trace(&format!(
-            "[gpu_batch] prepare_build_table_dispatch_begin pos={} chunk_index={} len={} gpu_hint=false",
-            pos,
-            chunk_idx,
-            chunk.len()
-        ));
         let built = build_table_dispatch(chunk, options, false)?;
-        append_gpu_compress_trace(&format!(
-            "[gpu_batch] prepare_build_table_dispatch_done pos={} chunk_index={} len={} table_count={} gpu_table={}",
-            pos,
-            chunk_idx,
-            chunk.len(),
-            built.table_count,
-            built.gpu_table.is_some()
-        ));
         prepare_table_build_ms += built.build_ms;
         let gpu_eligible = max_ref_len >= options.min_ref_len
             && (built.table_count > 0 || built.gpu_table.is_some());
@@ -2497,10 +2450,6 @@ fn compress_chunk_gpu_batch(
         });
     }
     if !gpu_table_batch_chunks.is_empty() {
-        append_gpu_compress_trace(&format!(
-            "[gpu_batch] prepare_gpu_table_batch_begin count={}",
-            gpu_table_batch_chunks.len()
-        ));
         let (gpu_table_sample_stride, gpu_match_probe_limit, gpu_hash_history_limit) =
             gpu_table_build_tuning(options);
         let batch_result = gpu::build_table_gpu_device_batch(
@@ -2514,10 +2463,6 @@ fn compress_chunk_gpu_batch(
         );
         match batch_result {
             Ok(entries) => {
-                append_gpu_compress_trace(&format!(
-                    "[gpu_batch] prepare_gpu_table_batch_done count={} ok=true",
-                    entries.len()
-                ));
                 for ((pos, chunk), (gpu_table, gpu_prof)) in gpu_table_batch_positions
                     .iter()
                     .copied()
@@ -2552,11 +2497,6 @@ fn compress_chunk_gpu_batch(
                 }
             }
             Err(err) => {
-                append_gpu_compress_trace(&format!(
-                    "[gpu_batch] prepare_gpu_table_batch_done count={} ok=false err={}",
-                    gpu_table_batch_chunks.len(),
-                    err
-                ));
                 for pos in gpu_table_batch_positions.iter().copied() {
                     let chunk_idx = indices[pos];
                     let start = chunk_idx
@@ -2564,25 +2504,11 @@ fn compress_chunk_gpu_batch(
                         .ok_or(PDeflateError::NumericOverflow)?;
                     let end = (start + chunk_size).min(input.len());
                     let chunk = &input[start..end];
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] prepare_build_table_dispatch_begin pos={} chunk_index={} len={} gpu_hint=true",
-                        pos,
-                        chunk_idx,
-                        chunk.len()
-                    ));
                     let built = build_table_dispatch(
                         chunk,
                         options,
                         should_use_gpu_table_build(options, chunk.len()),
                     )?;
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] prepare_build_table_dispatch_done pos={} chunk_index={} len={} table_count={} gpu_table={}",
-                        pos,
-                        chunk_idx,
-                        chunk.len(),
-                        built.table_count,
-                        built.gpu_table.is_some()
-                    ));
                     prepare_table_build_ms += built.build_ms;
                     if built.gpu_table.is_some() {
                         prepare_gpu_table_build_chunks =
@@ -2608,20 +2534,10 @@ fn compress_chunk_gpu_batch(
             }
         }
     }
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] prepare_done chunks={} gpu_table_requested={} gpu_table_built={}",
-        indices.len(),
-        gpu_table_build_requested_chunks,
-        prepare_gpu_table_build_chunks
-    ));
     let prepared = prepared
         .into_iter()
         .map(|v| v.expect("prepared chunk missing"))
         .collect::<Vec<_>>();
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] prepared_materialized chunks={}",
-        prepared.len()
-    ));
     let prepare_ms = elapsed_ms(t_prepare);
     let prepare_misc_ms =
         (prepare_ms - prepare_table_build_ms - prepare_table_readback_ms).max(0.0);
@@ -2652,12 +2568,6 @@ fn compress_chunk_gpu_batch(
         .enumerate()
         .filter_map(|(idx, chunk)| chunk.gpu_eligible.then_some(idx))
         .collect();
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] gpu_job_indices count={} first={} last={}",
-        gpu_job_indices.len(),
-        gpu_job_indices.first().copied().unwrap_or(0),
-        gpu_job_indices.last().copied().unwrap_or(0)
-    ));
     let mut fallback_match_job_indices = Vec::<usize>::new();
     let mut gpu_match_upload_ms = 0.0_f64;
     let mut gpu_match_wait_ms = 0.0_f64;
@@ -2693,20 +2603,9 @@ fn compress_chunk_gpu_batch(
 
     let t_gpu_call = Instant::now();
     if !gpu_job_indices.is_empty() {
-        append_gpu_compress_trace("[gpu_batch] gpu_call_begin");
         let gpu_max_cmd_len = options.max_ref_len.min(MAX_CMD_LEN).min(64);
         let requested_submit_group = options.gpu_submit_chunks.max(1);
-        append_gpu_compress_trace(&format!(
-            "[gpu_batch] gpu_call_before_safe_submit requested_submit_group={} chunk_size={}",
-            requested_submit_group,
-            chunk_size
-        ));
         let safe_submit_group = gpu::max_safe_match_batch_chunks(chunk_size);
-        append_gpu_compress_trace(&format!(
-            "[gpu_batch] gpu_call_after_safe_submit ok={} value={}",
-            safe_submit_group.is_ok(),
-            safe_submit_group.as_ref().copied().unwrap_or(0)
-        ));
         let submit_group = match safe_submit_group {
             Ok(limit) => requested_submit_group.min(limit.max(1)),
             Err(_) => requested_submit_group,
@@ -3056,13 +2955,6 @@ fn compress_chunk_gpu_batch(
                                 "gpu sparse pending batch removal failed".to_string(),
                             )
                         })?;
-                        append_gpu_compress_trace(&format!(
-                            "[gpu_batch] try_collect_ready jobs={} first_prep={} last_prep={} pending_after={}",
-                            prep_indices.len(),
-                            prep_indices.first().copied().unwrap_or(0),
-                            prep_indices.last().copied().unwrap_or(0),
-                            pending_batches.len()
-                        ));
                         ready.push((prep_indices, Ok(batch)));
                     }
                     Ok(None) => {
@@ -3074,13 +2966,6 @@ fn compress_chunk_gpu_batch(
                                 "gpu sparse pending batch removal failed".to_string(),
                             )
                         })?;
-                        append_gpu_compress_trace(&format!(
-                            "[gpu_batch] try_collect_error jobs={} first_prep={} last_prep={} err={}",
-                            prep_indices.len(),
-                            prep_indices.first().copied().unwrap_or(0),
-                            prep_indices.last().copied().unwrap_or(0),
-                            err
-                        ));
                         ready.push((prep_indices, Err(err)));
                     }
                 }
@@ -3105,33 +2990,13 @@ fn compress_chunk_gpu_batch(
                     let Some((prep_indices, pending)) = pending_batches.pop_front() else {
                         break;
                     };
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] blocking_collect_high_watermark jobs={} first_prep={} last_prep={} pending_before={}",
-                        prep_indices.len(),
-                        prep_indices.first().copied().unwrap_or(0),
-                        prep_indices.last().copied().unwrap_or(0),
-                        pending_batches.len() + 1
-                    ));
                     let batch_res =
                         gpu::collect_matches_encode_and_pack_sparse_batch(pending);
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] blocking_collect_high_watermark_done jobs={} first_prep={} last_prep={} ok={}",
-                        prep_indices.len(),
-                        prep_indices.first().copied().unwrap_or(0),
-                        prep_indices.last().copied().unwrap_or(0),
-                        batch_res.is_ok()
-                    ));
                     handle_integrated_batch(prep_indices, batch_res);
                 }
             }
 
             let prep_indices = job_group.to_vec();
-            append_gpu_compress_trace(&format!(
-                "[gpu_batch] gpu_inputs_build_begin jobs={} first_prep={} last_prep={}",
-                prep_indices.len(),
-                prep_indices.first().copied().unwrap_or(0),
-                prep_indices.last().copied().unwrap_or(0)
-            ));
             let gpu_inputs: Vec<gpu::GpuMatchInput<'_>> = prep_indices
                 .iter()
                 .map(|&idx| {
@@ -3150,37 +3015,15 @@ fn compress_chunk_gpu_batch(
                     }
                 })
                 .collect();
-            append_gpu_compress_trace(&format!(
-                "[gpu_batch] gpu_inputs_build_done jobs={}",
-                gpu_inputs.len()
-            ));
             match gpu::submit_matches_encode_and_pack_sparse_batch(
                 &gpu_inputs,
                 options.section_count,
                 gpu_max_cmd_len,
             ) {
                 Ok(pending) => {
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] submit jobs={} first_prep={} last_prep={} pending_before={}",
-                        prep_indices.len(),
-                        prep_indices.first().copied().unwrap_or(0),
-                        prep_indices.last().copied().unwrap_or(0),
-                        pending_batches.len()
-                    ));
                     pending_batches.push_back((prep_indices, pending));
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] submit_done pending_after={}",
-                        pending_batches.len()
-                    ));
                 }
                 Err(err) => {
-                    append_gpu_compress_trace(&format!(
-                        "[gpu_batch] submit_error jobs={} first_prep={} last_prep={} err={}",
-                        prep_indices.len(),
-                        prep_indices.first().copied().unwrap_or(0),
-                        prep_indices.last().copied().unwrap_or(0),
-                        err
-                    ));
                     handle_integrated_batch(prep_indices, Err(err));
                 }
             }
@@ -3191,21 +3034,7 @@ fn compress_chunk_gpu_batch(
                 let Some((prep_indices, pending)) = pending_batches.pop_front() else {
                     break;
                 };
-                append_gpu_compress_trace(&format!(
-                    "[gpu_batch] blocking_collect_wait_high jobs={} first_prep={} last_prep={} pending_before={}",
-                    prep_indices.len(),
-                    prep_indices.first().copied().unwrap_or(0),
-                    prep_indices.last().copied().unwrap_or(0),
-                    pending_batches.len() + 1
-                ));
                 let batch_res = gpu::collect_matches_encode_and_pack_sparse_batch(pending);
-                append_gpu_compress_trace(&format!(
-                    "[gpu_batch] blocking_collect_wait_high_done jobs={} first_prep={} last_prep={} ok={}",
-                    prep_indices.len(),
-                    prep_indices.first().copied().unwrap_or(0),
-                    prep_indices.last().copied().unwrap_or(0),
-                    batch_res.is_ok()
-                ));
                 handle_integrated_batch(prep_indices, batch_res);
                 for (prep_indices, batch_res) in drain_ready(&mut pending_batches)? {
                     handle_integrated_batch(prep_indices, batch_res);
@@ -3223,21 +3052,7 @@ fn compress_chunk_gpu_batch(
             let Some((prep_indices, pending)) = pending_batches.pop_front() else {
                 break;
             };
-            append_gpu_compress_trace(&format!(
-                "[gpu_batch] blocking_collect_final jobs={} first_prep={} last_prep={} pending_before={}",
-                prep_indices.len(),
-                prep_indices.first().copied().unwrap_or(0),
-                prep_indices.last().copied().unwrap_or(0),
-                pending_batches.len() + 1
-            ));
             let batch_res = gpu::collect_matches_encode_and_pack_sparse_batch(pending);
-            append_gpu_compress_trace(&format!(
-                "[gpu_batch] blocking_collect_final_done jobs={} first_prep={} last_prep={} ok={}",
-                prep_indices.len(),
-                prep_indices.first().copied().unwrap_or(0),
-                prep_indices.last().copied().unwrap_or(0),
-                batch_res.is_ok()
-            ));
             handle_integrated_batch(prep_indices, batch_res);
         }
 
@@ -3442,15 +3257,6 @@ fn compress_chunk_gpu_batch(
             gpu_call_ms / chunks_f
         );
     }
-    append_gpu_compress_trace(&format!(
-        "[gpu_batch] leave chunks={} first_index={} last_index={} gpu_used_chunks={} gpu_jobs={} finalize_ms={:.3}",
-        indices.len(),
-        indices.first().copied().unwrap_or(0),
-        indices.last().copied().unwrap_or(0),
-        gpu_used_chunks,
-        gpu_job_indices.len(),
-        finalize_ms
-    ));
     Ok((
         out,
         GpuBatchCompressProfile {
