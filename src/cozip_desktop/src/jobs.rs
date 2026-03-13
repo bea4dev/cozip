@@ -126,7 +126,6 @@ fn run_compress(plan: CompressPlan, shared: &SharedJobSnapshot) -> Result<String
             result?
         }
     };
-
     let mut state = shared.lock().expect("job snapshot poisoned");
     state.completed_tasks = 1;
     Ok(format!(
