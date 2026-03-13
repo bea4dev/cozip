@@ -1,9 +1,12 @@
 [window]
 title = "CoZip Setup"
+uninstall_title = "CoZip Uninstall"
 
 [header]
 title = "CoZip Setup Wizard"
 subtitle = "This wizard installs CoZip on your computer."
+uninstall_title = "CoZip Uninstall Wizard"
+uninstall_subtitle = "This wizard removes CoZip from your computer."
 
 [common]
 install_dir = "Install location"
@@ -27,6 +30,21 @@ status_extracting = "Copying application files..."
 status_registering = "Updating registry and Explorer settings..."
 status_completed = "Installation completed."
 
+[uninstall]
+confirm_title = "Confirm Uninstall"
+confirm_description = "CoZip will be removed from this computer."
+confirm_warning = "The application files, file association, and Explorer context menu will be removed. Explorer shell extension files may be deleted after a restart."
+progress_title = "Uninstalling"
+progress_description = "Removing registrations and application files."
+complete_title = "Uninstall Complete"
+complete_description = "CoZip has been removed."
+complete_state = "Uninstallation completed."
+status_preparing = "Preparing uninstallation..."
+status_unregistering = "Removing registry and Explorer settings..."
+status_removing_files = "Removing application files..."
+status_completed = "Uninstallation completed."
+restart_required_note = "Some files will be removed after restarting Windows."
+
 [complete]
 title = "Completed"
 description = "CoZip has been installed."
@@ -43,9 +61,14 @@ license = "Accept the license to continue."
 options = "Review the options, then start installation."
 installing = "Please wait while setup completes."
 complete = "Click Finish to exit setup."
+uninstall_confirm = "Click Uninstall to remove CoZip."
+uninstalling = "Please wait while CoZip is removed."
+uninstall_complete = "Click Finish to exit the uninstaller."
 
 [buttons]
 back = "Back"
 next = "Next"
 install = "Install"
 finish = "Finish"
+uninstall = "Uninstall"
+cancel = "Cancel"

@@ -1,9 +1,12 @@
 [window]
 title = "CoZip のセットアップ"
+uninstall_title = "CoZip のアンインストール"
 
 [header]
 title = "CoZip セットアップ ウィザード"
 subtitle = "このウィザードは CoZip をコンピューターにインストールします。"
+uninstall_title = "CoZip アンインストール ウィザード"
+uninstall_subtitle = "このウィザードは CoZip をコンピューターから削除します。"
 
 [common]
 install_dir = "インストール先"
@@ -27,6 +30,21 @@ status_extracting = "アプリケーションファイルをコピー中です..
 status_registering = "レジストリとエクスプローラーの設定を更新中です..."
 status_completed = "インストールが完了しました。"
 
+[uninstall]
+confirm_title = "アンインストールの確認"
+confirm_description = "CoZip をこのコンピューターから削除します。"
+confirm_warning = "CoZip のアプリケーション本体、関連付け、右クリックメニューを削除します。実行中の Explorer 拡張は再起動後に削除されることがあります。"
+progress_title = "アンインストール中"
+progress_description = "登録解除とファイル削除を実行しています。"
+complete_title = "アンインストール完了"
+complete_description = "CoZip のアンインストールが完了しました。"
+complete_state = "アンインストールが完了しました。"
+status_preparing = "アンインストールを準備中です..."
+status_unregistering = "レジストリとエクスプローラー設定を削除中です..."
+status_removing_files = "アプリケーションファイルを削除中です..."
+status_completed = "アンインストールが完了しました。"
+restart_required_note = "一部のファイルは再起動後に削除されます。"
+
 [complete]
 title = "完了"
 description = "CoZip のインストールが完了しました。"
@@ -43,9 +61,14 @@ license = "続行するにはライセンスに同意してください。"
 options = "オプションを確認してからインストールを開始してください。"
 installing = "セットアップが完了するまでお待ちください。"
 complete = "「完了」をクリックでセットアップを終了します。"
+uninstall_confirm = "「アンインストール」をクリックすると CoZip を削除します。"
+uninstalling = "アンインストールが完了するまでお待ちください。"
+uninstall_complete = "「完了」をクリックでアンインストーラーを終了します。"
 
 [buttons]
 back = "戻る"
 next = "次へ"
 install = "インストール"
 finish = "完了"
+uninstall = "アンインストール"
+cancel = "キャンセル"

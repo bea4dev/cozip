@@ -46,10 +46,13 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
 const INSTALL_DIR: &str = r"C:\Program Files\CoZip";
 const COZIP_DESKTOP_EXE_PATH: &str = r"C:\Program Files\CoZip\cozip_desktop.exe";
+const COZIP_WIN_UNINSTALLER_EXE_PATH: &str = r"C:\Program Files\CoZip\cozip_win_uninstaller.exe";
 const COZIP_WIN_SHELL_DLL_PATH: &str = r"C:\Program Files\CoZip\cozip_win_shell.dll";
 const COZIP_WIN_SHELL_TMP_DLL_PATH: &str = r"C:\Program Files\CoZip\cozip_win_shell_tmp.dll";
 const DECOMP_ICON_PATH: &str = r"C:\Program Files\CoZip\icons\decomp.ico";
 const COZIP_FILE_PROG_ID: &str = "CoZip.Archive";
+const COZIP_UNINSTALL_REG_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CoZip";
 const RELEASES_API_URL: &str = "https://api.github.com/repos/bea4dev/cozip/releases";
 const RELEASE_ASSET_NAME: &str = "pack.zip";
 const DOWNLOAD_PROGRESS_END: u8 = 59;
@@ -672,6 +675,7 @@ fn perform_install(
     let shell_extension_note = install_shell_extension_binaries()?;
 
     install_archive_file_associations()?;
+    install_uninstall_registration()?;
     report_progress(94);
     if add_explorer_menu {
         install_explorer_menu_entries()?;
@@ -917,8 +921,56 @@ fn install_archive_file_associations() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn install_uninstall_registration() -> Result<(), String> {
+    reg_set_sz_value(COZIP_UNINSTALL_REG_KEY, None, "CoZip")?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("DisplayName"),
+        "CoZip",
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("DisplayVersion"),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("Publisher"),
+        "bea4dev",
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("InstallLocation"),
+        INSTALL_DIR,
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("DisplayIcon"),
+        DECOMP_ICON_PATH,
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("UninstallString"),
+        &format!(r#""{COZIP_WIN_UNINSTALLER_EXE_PATH}""#),
+    )?;
+    reg_set_sz_value(
+        COZIP_UNINSTALL_REG_KEY,
+        Some("QuietUninstallString"),
+        &format!(r#""{COZIP_WIN_UNINSTALLER_EXE_PATH}""#),
+    )?;
+    reg_set_dword_value(COZIP_UNINSTALL_REG_KEY, "NoModify", 1)?;
+    reg_set_dword_value(COZIP_UNINSTALL_REG_KEY, "NoRepair", 1)?;
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn install_archive_file_associations() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_uninstall_registration() -> Result<(), String> {
     Ok(())
 }
 
@@ -1072,6 +1124,56 @@ fn reg_set_sz_value(key: &str, value_name: Option<&str>, data: &str) -> Result<(
                 REG_SZ,
                 data_wide.as_ptr() as *const u8,
                 bytes,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "registry write failed for HKCU\\{key}: win32 error {status}"
+            ))
+        }
+    })();
+
+    unsafe {
+        RegCloseKey(handle);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn reg_set_dword_value(key: &str, value_name: &str, data: u32) -> Result<(), String> {
+    let key_wide = to_wide(OsStr::new(key));
+    let mut handle: HKEY = std::ptr::null_mut();
+    let create_status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_wide.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut handle,
+            std::ptr::null_mut(),
+        )
+    };
+    if create_status != 0 {
+        return Err(format!(
+            "registry write failed for HKCU\\{key}: win32 error {create_status}"
+        ));
+    }
+
+    let result = (|| {
+        let value_name_wide = to_wide(OsStr::new(value_name));
+        let status = unsafe {
+            RegSetValueExW(
+                handle,
+                value_name_wide.as_ptr(),
+                0,
+                windows_sys::Win32::System::Registry::REG_DWORD,
+                &data as *const u32 as *const u8,
+                std::mem::size_of::<u32>() as u32,
             )
         };
         if status == 0 {

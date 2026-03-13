@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
+[[bin]]
+name = "cozip_win_installer"
+path = "src/main.rs"
+
+[[bin]]
+name = "cozip_win_uninstaller"
+path = "src/bin/cozip_win_uninstaller.rs"
+
 [dependencies]
 gpui = "0.2.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
