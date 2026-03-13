@@ -2640,10 +2640,18 @@ pub fn inspect_archive_decode_hint_from_name<P: AsRef<Path>>(
     if read_len >= 2 && magic[..2] == *b"PK" {
         let mut reader = BufReader::new(input);
         let (entries, _) = read_central_directory_entries(&mut reader)?;
-        let all_entries_parallelizable = entries.iter().all(|entry| {
-            entry.method == STORED_METHOD || entry._czdi_index.is_some()
-        });
-        return Ok(if all_entries_parallelizable {
+        let file_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.name.ends_with('/'))
+            .collect();
+        let is_parallel = if file_entries.len() > 1 {
+            true
+        } else {
+            file_entries.first().is_some_and(|entry| {
+                entry.method == STORED_METHOD || entry._czdi_index.is_some()
+            })
+        };
+        return Ok(if is_parallel {
             CoZipArchiveDecodeHint::Parallel
         } else {
             CoZipArchiveDecodeHint::SingleThread
