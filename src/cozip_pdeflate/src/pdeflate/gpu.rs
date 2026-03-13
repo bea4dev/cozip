@@ -411,14 +411,16 @@ fn format_sparse_payload_class_counts(counts: &[u32; GPU_SPARSE_PAYLOAD_CLASS_CO
 
 fn sparse_payload_class_capacity_bytes(
     class_id: GpuSparsePayloadClass,
-    predicted_payload_bytes: usize,
+    guarded_payload_bytes: usize,
 ) -> usize {
     match class_id {
         GpuSparsePayloadClass::Tiny => 256 * 1024,
         GpuSparsePayloadClass::Small => 1024 * 1024,
         GpuSparsePayloadClass::Medium => 2 * 1024 * 1024,
         GpuSparsePayloadClass::Large => 4 * 1024 * 1024,
-        GpuSparsePayloadClass::XLarge => align_up4(predicted_payload_bytes.max(4)).div_ceil(1024 * 1024) * (1024 * 1024),
+        GpuSparsePayloadClass::XLarge => {
+            align_up4(guarded_payload_bytes.max(4)).div_ceil(1024 * 1024) * (1024 * 1024)
+        }
     }
 }
 
@@ -449,21 +451,6 @@ fn estimate_sparse_payload_bytes(
             .saturating_add(table_bias),
     );
     align_up4(base.saturating_add(cmd_estimate))
-}
-
-fn planned_sparse_payload_readback_bytes(
-    predicted_payload_bytes: usize,
-    slot_cap_bytes: u64,
-) -> u64 {
-    let predicted = align_up4(predicted_payload_bytes.max(4));
-    let guarded = predicted
-        .saturating_add(predicted / 8)
-        .saturating_add(16 * 1024);
-    let planned = align_up4(guarded);
-    u64::try_from(planned)
-        .unwrap_or(u64::MAX)
-        .min(slot_cap_bytes.max(4))
-        .max(4)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -12868,6 +12855,12 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
     section_count: usize,
     max_cmd_len: usize,
 ) -> Result<PendingGpuSparsePackBatch, PDeflateError> {
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] enter inputs={} section_count={} max_cmd_len={}",
+        inputs.len(),
+        section_count,
+        max_cmd_len
+    ));
     let with_gpu_stage = |stage: &'static str, err: PDeflateError| -> PDeflateError {
         match err {
             PDeflateError::Gpu(msg) => PDeflateError::Gpu(format!("{stage}: {msg}")),
@@ -12971,8 +12964,15 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
     }
 
     let r = runtime().map_err(|err| with_gpu_stage("integrated/runtime", err))?;
+    super::append_gpu_compress_trace("[gpu_submit] runtime_ok");
     let (packed, pack_profile) =
         pack_match_batch_inputs(inputs).map_err(|err| with_gpu_stage("integrated/pack-inputs", err))?;
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] pack_inputs_done total_src_len={} chunk_count={} total_table_entries={}",
+        packed.total_src_len,
+        packed.chunk_lens.len(),
+        packed.total_table_entries
+    ));
     let pack_inputs_ms = pack_profile.total_ms;
 
     let groups_total = (u32::try_from(packed.total_src_len)
@@ -13040,6 +13040,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
     let t_batch_scratch = Instant::now();
     let batch_scratch = acquire_batch_scratch(r, required_caps)
         .map_err(|err| with_gpu_stage("integrated/acquire-batch-scratch", err))?;
+    super::append_gpu_compress_trace("[gpu_submit] batch_scratch_acquired");
     let batch_scratch_acquire_ms = elapsed_ms(t_batch_scratch);
 
     let mut uploaded_tables = Vec::<GpuPackedTableDevice>::with_capacity(inputs.len());
@@ -13068,10 +13069,18 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             None => &uploaded_tables[uploaded_table_idx[idx].expect("uploaded table missing")],
         })
         .collect();
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] packed_tables_ready uploaded_tables={}",
+        uploaded_tables.len()
+    ));
 
     let t_sparse_prepare = Instant::now();
     let (resolved_table_sizes, resolve_profile) = resolve_packed_table_sizes_batch(&packed_tables)
         .map_err(|err| with_gpu_stage("integrated/resolve-packed-table-sizes", err))?;
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] resolve_table_sizes_done count={}",
+        resolved_table_sizes.len()
+    ));
     let table_size_resolve_ms = resolve_profile.total_ms;
 
     let mut section_meta_total_bytes = 0u64;
@@ -13194,16 +13203,33 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             prep.section_index_cap_len,
             prep.section_cmd_cap_len,
         );
-        let predicted_payload_class = classify_sparse_payload_bytes(predicted_payload_bytes);
+        let guarded_payload_bytes = guarded_sparse_payload_bytes(predicted_payload_bytes);
+        let predicted_payload_class = classify_sparse_payload_bytes(guarded_payload_bytes);
         let slot_cap_bytes = u64::try_from(sparse_payload_class_capacity_bytes(
             predicted_payload_class,
-            predicted_payload_bytes,
+            guarded_payload_bytes,
         ))
         .map_err(|_| PDeflateError::NumericOverflow)?
         .max(4);
         let cap_payload_class = classify_sparse_payload_bytes(
             usize::try_from(slot_cap_bytes).map_err(|_| PDeflateError::NumericOverflow)?,
         );
+        super::append_gpu_compress_trace(&format!(
+            "[gpu_submit] capacity_plan idx={} chunk_len={} table_count={} table_index_len={} table_data_len={} predicted_payload_bytes={} guarded_payload_bytes={} predicted_class={:?} slot_cap_bytes={} cap_class={:?} total_bytes_cap={} section_index_cap_len={} section_cmd_cap_len={}",
+            chunk_idx,
+            chunk_len,
+            table_count,
+            table_index_len,
+            table_data_len,
+            predicted_payload_bytes,
+            guarded_payload_bytes,
+            predicted_payload_class,
+            slot_cap_bytes,
+            cap_payload_class,
+            prep.total_bytes_cap,
+            prep.section_index_cap_len,
+            prep.section_cmd_cap_len
+        ));
 
         let section_meta_words_off = usize::try_from(section_meta_total_bytes / 4)
             .map_err(|_| PDeflateError::NumericOverflow)?;
@@ -13297,6 +13323,10 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         });
         let _ = input;
     }
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] direct_states_ready count={}",
+        direct_states.len()
+    ));
 
     let mut class_counts = [0usize; GPU_SPARSE_PAYLOAD_CLASS_COUNT];
     for state in &direct_states {
@@ -13385,6 +13415,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         },
     )
     .map_err(|err| with_gpu_stage("integrated/acquire-sparse-pack-scratch", err))?;
+    super::append_gpu_compress_trace("[gpu_submit] sparse_scratch_acquired");
     let sparse_scratch_acquire_ms = elapsed_ms(t_sparse_scratch);
 
     let sparse_probe = sparse_probe_enabled();
@@ -13475,6 +13506,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         desc_words[base + 22] = u32::try_from(prep.total_bytes_cap / 4)
             .map_err(|_| PDeflateError::NumericOverflow)?;
     }
+    super::append_gpu_compress_trace("[gpu_submit] desc_words_ready");
 
     let t_pack_bind_group = Instant::now();
     let pack_bind_group = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -13527,6 +13559,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             },
         ],
     });
+    super::append_gpu_compress_trace("[gpu_submit] pack_bind_group_ready");
     let pack_bind_group_ms = elapsed_ms(t_pack_bind_group);
 
     let t_section_setup = Instant::now();
@@ -13895,6 +13928,10 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             out_cmd_byte_buffer,
         });
     }
+    super::append_gpu_compress_trace(&format!(
+        "[gpu_submit] section_setup_done direct_gpu={}",
+        direct_gpu.len()
+    ));
     let section_setup_ms = elapsed_ms(t_section_setup);
     let sparse_prepare_total_ms = elapsed_ms(t_sparse_prepare);
     let sparse_prepare_ms = (sparse_prepare_total_ms - sparse_scratch_acquire_ms).max(0.0);
@@ -14268,6 +14305,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         );
         r.queue
             .write_buffer(&scratch.desc_buffer, 0, bytemuck::cast_slice(&desc_words));
+        super::append_gpu_compress_trace("[gpu_submit] match_upload_done");
         let match_upload_ms = elapsed_ms(t_match_upload);
 
         let t_encoder_create = Instant::now();
@@ -14276,6 +14314,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("cozip-pdeflate-match-section-sparse-direct-encoder"),
             });
+        super::append_gpu_compress_trace("[gpu_submit] encoder_created");
         encoder_create_ms += elapsed_ms(t_encoder_create);
         let t_table_copy = Instant::now();
         encode_table_device_copies(
@@ -14444,13 +14483,12 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         .max(4);
         let payload_readback_plan_bytes: Vec<u64> = direct_states
             .iter()
-            .map(|state| {
-                planned_sparse_payload_readback_bytes(
-                    state.predicted_payload_bytes,
-                    state.slot_cap_bytes,
-                )
-            })
+            .map(|state| state.slot_cap_bytes.max(4))
             .collect();
+        super::append_gpu_compress_trace(&format!(
+            "[gpu_submit] payload_readback_plan_bytes={:?}",
+            payload_readback_plan_bytes
+        ));
         let mut payload_readback_offsets = Vec::<u64>::with_capacity(direct_states.len());
         let mut payload_readback_bytes = 0u64;
         for &copy_bytes in &payload_readback_plan_bytes {
@@ -14521,7 +14559,15 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
         }
 
         let t_submit = Instant::now();
-        r.queue.submit(Some(encoder.finish()));
+        super::append_gpu_compress_trace("[gpu_submit] encoder_finish_begin");
+        let finished = encoder.finish();
+        super::append_gpu_compress_trace("[gpu_submit] encoder_finish_done");
+        super::append_gpu_compress_trace("[gpu_submit] queue_submit_begin");
+        let submission = r.queue.submit(Some(finished));
+        super::append_gpu_compress_trace(&format!(
+            "[gpu_submit] queue_submit_done submission={:?}",
+            submission
+        ));
         let submit_ms = elapsed_ms(t_submit);
 
         let t_result_readback_setup = Instant::now();
@@ -14541,6 +14587,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
             .as_ref()
             .map(|(submit_seq, build_id, _)| (*submit_seq, *build_id))
             .unwrap_or((0, 0));
+        super::append_gpu_compress_trace("[gpu_submit] leave_ok");
         Ok(PendingGpuSparsePackBatch {
             inputs_len: inputs.len(),
             compression_mode,
@@ -14613,6 +14660,7 @@ pub(crate) fn submit_matches_encode_and_pack_sparse_batch(
     match result {
         Ok(pending) => Ok(pending),
         Err(err) => {
+            super::append_gpu_compress_trace(&format!("[gpu_submit] leave_err err={}", err));
             if let Some(scratch) = scratch_slot.take() {
                 release_sparse_pack_scratch(r, scratch);
             }
@@ -14768,9 +14816,34 @@ fn collect_pending_gpu_sparse_pack_batch(
             let mut payload_copy_bytes = Vec::<u64>::with_capacity(pending.inputs_len);
             for (idx, state) in pending.direct_states.iter().enumerate() {
                 let base = idx * GPU_SPARSE_PACK_BATCH_RESULT_WORDS;
+                let words = [
+                    *result_words.get(base).unwrap_or(&0),
+                    *result_words.get(base + 1).unwrap_or(&0),
+                    *result_words.get(base + 2).unwrap_or(&0),
+                    *result_words.get(base + 3).unwrap_or(&0),
+                    *result_words.get(base + 4).unwrap_or(&0),
+                    *result_words.get(base + 5).unwrap_or(&0),
+                ];
                 let total_len_u32 = *result_words.get(base + 2).unwrap_or(&0xffff_ffff);
                 let total_words_u32 = *result_words.get(base + 3).unwrap_or(&0);
                 if total_len_u32 == 0xffff_ffff || total_words_u32 == 0 {
+                    super::append_gpu_compress_trace(&format!(
+                        "[gpu_collect] sparse_prepare_overflow idx={} result_words={:?} chunk_len={} table_count={} table_index_len={} table_data_len={} section_count={} total_bytes_cap={} slot_cap_bytes={} predicted_payload_bytes={} section_index_cap_len={} section_cmd_cap_len={} max_tokens_per_section={} max_cmd_words_per_section={}",
+                        idx,
+                        words,
+                        state.chunk_len,
+                        state.prep.table_count,
+                        state.prep.table_index_len,
+                        state.prep.table_data_len,
+                        state.prep.section_count,
+                        state.prep.total_bytes_cap,
+                        state.slot_cap_bytes,
+                        state.predicted_payload_bytes,
+                        state.prep.section_index_cap_len,
+                        state.prep.section_cmd_cap_len,
+                        state.max_tokens_per_section,
+                        state.max_cmd_words_per_section
+                    ));
                     return Err(PDeflateError::Gpu(
                         "integrated/result-parse: sparse size prepare overflow while packing"
                             .to_string(),
@@ -14782,11 +14855,34 @@ fn collect_pending_gpu_sparse_pack_batch(
                 let total_copy_bytes = u64::try_from(total_copy_len)
                     .map_err(|_| PDeflateError::NumericOverflow)?;
                 if total_copy_bytes > state.prep.total_bytes_cap {
+                    super::append_gpu_compress_trace(&format!(
+                        "[gpu_collect] capacity_over_total_bytes_cap idx={} total_len={} total_copy_bytes={} total_bytes_cap={} predicted_payload_bytes={} predicted_class={:?} slot_cap_bytes={} cap_class={:?}",
+                        idx,
+                        total_len,
+                        total_copy_bytes,
+                        state.prep.total_bytes_cap,
+                        state.predicted_payload_bytes,
+                        state.predicted_payload_class,
+                        state.slot_cap_bytes,
+                        state.cap_payload_class
+                    ));
                     return Err(PDeflateError::Gpu(
                         "gpu sparse pack produced oversized aligned payload".to_string(),
                     ));
                 }
                 if total_copy_bytes > pending.payload_readback_plan_bytes[idx] {
+                    super::append_gpu_compress_trace(&format!(
+                        "[gpu_collect] capacity_over_readback_plan idx={} total_len={} total_copy_bytes={} readback_plan_bytes={} total_bytes_cap={} predicted_payload_bytes={} predicted_class={:?} slot_cap_bytes={} cap_class={:?}",
+                        idx,
+                        total_len,
+                        total_copy_bytes,
+                        pending.payload_readback_plan_bytes[idx],
+                        state.prep.total_bytes_cap,
+                        state.predicted_payload_bytes,
+                        state.predicted_payload_class,
+                        state.slot_cap_bytes,
+                        state.cap_payload_class
+                    ));
                     return Err(PDeflateError::Gpu(format!(
                         "integrated/result-parse: planned payload readback too small idx={} planned={} actual={}",
                         idx,
@@ -14855,6 +14951,16 @@ fn collect_pending_gpu_sparse_pack_batch(
                 })?;
                 let payload_len = payload_lens[idx];
                 let actual_payload_class = classify_sparse_payload_bytes(payload_len);
+                super::append_gpu_compress_trace(&format!(
+                    "[gpu_collect] payload_actual idx={} payload_len={} payload_copy_bytes={} predicted_payload_bytes={} predicted_class={:?} slot_cap_bytes={} cap_class={:?}",
+                    idx,
+                    payload_len,
+                    payload_copy_bytes[idx],
+                    state.predicted_payload_bytes,
+                    state.predicted_payload_class,
+                    state.slot_cap_bytes,
+                    state.cap_payload_class
+                ));
                 predicted_payload_bytes_total = predicted_payload_bytes_total
                     .saturating_add(u64::try_from(state.predicted_payload_bytes).unwrap_or(u64::MAX));
                 cap_payload_bytes_total =
@@ -15196,10 +15302,20 @@ pub(crate) fn try_collect_matches_encode_and_pack_sparse_batch(
     match collect_pending_gpu_sparse_pack_batch(pending, false) {
         Ok(out) => Ok(out),
         Err(err) => {
+            super::append_gpu_compress_trace(&format!(
+                "[gpu_collect] try_collect_err err={}",
+                err
+            ));
             release_pending_gpu_sparse_pack_batch(r, pending);
             Err(err)
         }
     }
+}
+
+fn guarded_sparse_payload_bytes(predicted_payload_bytes: usize) -> usize {
+    let doubled = predicted_payload_bytes.saturating_mul(2);
+    let with_slack = predicted_payload_bytes.saturating_add(1024 * 1024);
+    align_up4(doubled.max(with_slack).max(4))
 }
 
 pub(crate) fn collect_matches_encode_and_pack_sparse_batch(
@@ -15212,6 +15328,10 @@ pub(crate) fn collect_matches_encode_and_pack_sparse_batch(
             "integrated/collect: pending batch was not ready after blocking collect".to_string(),
         )),
         Err(err) => {
+            super::append_gpu_compress_trace(&format!(
+                "[gpu_collect] blocking_collect_err err={}",
+                err
+            ));
             release_pending_gpu_sparse_pack_batch(r, &mut pending);
             Err(err)
         }

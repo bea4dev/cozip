@@ -233,11 +233,28 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
                     low_watermark_bytes,
                 );
                 let Some(tasks) = tasks else {
+                    append_gpu_compress_trace("[gpu_worker] exit_no_tasks");
                     return;
                 };
+                let claimed_count = tasks.len();
+                let first_index = tasks.first().map(|task| task.index).unwrap_or(0);
+                let last_index = tasks.last().map(|task| task.index).unwrap_or(0);
+                append_gpu_compress_trace(&format!(
+                    "[gpu_worker] batch_claimed count={} first_index={} last_index={}",
+                    claimed_count,
+                    first_index,
+                    last_index
+                ));
                 let batch = match compress_stream_gpu_batch(&tasks, options) {
                     Ok(batch) => batch,
                     Err(err) => {
+                        append_gpu_compress_trace(&format!(
+                            "[gpu_worker] batch_error count={} first_index={} last_index={} err={}",
+                            tasks.len(),
+                            first_index,
+                            last_index,
+                            err
+                        ));
                         set_worker_error_once(&err_slot_ref, &err_flag_ref, err);
                         let (lock, cv) = &*state_ref;
                         if let Ok(mut state) = lock.lock() {
@@ -247,6 +264,12 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
                         return;
                     }
                 };
+                append_gpu_compress_trace(&format!(
+                    "[gpu_worker] batch_returned count={} first_index={} last_index={}",
+                    batch.len(),
+                    first_index,
+                    last_index
+                ));
                 let (lock, cv) = &*state_ref;
                 let mut state = match lock.lock() {
                     Ok(guard) => guard,
@@ -257,6 +280,12 @@ pub(crate) fn compress_reader_with_stats<R: Read + Send, W: Write>(
                         *slot = Some((encoded, task.chunk.len()));
                     }
                 }
+                append_gpu_compress_trace(&format!(
+                    "[gpu_worker] batch_published count={} first_index={} last_index={}",
+                    claimed_count,
+                    first_index,
+                    last_index
+                ));
                 cv.notify_all();
             });
         }
