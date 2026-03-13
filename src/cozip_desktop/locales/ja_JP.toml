@@ -124,8 +124,8 @@ summary.completed = "完了"
 summary.failed = "失敗"
 summary.throughput = "スループット"
 
-compress.empty = "エクスプローラーのコンテキストメニューからファイルまたはフォルダーを指定すると、ここで圧縮を開始できます。"
-decompress.empty = "エクスプローラーのコンテキストメニューからアーカイブを指定すると、ここで展開を開始できます。"
+compress.empty = "エクスプローラーのコンテキスト メニューからファイルまたはフォルダーを指定すると、ここで圧縮を開始できます。"
+decompress.empty = "エクスプローラーのコンテキスト メニューからアーカイブを指定すると、ここで展開を開始できます。"
 
 settings.output_file = "圧縮先のファイル"
 settings.output_dir = "展開先のディレクトリ"
@@ -156,5 +156,6 @@ warning.decode_backlog_high = "書き込み待ちが増加中:"
 dialog.compress_output = "圧縮先のファイルを選択"
 dialog.extract_output = "展開先のディレクトリを選択"
 dialog.overwrite_title = "上書きの確認"
-dialog.overwrite_body = "既存のファイルがあります。上書きしますか？"
+dialog.overwrite_body = "既存のファイ
+ルがあります。上書きしますか？"
 dialog.extract_overwrite_body = "既存の展開先と重複します。続行しますか？"
