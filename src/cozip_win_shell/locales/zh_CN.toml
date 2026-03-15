@@ -1,0 +1,11 @@
+[menu]
+compress_root = "压缩"
+compress_zip = "zip (CPU + GPU)"
+compress_cozip = "cozip (实验性) (CPU + GPU)"
+compress_details = "高级"
+extract_root = "解压"
+extract_here = "在此解压"
+extract_details = "高级"
+
+[registration]
+command_name = "CoZip 资源管理器命令"
