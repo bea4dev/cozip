@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=application/zip;application/x-cozip;application/x-zip-compressed;application/x-zip;
+Actions=cozip_extract_here;cozip_extract_details;
+
+[Desktop Action cozip_extract_here]
+Name=CoZip: ここに展開
+Name[en]=CoZip: Extract Here
+Icon=package-x-generic
+Exec=cozip_desktop extract --here %F
+
+[Desktop Action cozip_extract_details]
+Name=CoZip: 展開先を選んで展開...
+Name[en]=CoZip: Extract (choose options)...
+Icon=package-x-generic
+Exec=cozip_desktop ui extract-details --here %F

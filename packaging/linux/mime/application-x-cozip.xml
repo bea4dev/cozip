@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-cozip">
+    <comment>CoZip Archive</comment>
+    <comment xml:lang="ja">CoZip アーカイブ</comment>
+    <glob pattern="*.cozip"/>
+    <glob pattern="*.pdz"/>
+    <icon name="package-x-generic"/>
+  </mime-type>
+</mime-info>

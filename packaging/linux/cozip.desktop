@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=CoZip
+Name[ja]=CoZip
+Comment=GPU-accelerated compression and decompression
+Comment[ja]=GPU加速の圧縮・展開ツール
+Exec=cozip_desktop %F
+Icon=package-x-generic
+Terminal=false
+Categories=Utility;Archiving;Compression;
+MimeType=application/zip;application/x-cozip;application/x-zip-compressed;application/x-zip;
+StartupNotify=true

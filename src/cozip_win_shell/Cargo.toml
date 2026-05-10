@@ -1,14 +1,16 @@
 [package]
 name = "cozip_win_shell"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-thiserror.workspace = true
+thiserror = "=2.0.17"
 toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.57.0", features = [
     "implement",
     "Win32_Foundation",

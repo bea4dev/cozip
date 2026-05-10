@@ -560,20 +560,19 @@ fn read_backend_loop(
             for cqe in cq {
                 let id = cqe.user_data();
                 let result = cqe.result();
-                let Some(mut req) = inflight.remove(&id) else {
+                let Some(req) = inflight.remove(&id) else {
                     continue;
                 };
                 if result < 0 {
-                    let err = io::Error::from_raw_os_error(-result);
-                    let _ = req.response.send(Err(err.into()));
-                    store_read_backend_error(&state_ref, &error_ref, err.into());
+                    let raw = -result;
+                    let _ = req.response.send(Err(io::Error::from_raw_os_error(raw).into()));
+                    store_read_backend_error(&state_ref, &error_ref, io::Error::from_raw_os_error(raw).into());
                     return;
                 }
                 let read = usize::try_from(result).unwrap_or(usize::MAX);
                 if read != req.data.len() {
-                    let err = io::Error::new(io::ErrorKind::UnexpectedEof, "short io_uring read");
-                    let _ = req.response.send(Err(err.into()));
-                    store_read_backend_error(&state_ref, &error_ref, err.into());
+                    let _ = req.response.send(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short io_uring read").into()));
+                    store_read_backend_error(&state_ref, &error_ref, io::Error::new(io::ErrorKind::UnexpectedEof, "short io_uring read").into());
                     return;
                 }
                 let _ = req.response.send(Ok(req.data));

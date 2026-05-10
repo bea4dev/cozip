@@ -272,6 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options: ZipOptions {
             compression_level: args.level,
             deflate_mode: args.engine,
+            ..ZipOptions::default()
         },
     })?;
 

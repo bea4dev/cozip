@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+Actions=cozip_compress_zip;cozip_compress_cozip;
+
+[Desktop Action cozip_compress_zip]
+Name=CoZip: ZIP に圧縮
+Name[en]=CoZip: Compress to ZIP
+Icon=package-x-generic
+Exec=cozip_desktop compress --format zip %F
+
+[Desktop Action cozip_compress_cozip]
+Name=CoZip: CoZip 形式に圧縮
+Name[en]=CoZip: Compress to CoZip
+Icon=package-x-generic
+Exec=cozip_desktop compress --format cozip %F
