@@ -81,11 +81,13 @@ rm -f \
   "$SERVICEMENU_DIR/cozip-extract.desktop"
 install_desktop_template "$SCRIPT_DIR/cozip-compress-zip-servicemenu.desktop" "$SERVICEMENU_DIR/cozip-10-compress-zip.desktop"
 install_desktop_template "$SCRIPT_DIR/cozip-compress-cozip-servicemenu.desktop" "$SERVICEMENU_DIR/cozip-20-compress-cozip.desktop"
+install_desktop_template "$SCRIPT_DIR/cozip-compress-details-servicemenu.desktop" "$SERVICEMENU_DIR/cozip-30-compress-details.desktop"
 install_desktop_template "$SCRIPT_DIR/cozip-extract-here-servicemenu.desktop" "$SERVICEMENU_DIR/cozip-10-extract-here.desktop"
 install_desktop_template "$SCRIPT_DIR/cozip-extract-details-servicemenu.desktop" "$SERVICEMENU_DIR/cozip-20-extract-details.desktop"
 chmod +x \
   "$SERVICEMENU_DIR/cozip-10-compress-zip.desktop" \
   "$SERVICEMENU_DIR/cozip-20-compress-cozip.desktop" \
+  "$SERVICEMENU_DIR/cozip-30-compress-details.desktop" \
   "$SERVICEMENU_DIR/cozip-10-extract-here.desktop" \
   "$SERVICEMENU_DIR/cozip-20-extract-details.desktop"
 

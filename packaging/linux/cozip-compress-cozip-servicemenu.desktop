@@ -13,4 +13,4 @@ X-KDE-MinNumberOfUrls=1
 Name=CoZip 形式に圧縮
 Name[en]=Compress to CoZip
 Icon=@COZIP_COMP_ICON@
-Exec=@COZIP_DESKTOP@ compress --format cozip %F
+Exec=@COZIP_DESKTOP@ compress --format cozip --hybrid %F
