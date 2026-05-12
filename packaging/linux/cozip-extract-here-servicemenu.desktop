@@ -6,7 +6,6 @@ MimeType=application/zip;application/x-cozip;application/x-zip-compressed;applic
 Actions=cozip-10-extract-here;
 X-KDE-Submenu=Extract
 X-KDE-Submenu[ja]=展開
-X-KDE-Protocols=file
 X-KDE-MinNumberOfUrls=1
 
 [Desktop Action cozip-10-extract-here]

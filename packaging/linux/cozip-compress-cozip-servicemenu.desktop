@@ -6,7 +6,6 @@ MimeType=application/octet-stream;inode/directory;
 Actions=cozip-20-compress-cozip;
 X-KDE-Submenu=Compress
 X-KDE-Submenu[ja]=圧縮
-X-KDE-Protocols=file
 X-KDE-MinNumberOfUrls=1
 
 [Desktop Action cozip-20-compress-cozip]
