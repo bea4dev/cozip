@@ -12,7 +12,7 @@
 - `cozip`: `cozip_deflate` の CPU deflate/inflate を使う、ファイル/ディレクトリ圧縮向け ZIP ラッパー（オーケストレーター）。
 - `cozip_desktop`: GPUI ベースのデスクトップアプリ。
 
-英語版: [README.md](./README.md)
+English version: [README.md](./README.md)
 
 ## ディレクトリ構成
 
